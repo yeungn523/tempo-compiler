@@ -1,5 +1,5 @@
-"""Defines the host to device ABI: the command window, the command opcodes, the register map and the descriptor and
-patch-table wire formats.
+"""Defines the host to device ABI: the command window, the command opcodes, the register map and the descriptor
+wire formats.
 
 The bitstream mirrors these constants through the generated SystemVerilog packages, so changing a layout, an opcode, a
 unit or a field requires an ABI_VERSION bump and a rebuild.
@@ -7,7 +7,6 @@ unit or a field requires an ABI_VERSION bump and a rebuild.
 
 from __future__ import annotations
 
-import struct
 from enum import IntEnum
 from typing import NamedTuple
 
@@ -32,14 +31,14 @@ build_identity/build_identity.json, which resolves the truncated hardware value.
 """
 
 AXI_REG: dict[str, int] = {
-    "cmd_w0": 0x00,  # WO: header, [3:0] opcode, [4] doorbell, [7:5] direction/target, [31:8] reserved
-    "cmd_w1": 0x04,  # WO: COPY host_phys[31:0] / LAUNCH kbin_addr[31:0]
-    "cmd_w2": 0x08,  # WO: COPY host_phys[63:32] / LAUNCH kbin_addr[63:32]
-    "cmd_w3": 0x0C,  # WO: COPY dev_addr[31:0] / LAUNCH kbin_size[31:0] in bytes
-    "cmd_w4": 0x10,  # WO: COPY dev_addr[63:32] / LAUNCH kernarg_ptr[31:0], reserved
-    "cmd_w5": 0x14,  # WO: COPY len[31:0] in bytes / LAUNCH kernarg_ptr[63:32], reserved
-    "cmd_w6": 0x18,  # WO: COPY reserved / LAUNCH grid_x[31:0], reserved
-    "cmd_w7": 0x1C,  # WO: COPY reserved / LAUNCH grid_y[31:0], reserved
+    "cmd_w0": 0x00,  # header, [3:0] opcode, [4] doorbell, [7:5] direction/target, [31:8] reserved
+    "cmd_w1": 0x04,  # COPY host_phys[31:0] / LAUNCH kbin_addr[31:0]
+    "cmd_w2": 0x08,  # COPY host_phys[63:32] / LAUNCH kbin_addr[63:32]
+    "cmd_w3": 0x0C,  # COPY dev_addr[31:0] / LAUNCH kbin_size[31:0] in bytes
+    "cmd_w4": 0x10,  # COPY dev_addr[63:32] / LAUNCH kernarg_ptr[31:0], reserved
+    "cmd_w5": 0x14,  # COPY len[31:0] in bytes / LAUNCH kernarg_ptr[63:32], reserved
+    "cmd_w6": 0x18,  # COPY reserved / LAUNCH grid_x[31:0], reserved
+    "cmd_w7": 0x1C,  # COPY reserved / LAUNCH grid_y[31:0], reserved
     "instr_ready": 0x20,  # RO: 1 when every sub-FSM is idle
     "dma_slot_done": 0x24,  # RO: async-DMA slot-done bits [1:0]
     "kernel_arg_0": 0x24,  # WO: parameter slot 0, write alias over the dma_slot_done read
@@ -77,33 +76,6 @@ has to catch instead.
 """
 
 DMA_SLOT_DONE_CSR: int = AXI_REG["dma_slot_done"]
-
-PATCH_SECTION_MAGIC: bytes = b"MINITPUP"
-"""Opens a patch section, followed by a u32 record count and that many 16-byte records."""
-
-PATCH_HEADER_MAGIC: bytes = b"MINITPUH"
-"""Opens a v2 binary, followed by a u32 byte offset to the patch section. A v1 binary carries no header, so its section
-is found by scanning for PATCH_SECTION_MAGIC.
-"""
-
-PATCH_HEADER_SIZE: int = 8
-
-EXPR_GRID_LINEAR: int = 0x01
-"""The only patch expression kind: a grid axis scaled and offset by compile-time constants."""
-
-GRID_AXIS_X: int = 0
-GRID_AXIS_Y: int = 1
-GRID_AXIS_Z: int = 2
-
-_PATCH_RECORD_FMT: str = "<IBBBBIi"
-"""Record layout: instruction index, operand slot, expression kind, grid axis, padding, scale, addend."""
-
-PATCH_RECORD_SIZE: int = struct.calcsize(_PATCH_RECORD_FMT)
-
-assert PATCH_RECORD_SIZE == 16, PATCH_RECORD_SIZE
-
-_OPERAND_SLOT_SHIFTS: tuple[int, int, int] = (32, 16, 0)
-"""Bit shift of op0, op1 and op2 within the 64-bit instruction word."""
 
 # The v7 host-dispatch sub-FSM still decodes these mode values, so the constant generator keeps emitting the matching
 # localparams to keep the modes package elaborating. No opcode maps to them and the runtime never writes them.
@@ -152,93 +124,6 @@ class CmdField(NamedTuple):
     """Milestone that activates the field. The serving and v3 fields hold their place in the wire layout and the
     current RTL ignores them.
     """
-
-
-class PatchRecord(NamedTuple):
-    """Defines one grid-dependent instruction operand the host resolves before each launch.
-
-    The compiler emits such operands as placeholders and appends a patch table, so one binary serves every grid without
-    per-launch recompilation. A program carrying no records is launch-invariant.
-    """
-
-    insn_index: int
-    operand_slot: int
-    """Selects op0, op1 or op2 as 0, 1 or 2."""
-    expr_kind: int = EXPR_GRID_LINEAR
-    grid_axis: int = GRID_AXIS_X
-    scale: int = 1
-    addend: int = 0
-
-    def pack(self) -> bytes:
-        """Serializes the record into its 16-byte wire form, raising ValueError on a field that overflows its width."""
-        if not (0 <= self.insn_index <= 0xFFFF_FFFF):
-            message = (
-                f"Unable to pack the patch record. The instruction index must fit an unsigned 32-bit integer, but "
-                f"got {self.insn_index}."
-            )
-            raise ValueError(message)
-        if self.operand_slot not in (0, 1, 2):
-            message = (
-                f"Unable to pack the patch record. The operand slot must be 0, 1 or 2, but got {self.operand_slot}."
-            )
-            raise ValueError(message)
-        if self.expr_kind != EXPR_GRID_LINEAR:
-            message = (
-                f"Unable to pack the patch record. The expression kind must be EXPR_GRID_LINEAR (0x01), but got "
-                f"{self.expr_kind:#x}."
-            )
-            raise ValueError(message)
-        if self.grid_axis not in (GRID_AXIS_X, GRID_AXIS_Y, GRID_AXIS_Z):
-            message = f"Unable to pack the patch record. The grid axis must be 0, 1 or 2, but got {self.grid_axis}."
-            raise ValueError(message)
-        if not (0 <= self.scale <= 0xFFFF_FFFF):
-            message = (
-                f"Unable to pack the patch record. The scale must fit an unsigned 32-bit integer, but got {self.scale}."
-            )
-            raise ValueError(message)
-        if not (-(1 << 31) <= self.addend < (1 << 31)):
-            message = (
-                f"Unable to pack the patch record. The addend must fit a signed 32-bit integer, but got {self.addend}."
-            )
-            raise ValueError(message)
-        return struct.pack(
-            _PATCH_RECORD_FMT,
-            self.insn_index,
-            self.operand_slot,
-            self.expr_kind,
-            self.grid_axis,
-            0,  # padding
-            self.scale,
-            self.addend,
-        )
-
-    @classmethod
-    def unpack(cls, buffer: bytes) -> PatchRecord:
-        """Deserializes one record from the leading PATCH_RECORD_SIZE bytes of the buffer."""
-        instruction_index, operand_slot, expression_kind, grid_axis, _padding, scale, addend = struct.unpack(
-            _PATCH_RECORD_FMT, buffer[:PATCH_RECORD_SIZE]
-        )
-        return cls(
-            insn_index=instruction_index,
-            operand_slot=operand_slot,
-            expr_kind=expression_kind,
-            grid_axis=grid_axis,
-            scale=scale,
-            addend=addend,
-        )
-
-    def resolve(self, grid: tuple[int, int, int]) -> int:
-        """Evaluates the record against one launch grid, raising ValueError when the result overflows the 16-bit
-        operand field it has to be written into.
-        """
-        value = grid[self.grid_axis] * self.scale + self.addend
-        if not (0 <= value < (1 << 16)):
-            message = (
-                f"Unable to resolve the patch record. The value must fit the 16-bit operand field, but got {value} "
-                f"for grid {grid} with axis {self.grid_axis}, scale {self.scale} and addend {self.addend}."
-            )
-            raise ValueError(message)
-        return value
 
 
 REG_SEMANTICS: dict[str, RegSpec] = {
@@ -428,74 +313,3 @@ def build_cmd_words(descriptor: tuple[CmdField, ...], values: dict[str, int]) ->
             raise ValueError(message)
         words[field.word] |= (value & ((1 << field.width) - 1)) << field.lo
     return words
-
-
-def parse_binary(blob: bytes) -> tuple[list[int], list[PatchRecord]]:
-    """Splits a compiler binary into its program words and patch records.
-
-    A v2 blob opens with PATCH_HEADER_MAGIC and a byte offset to the patch section. A v1 blob carries no header, so the
-    section is found by scanning and the program is treated as launch-invariant when the scan finds nothing.
-    """
-    if blob[:4] == PATCH_HEADER_MAGIC:
-        (patch_offset,) = struct.unpack("<I", blob[4:8])
-        instruction_bytes = blob[PATCH_HEADER_SIZE:patch_offset]
-        patch_section = blob[patch_offset:]
-    elif blob[:4] == PATCH_SECTION_MAGIC:
-        message = "Unable to parse the binary. The input must be a whole binary blob, but got a bare patch section."
-        raise ValueError(message)
-    else:
-        index = blob.find(PATCH_SECTION_MAGIC)
-        if index < 0:
-            instruction_bytes = blob
-            patch_section = PATCH_SECTION_MAGIC + struct.pack("<I", 0)
-        else:
-            instruction_bytes = blob[:index]
-            patch_section = blob[index:]
-
-    word_count = len(instruction_bytes) // 8
-    program_words = list(struct.unpack(f"<{word_count}Q", instruction_bytes[: word_count * 8]))
-    return program_words, parse_patch_table(patch_section)
-
-
-def parse_patch_table(section: bytes) -> list[PatchRecord]:
-    """Parses a patch section into its records, rejecting any expression kind other than EXPR_GRID_LINEAR.
-
-    Returns an empty list for a launch-invariant program.
-    """
-    if section[:4] != PATCH_SECTION_MAGIC:
-        message = (
-            f"Unable to parse the patch table. The section must open with {PATCH_SECTION_MAGIC!r}, but got "
-            f"{section[:4]!r}."
-        )
-        raise ValueError(message)
-    (count,) = struct.unpack("<I", section[4:8])
-    records: list[PatchRecord] = []
-    offset = 8
-    for _ in range(count):
-        record = PatchRecord.unpack(section[offset : offset + PATCH_RECORD_SIZE])
-        if record.expr_kind != EXPR_GRID_LINEAR:
-            message = (
-                f"Unable to parse the patch table. The record at offset {offset} must declare EXPR_GRID_LINEAR, but "
-                f"got expression kind {record.expr_kind:#x}. Variable loop bounds bind through inline kernel "
-                f"arguments instead."
-            )
-            raise ValueError(message)
-        records.append(record)
-        offset += PATCH_RECORD_SIZE
-    return records
-
-
-def apply_patch_table(program_words: list[int], records: list[PatchRecord], grid: tuple[int, int, int]) -> list[int]:
-    """Resolves every record for one launch grid and rewrites the affected operands in place.
-
-    The 64-bit instruction word packs an 8-bit opcode, 8 flag bits and three 16-bit operands, so op0 occupies bits
-    [47:32], op1 bits [31:16] and op2 bits [15:0].
-    """
-    for record in records:
-        value = record.resolve(grid)
-        shift = _OPERAND_SLOT_SHIFTS[record.operand_slot]
-        word = program_words[record.insn_index]
-        word &= ~(0xFFFF << shift) & 0xFFFF_FFFF_FFFF_FFFF
-        word |= (value & 0xFFFF) << shift
-        program_words[record.insn_index] = word
-    return program_words

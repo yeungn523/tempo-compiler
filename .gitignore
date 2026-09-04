@@ -222,3 +222,6 @@ docs/
 
 # FPGA bitstreams
 *.bit.bin
+
+# Agent instructions symlink (AGENTS.md is the tracked source)
+CLAUDE.md

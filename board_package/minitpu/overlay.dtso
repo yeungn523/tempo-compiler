@@ -1,0 +1,29 @@
+/*
+ * ZCU104 provisioning overlay: expose minitpu_0 as generic-uio for the host runtime.
+ *
+ * MINITPU AXI-Lite CMD window is at 0x9000_0000, 4 KiB (from the Vivado .hwh:
+ *   minitpu_0  C_BASEADDR=0x90000000  C_HIGHADDR=0x90000FFF  on M_AXI_HPM0_LPD).
+ *
+ * The node is named plain "minitpu" (no unit-address) so that the kernel's
+ * uio_pdrv_genirq reports the UIO device name as exactly "minitpu" — the
+ * host runtime discovers it via open_by_name("minitpu").  (A node named
+ * "minitpu@90000000" would yield UIO name "minitpu@90000000" and the runtime
+ * would miss it.)  dtc warns about a missing unit-address; that is intentional.
+ *
+ * After applying, the platform device (90000000.minitpu) must be MANUALLY
+ * bound to uio_pdrv_genirq — this kernel's OF match table has no generic-uio
+ * entry, so auto-match does not fire.  See provision.sh.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&fpga_full {
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	minitpu {
+		compatible = "generic-uio";
+		reg = <0x0 0x90000000 0x0 0x1000>;   /* CMD window, 4 KiB */
+	};
+};

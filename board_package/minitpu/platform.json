@@ -1,0 +1,8 @@
+{
+  "board": "zcu104",
+  "copy_base": 17179869184,
+  "copy_size": 17179869184,
+  "kernel_base": 2147483648,
+  "kernel_size": 2147483648,
+  "kernel_alias_copy_base": 19327352832
+}

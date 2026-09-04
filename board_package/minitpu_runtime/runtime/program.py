@@ -1,15 +1,7 @@
-"""Callable MINITPU programs: stage an image, transfer arguments, and launch.
+"""Provides callable MINITPU programs that stage an image, transfer arguments and launch.
 
-The public convention is deliberately small: a callable program receives one or
-more C-contiguous ``numpy.uint16`` host arrays.  Every argument except the last
-is copied host-to-device; the final argument is copied device-to-host after the
-program returns.  The corresponding device pointers are passed to the program
-in that same order through the four hardware argument slots.
-
-``uint16`` is the MINITPU's host wire container, matching the BF16-native
-element width on the device.  A program-specific caller is
-responsible for converting float values to the required representation (BF16 in
-the included board example) before it invokes the callable program.
+A program takes C-contiguous uint16 host arrays, copies all but the last to the device through the hardware
+argument slots, and copies the last back after the launch.
 """
 
 from __future__ import annotations
@@ -22,23 +14,22 @@ import numpy as np
 
 from .address_space import minitpuGetAddressSpace
 from .device import minitpuFree, minitpuHostAlloc, minitpuHostReset, minitpuMalloc, minitpuSetDevice
-from .launch import DMA_ARG_SLOT_COUNT, INSTR_BYTES, minitpuLaunchKernel
+from .launch import DMA_ARG_SLOT_COUNT, INSTR_BYTES, IRAM_DEPTH, minitpuLaunchKernel
 from .memcpy import MemcpyKind, minitpuMemcpy
 
-# Mirrored from src/pkg/minitpu_config_pkg.sv (localparam int IRAM_DEPTH).
-# hwparams.py was retired: it claimed to generate minitpu_config_pkg.sv via a
-# build step that does not exist in this repository, and had drifted from the
-# RTL on nearly every constant it declared. Of everything it exported the
-# runtime used exactly this one name, so it is hardcoded here rather than
-# kept alive as a stale mirror of an entire package. Unifying RTL constants
-# with their software mirrors is tracked as CONST_MGMT work.
-IRAM_DEPTH = 4096
+_ELEMENT_DTYPE: np.dtype = np.dtype("<u2")
+"""The device's element container, holding one BF16 value per 16-bit VMEM and VREG element."""
 
 _ACTIVE_UIO_NAME: str | None = None
+"""UIO node name the device selection currently in force names, so a repeated run skips reselecting it."""
 
 
 class KernelImage(Protocol):
-    """Assembler result needed by :func:`minitpuKernel`."""
+    """Defines the assembler result a callable program is built from.
+
+    Attributes:
+        name: The program name, used to report a malformed image.
+    """
 
     name: str
 
@@ -47,46 +38,36 @@ class KernelImage(Protocol):
 
 @dataclass(frozen=True)
 class MinitpuKernel:
-    """A callable assembled program bound to a board UIO device."""
+    """Binds an assembled program to a board UIO device, making it callable.
+
+    Attributes:
+        image: The assembled program.
+        uio_name: The UIO node name of the board it runs on.
+    """
 
     image: KernelImage
     uio_name: str
 
     def __call__(self, *host_buffers: np.ndarray) -> None:
+        """Runs the program against the given host arrays, the last of which is the output."""
         minitpuRunKernel(self.image, *host_buffers, uio_name=self.uio_name)
 
 
-def minitpuKernel(image: KernelImage, *, uio_name: str) -> MinitpuKernel:
-    """Bind an assembled image to a board, returning a callable MINITPU program.
-
-    For example, ``program = minitpuKernel(image, uio_name="minitpu")`` makes
-    ``program(h_src1, h_src2, h_dest)`` perform all staging, COPY operations,
-    argument binding, LAUNCH, and output COPY.  The last host array is the sole
-    output; preceding arrays are inputs.
-    """
-    if not isinstance(uio_name, str) or not uio_name:
-        raise ValueError("uio_name must be a non-empty UIO device name")
-    return MinitpuKernel(image, uio_name)
-
-
 class minitpuAssembly:
-    """Namespace for declaring callable MINITPU assembly programs.
+    """Declares callable MINITPU assembly programs through its decorator.
 
-    The common form is ``@minitpu.asm``::
-
-        @minitpu.asm
-        def vector_add():
-            minitpu.bundle(f=minitpu.halt())
-
-    ``vector_add(h_src1, h_src2, h_dest)`` then performs all runtime work.
-    Inside the decorated function, ``minitpu`` is temporarily the assembler
-    builder, exposing ``bundle``, ``dma_load``, ``vadd``, and the other ISA
-    constructors. Use ``@minitpu.asm(uio_name="other-minitpu")`` when the board UIO
-    device is not named ``minitpu``.
+    Inside a decorated function the ``minitpu`` name is temporarily the assembler builder, exposing ``bundle``,
+    ``dma_load``, ``vadd`` and the other ISA constructors. The decorated name becomes a callable program that
+    performs every runtime step.
     """
 
     def asm(self, function=None, *, uio_name: str = "minitpu"):
-        """Assemble a function and return its callable MINITPU-program wrapper."""
+        """Assembles a function and returns its callable program wrapper.
+
+        Args:
+            function: The function to assemble, or None to return a decorator that takes it.
+            uio_name: The UIO node name of the board the program runs on.
+        """
         if function is None:
             return lambda assembly_function: self.asm(assembly_function, uio_name=uio_name)
         assembler = import_module("asm")
@@ -95,41 +76,47 @@ class minitpuAssembly:
 
 
 minitpu = minitpuAssembly()
+"""The assembly namespace a program is declared through."""
 
 
-#: The device's element container. BF16-native hardware stores one BF16 value
-#: per 16-bit VMEM/VREG element; the retired 32-bit container put a zero in
-#: every other byte on the wire (docs/DDR_BW_UTIL.md).
-ELEMENT_DTYPE = np.dtype("<u2")
+def minitpuKernel(image: KernelImage, *, uio_name: str) -> MinitpuKernel:
+    """Binds an assembled image to a board, returning a callable MINITPU program.
 
+    Calling the result performs all staging, copies, argument binding, launch and output copy. The last host array
+    passed to it is the sole output and the preceding arrays are inputs.
 
-def _host_array(value: np.ndarray, *, output: bool) -> np.ndarray:
-    if not isinstance(value, np.ndarray):
-        raise TypeError("program arguments must be numpy.uint16 arrays")
-    if value.dtype != ELEMENT_DTYPE:
-        raise TypeError(f"program arguments must have dtype numpy.uint16, got {value.dtype}")
-    if not value.flags.c_contiguous:
-        raise ValueError("program arguments must be C-contiguous")
-    if not value.size:
-        raise ValueError("program arguments must not be empty")
-    if output and not value.flags.writeable:
-        raise ValueError("the output program argument must be writeable")
-    return value.reshape(-1)
+    Raises:
+        ValueError: When the UIO node name is empty or not a string.
+    """
+    if not isinstance(uio_name, str) or not uio_name:
+        message = f"Unable to bind a kernel. The UIO device name must be a non-empty string, but got {uio_name!r}."
+        raise ValueError(message)
+    return MinitpuKernel(image, uio_name)
 
 
 def minitpuRunKernel(image: KernelImage, *host_buffers: np.ndarray, uio_name: str) -> None:
-    """Run ``image`` with host input arrays followed by one output array.
+    """Runs an image with host input arrays followed by one output array.
 
-    This owns all transient resources: instruction-image staging, pinned host
-    regions, device allocations, transfers, launch, and allocator cleanup.
-    A fresh host allocation session is used for each call, so repeated calls do
-    not exhaust udmabuf merely by retaining internal staging regions.
+    This owns every transient resource the run needs: instruction-image staging, pinned host regions, device
+    allocations, transfers, launch and allocator cleanup. Each call starts a fresh host allocation session, so
+    repeated calls do not exhaust the udmabuf by retaining staging regions.
+
+    Args:
+        image: The assembled program to run.
+        host_buffers: The input arrays followed by the single output array.
+        uio_name: The UIO node name of the board the program runs on.
+
+    Raises:
+        ValueError: When the argument count falls outside the hardware slots, an argument is not a writeable
+            C-contiguous non-empty uint16 array, or the image does not fit the staging prefix.
+        TypeError: When an argument is not a uint16 numpy array.
     """
     if not 2 <= len(host_buffers) <= DMA_ARG_SLOT_COUNT:
-        raise ValueError(
-            f"a program needs at least one input and one output, and supports at most "
-            f"{DMA_ARG_SLOT_COUNT} total arguments; got {len(host_buffers)}"
+        message = (
+            f"Unable to run {image.name}. A program needs at least one input and one output and supports at most "
+            f"{DMA_ARG_SLOT_COUNT} arguments, but got {len(host_buffers)}."
         )
+        raise ValueError(message)
     host_arrays = tuple(
         _host_array(value, output=index == len(host_buffers) - 1)
         for index, value in enumerate(host_buffers)
@@ -138,13 +125,12 @@ def minitpuRunKernel(image: KernelImage, *host_buffers: np.ndarray, uio_name: st
     address_space = minitpuGetAddressSpace()
     max_image_bytes = min(IRAM_DEPTH * INSTR_BYTES, address_space.reserved)
     if not image_bytes or len(image_bytes) > max_image_bytes:
-        raise ValueError(
-            f"{image.name} is {len(image_bytes)} bytes; kernel images must be between "
-            f"1 and {max_image_bytes} bytes for this board"
+        message = (
+            f"Unable to run {image.name}. A kernel image must be between 1 and {max_image_bytes} bytes on this "
+            f"board, but got {len(image_bytes)} bytes."
         )
+        raise ValueError(message)
 
-    # The kernel image occupies the address-space's reserved low prefix.  It is
-    # intentionally not exposed as a host-side allocation or user argument.
     global _ACTIVE_UIO_NAME
     if _ACTIVE_UIO_NAME != uio_name:
         minitpuSetDevice(uio_name)
@@ -152,13 +138,17 @@ def minitpuRunKernel(image: KernelImage, *host_buffers: np.ndarray, uio_name: st
     minitpuHostReset()
     device_buffers: list[int] = []
     try:
+        # Stages the image in the aperture's reserved low prefix, which is neither a host allocation nor a
+        # user argument.
         host_kernel = minitpuHostAlloc(len(image_bytes))
         host_kernel.view[: len(image_bytes) // 4] = np.frombuffer(image_bytes, dtype="<u4")
-        minitpuMemcpy(address_space.kernel_base, host_kernel, len(image_bytes), MemcpyKind.HostToDevice)
+        minitpuMemcpy(
+            address_space.kernel_base, host_kernel, len(image_bytes), MemcpyKind.HostToDevice
+        )
 
         host_regions = [minitpuHostAlloc(array.nbytes) for array in host_arrays]
         for array, region in zip(host_arrays[:-1], host_regions[:-1], strict=True):
-            region.view.view(ELEMENT_DTYPE)[: array.size] = array
+            region.view.view(_ELEMENT_DTYPE)[: array.size] = array
             device_addr = minitpuMalloc(array.nbytes)
             device_buffers.append(device_addr)
             minitpuMemcpy(device_addr, region, array.nbytes, MemcpyKind.HostToDevice)
@@ -169,8 +159,37 @@ def minitpuRunKernel(image: KernelImage, *host_buffers: np.ndarray, uio_name: st
         device_buffers.append(output_addr)
         minitpuLaunchKernel(address_space.kernel_base, len(image_bytes), args=device_buffers)
         minitpuMemcpy(output_region, output_addr, output_array.nbytes, MemcpyKind.DeviceToHost)
-        output_array[:] = output_region.view.view(ELEMENT_DTYPE)[: output_array.size]
+        output_array[:] = output_region.view.view(_ELEMENT_DTYPE)[: output_array.size]
     finally:
         for address in device_buffers:
             minitpuFree(address)
         minitpuHostReset()
+
+
+def _host_array(value: np.ndarray, *, output: bool) -> np.ndarray:
+    """Validates one program argument and returns it flattened.
+
+    Args:
+        value: The candidate host array.
+        output: Determines whether the array is the program's output and must therefore be writeable.
+
+    Raises:
+        TypeError: When the value is not a uint16 numpy array.
+        ValueError: When the array is not C-contiguous, is empty, or is a read-only output.
+    """
+    if not isinstance(value, np.ndarray):
+        message = f"Unable to bind a program argument. Arguments must be numpy arrays, but got {type(value).__name__}."
+        raise TypeError(message)
+    if value.dtype != _ELEMENT_DTYPE:
+        message = f"Unable to bind a program argument. Arguments must have dtype uint16, but got {value.dtype}."
+        raise TypeError(message)
+    if not value.flags.c_contiguous:
+        message = "Unable to bind a program argument. Arguments must be C-contiguous."
+        raise ValueError(message)
+    if not value.size:
+        message = "Unable to bind a program argument. Arguments must not be empty."
+        raise ValueError(message)
+    if output and not value.flags.writeable:
+        message = "Unable to bind a program argument. The output argument must be writeable."
+        raise ValueError(message)
+    return value.reshape(-1)

@@ -2,10 +2,8 @@
 
 `CLAUDE.md` is a symlink to this file.
 
-**Read [PORTING.md](PORTING.md) first.** It states where every file came from,
-what the compiler can and cannot do today, and what was deliberately left
-behind. The rules below are the ones that will cost you a board run if you
-ignore them.
+The rules below are the ones that will cost you a board run if you ignore
+them.
 
 ## The one thing that matters most
 
@@ -27,8 +25,8 @@ python3 tools/sim_triton_kernel.py       # compile a GEMM, scp it to the board
 ```
 
 `make check` runs `minitpu/scripts/check_package.py` (which assembles
-`single_mul_add`, so it catches a truncated source) and the five unit tests in
-`board_package/tests/`. Neither needs hardware.
+`single_mul_add`, so it catches a truncated source) and the four unit test
+modules in `board_package/tests/`. Neither needs hardware.
 
 ## What compiles today
 
@@ -37,8 +35,7 @@ GEMM and GEMM+GELU, through `tools/sim_triton_kernel.py`. Nothing else.
 describe this as a working compiler for anything wider without running it.
 
 `gpt2_kernels.py`'s attention is **materialized, not flash**, and there is no
-flash-attention reference anywhere here. See PORTING.md before claiming
-otherwise.
+flash-attention reference anywhere here to check one against.
 
 ## Hazards the compiler owns
 

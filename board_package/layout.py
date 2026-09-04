@@ -216,20 +216,6 @@ class Tiled:
                 f"tile_stride={self.tile_stride}{tag})")
 
 
-def conflict_free_pitch(rows: int) -> int:
-    """The smallest pitch at or above `rows` that is coprime with the bank count.
-
-    The oldest fix in the shared-memory literature -- pad the leading dimension so
-    the column stride is coprime with the bank count -- and the one this machine can
-    express, because a DMA descriptor names its own destination row. For a
-    power-of-two bank count it is simply the next odd number.
-    """
-    pitch = rows
-    while math.gcd(pitch, _NUM_SUBLANES) != 1:
-        pitch += 1
-    return pitch
-
-
 @dataclass(frozen=True)
 class VmemRegion:
     """Rows of one VMEM slot, owned by one staged tensor.
@@ -270,6 +256,20 @@ class VmemRegion:
     def conflict(self) -> int:
         """Cycles a VREG access walking feature tiles costs here."""
         return math.gcd(self.pitch, _NUM_SUBLANES)
+
+
+def conflict_free_pitch(rows: int) -> int:
+    """The smallest pitch at or above `rows` that is coprime with the bank count.
+
+    The oldest fix in the shared-memory literature -- pad the leading dimension so
+    the column stride is coprime with the bank count -- and the one this machine can
+    express, because a DMA descriptor names its own destination row. For a
+    power-of-two bank count it is simply the next odd number.
+    """
+    pitch = rows
+    while math.gcd(pitch, _NUM_SUBLANES) != 1:
+        pitch += 1
+    return pitch
 
 
 class VmemAllocator:

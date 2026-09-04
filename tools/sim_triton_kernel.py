@@ -28,12 +28,12 @@ from bf16 import (  # noqa: E402
     _BLOCK_TOKENS,
     _BLOCK_WEIGHT_BYTES,
     _ELEMENT_BYTES,
+    build_operands,
     pack_activations,
     pack_weights,
 )
 from compiler import plan, read_program, signature_of, stage  # noqa: E402
 from kernels import build_looped_gemm  # noqa: E402
-from sim_kernel import build_operands  # noqa: E402
 
 
 @triton.jit

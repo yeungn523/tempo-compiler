@@ -1,188 +1,184 @@
 #!/usr/bin/env python3
-"""Device geometry, BF16 packing and the host references every check compares against.
-
-Nothing here touches the device. It is the half of the package a reviewer can read and check by
-inspection: how a float32 becomes the BF16 word the array consumes, how an operand is laid out for
-the kernel that reads it, and what the SFU's own tables do -- all derived from the geometry
-constants at the top rather than written out, because every one of them silently mis-addresses
-rather than failing when the device geometry moves under it.
-"""
+"""Device geometry, BF16 packing and the host references every check compares against."""
 
 from __future__ import annotations
 
+import math
 import pathlib
+import struct
 import sys
 
-HERE = pathlib.Path(__file__).resolve().parent
+import numpy as np
+from numpy.typing import NDArray
+
+HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent
+"""The directory holding this package."""
+
+# dsl.py reaches the board runtime through this module rather than inserting the roots itself, so importing bf16
+# has to leave both of them on the path.
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE / "minitpu_runtime"))
 
-import math  # noqa: E402
-import struct  # noqa: E402
-
-import numpy as np  # noqa: E402
-from numpy.typing import NDArray  # noqa: E402
-
-
-HERE = pathlib.Path(__file__).resolve().parent
-
-
-# --- Device geometry ------------------------------------------------------
-# Derived rather than written out, because every one of these silently
-# mis-addresses rather than failing when the device geometry moves under it.
 _ELEMENT_BYTES: int = 2
-
+"""The byte width of one BF16 value in memory."""
 
 _NUM_LANES: int = 16
-
+"""The number of MXU lanes, which is how many values one VMEM row holds."""
 
 _ROW_BYTES: int = _NUM_LANES * _ELEMENT_BYTES
-
+"""The byte size of one VMEM row, which is the pitch every DMA descriptor walks DRAM at."""
 
 _VMEM_ENTRIES_PER_LANE: int = 8192
-
+"""The number of rows one VMEM lane holds."""
 
 _GELU_TABLE_ENTRIES: int = 2048
-
+"""The number of entries in the SFU's GELU table."""
 
 _GELU_LIMIT_Q7: int = 8 * 128
-
+"""The Q7 magnitude the GELU table saturates at, which is 8.0."""
 
 _CORRUPTION_WORD: int = 0xDEAD_BEEF
-
+"""The sentinel a destination buffer is filled with before a read-back, so a copy that never landed is visible."""
 
 _LAUNCH_REPEATS: int = 3
-
+"""The number of back-to-back launches of one image the repeat check issues."""
 
 _INTERLEAVE_ROUNDS: int = 4
-
+"""The number of alternating copy and launch rounds the command interleave check issues."""
 
 _INTERLEAVE_PAYLOAD_BYTES: int = 9216
-
+"""The byte size of the payload each interleave round moves."""
 
 _TILE: int = 16
-
+"""The edge length of one MXU tile."""
 
 _TOKEN_GROUPS: int = 2
-
+"""The number of token groups one block carries."""
 
 _STEPS: int = 2
-
+"""The number of accumulation steps one block spans."""
 
 _BLOCK_TOKENS: int = _TOKEN_GROUPS * _TILE
-
+"""The number of token rows one block carries."""
 
 _BLOCK_DEPTH: int = _STEPS * _TILE
-
+"""The contraction depth one block spans."""
 
 _STEP_TILES: int = 4
-
+"""The number of tiles one step block spans, set by the AGU's power-of-two row stride."""
 
 _LOOP_BLOCKS: int = 6
-
+"""The number of blocks the looped GEMM accumulates before it drains."""
 
 _NUM_SUBLANES: int = 4
-
+"""The number of sublanes one vector register spans."""
 
 _TILE_VREGS: int = 4
-
+"""The number of vector registers one tile occupies."""
 
 _TILE_ROWS: int = _NUM_SUBLANES * _TILE_VREGS
-
+"""The number of VMEM rows one tile occupies."""
 
 _ROW_ZERO: int = 0
-
+"""The VMEM row of the zeroed tile that clears the output accumulators."""
 
 _ROW_ACTIVATION: tuple[int, int] = (16, 80)
-
+"""The first VMEM row of each accumulation step's activation bank."""
 
 _ROW_WEIGHT: tuple[int, int] = (64, 128)
-
+"""The first VMEM row of each accumulation step's weight bank."""
 
 _ROW_OUTPUT: int = 160
-
+"""The first VMEM row of the output tiles."""
 
 _VMEM_SLOT_STRIDE: int = _VMEM_ENTRIES_PER_LANE
-
+"""The VMEM row distance between consecutive staging slots, which is a whole lane so no two slots share a row."""
 
 _BLOCK_ACTIVATION_BYTES: int = _STEPS * _TOKEN_GROUPS * _TILE * _ROW_BYTES
-
+"""The byte size of one block's activation tiles."""
 
 _BLOCK_WEIGHT_BYTES: int = _STEPS * _TILE * _ROW_BYTES
-
+"""The byte size of one block's weight tiles."""
 
 _ZERO_TILE_WORDS: int = _TILE * _TILE
-
+"""The word count of the zeroed tile that clears the output accumulators."""
 
 _ZERO_TILE_BYTES: int = _ZERO_TILE_WORDS * _ELEMENT_BYTES
-
+"""The byte size of that zeroed tile."""
 
 _ROW_SCORES: int = 256
-
+"""The first VMEM row of the attention scores the softmax reads."""
 
 _ROW_SOFTMAX_OUT: int = 1024
-
+"""The first VMEM row of the softmax result."""
 
 _VREG_ELEMENTS: int = _NUM_LANES * _NUM_SUBLANES
-
+"""The number of values one vector register holds."""
 
 _MAX_DESCRIPTOR_ROWS: int = 128
+"""The largest number of rows one DMA descriptor moves, which is the chunk every staged region is sized in."""
 
-
-#: VMEM rows the elementwise add stages its two operands and its result at. One
-#: chunk is _MAX_DESCRIPTOR_ROWS rows, which is what a single descriptor moves.
 _ROW_ADD_LEFT: int = 2048
-
+"""The first VMEM row of the elementwise add's left operand."""
 
 _ROW_ADD_RIGHT: int = _ROW_ADD_LEFT + _MAX_DESCRIPTOR_ROWS
-
+"""The first VMEM row of the elementwise add's right operand."""
 
 _ROW_ADD_OUT: int = _ROW_ADD_RIGHT + _MAX_DESCRIPTOR_ROWS
+"""The first VMEM row of the elementwise add's result."""
 
-
-#: VMEM rows the tile transpose stages its input and its result at. One tile is
-#: _TILE rows in and _TILE rows out.
 _ROW_TX_IN: int = _ROW_ADD_OUT + _MAX_DESCRIPTOR_ROWS
-
+"""The first VMEM row of the tile transpose's input."""
 
 _ROW_TX_OUT: int = _ROW_TX_IN + _TILE
-
+"""The first VMEM row of the tile transpose's result."""
 
 _MODEL_WIDTH: int = 768
-
+"""The GPT-2 model width in features."""
 
 _WIDTH_VREGS: int = _MODEL_WIDTH // _VREG_ELEMENTS
-
+"""The number of vector registers one model-width row spans."""
 
 _WIDTH_ROWS: int = _MODEL_WIDTH // _NUM_LANES
-
+"""The number of VMEM rows one model-width row spans."""
 
 _LN_ROW_X: int = 0
-
+"""The first VMEM row of the LayerNorm input."""
 
 _LN_ROW_CONST: int = _WIDTH_ROWS
-
+"""The first VMEM row of the LayerNorm constants, which sit directly above the input."""
 
 _LN_ROW_OUT: int = 512
-
+"""The first VMEM row of the LayerNorm result."""
 
 _LN_EPSILON: float = 1e-5
+"""The variance floor LayerNorm adds before taking the reciprocal square root."""
 
 
-def layernorm_constants(gamma: NDArray[np.float32], beta: NDArray[np.float32]) -> NDArray[np.uint32]:
-    """Packs the resident half of a LayerNorm launch: gamma, beta and three broadcast scalars."""
+def layernorm_constants(gamma: NDArray[np.float32], beta: NDArray[np.float32]) -> NDArray[np.uint16]:
+    """Packs the resident half of a LayerNorm launch: gamma, beta and three broadcast scalars.
+
+    Args:
+        gamma: The per-feature scale.
+        beta: The per-feature shift.
+
+    Returns:
+        The container words the launch stages in VMEM.
+    """
     zero = np.zeros(_VREG_ELEMENTS, dtype=np.float32)
     inverse = np.full(_VREG_ELEMENTS, 1.0 / _MODEL_WIDTH, dtype=np.float32)
     epsilon = np.full(_VREG_ELEMENTS, _LN_EPSILON, dtype=np.float32)
     return as_bf16_words(values=np.concatenate([gamma, beta, zero, inverse, epsilon]))
 
 
-def as_bf16_words(values: NDArray[np.float32]) -> NDArray[np.uint32]:
-    """Stores each float32 value in the MINITPU's 32-bit BF16 container format.
+def as_bf16_words(values: NDArray[np.float32]) -> NDArray[np.uint16]:
+    """Stores each float32 value in the MINITPU's BF16 container, rounding to nearest even.
 
-    Notes:
-        Rounds to nearest even, matching the MXU's pack_bf16, the accumulator's add pipe and the SFU's table, so the
-        host is the same rounding mode as every stage it feeds.
+    Args:
+        values: The values to convert.
+
+    Returns:
+        The BF16 container words.
     """
     bits = values.astype("<f4", copy=False).view("<u4")
     words = bits >> 16
@@ -193,22 +189,13 @@ def as_bf16_words(values: NDArray[np.float32]) -> NDArray[np.uint32]:
     return words.astype("<u2")
 
 
-def from_bf16_words(words: NDArray[np.uint32]) -> NDArray[np.float32]:
-    """Recovers the float32 values the MINITPU's 32-bit BF16 container words hold."""
+def from_bf16_words(words: NDArray[np.uint16]) -> NDArray[np.float32]:
+    """Recovers the float32 values the MINITPU's BF16 container words hold."""
     return (words.astype("<u4") << 16).view("<f4")
 
 
-def pack_gemm_input(activations: NDArray[np.float32], weights: NDArray[np.float32]) -> NDArray[np.uint32]:
+def pack_gemm_input(activations: NDArray[np.float32], weights: NDArray[np.float32]) -> NDArray[np.uint16]:
     """Packs the tiled GEMM's tiles into the one buffer its DMA prologue expects.
-
-    Notes:
-        Orders the blocks to match the kernel's VMEM bank map: a zeroed block clearing the output tiles, then one
-        block per accumulation step holding that step's activation tiles followed by its weight tile. One tile
-        occupies sixteen VMEM rows.
-
-        A step block always spans _STEP_TILES tiles, since the kernel's AGU walks the steps with a power-of-two row
-        stride and its weight bank sits at the top of that stride. Fewer activation tiles than the block holds
-        therefore leaves a gap ahead of the weight tile, which this padding fills.
 
     Args:
         activations: Activation tiles indexed by step, group, row and column.
@@ -240,11 +227,6 @@ def pack_gemm_input(activations: NDArray[np.float32], weights: NDArray[np.float3
 def gelu_lut_reference(words: NDArray[np.uint32]) -> NDArray[np.uint32]:
     """Models the SFU's direct GELU table over a vector of BF16 container words.
 
-    Notes:
-        Mirrors the address fold in src/core/sfu/sfu.sv. The operand magnitude becomes a Q7 integer, the sign
-        selects one half of the table, and the entry holds that bin's centre GELU value rounded to BF16. Magnitudes
-        at or past the limit pass through when the operand is positive and return zero when it is negative.
-
     Args:
         words: BF16 container words to transform.
 
@@ -261,12 +243,8 @@ def gelu_lut_reference(words: NDArray[np.uint32]) -> NDArray[np.uint32]:
     return np.where((operand & 0x7FFF_FFFF) == 0, 0, result).astype("<u4")
 
 
-def pack_activations(activations: NDArray[np.float32]) -> NDArray[np.uint32]:
+def pack_activations(activations: NDArray[np.float32]) -> NDArray[np.uint16]:
     """Lays an activation array out in the order the looped kernel visits it.
-
-    Notes:
-        Packing both operands gives every descriptor the same 64-byte row pitch, which frees the register that
-        would otherwise hold the array's own pitch so the drain pointer can live across the group loop.
 
     Args:
         activations: The left operand, whose rows are tokens and columns the contraction.
@@ -288,13 +266,8 @@ def pack_activations(activations: NDArray[np.float32]) -> NDArray[np.uint32]:
     return np.ascontiguousarray(words.reshape(tokens, depth // _TILE, _TILE).transpose(1, 0, 2)).reshape(-1)
 
 
-def pack_weights(weights: NDArray[np.float32]) -> NDArray[np.uint32]:
+def pack_weights(weights: NDArray[np.float32]) -> NDArray[np.uint16]:
     """Lays a weight matrix out in the order the looped kernel visits it.
-
-    Notes:
-        Consecutive blocks have to be consecutive in memory, because the kernel advances its weight pointer by
-        one scalar add per step. A natural row-major block advances 196608 bytes at model width, past both the
-        immediate an add carries and the multiplier a multiply-accumulate carries.
 
     Args:
         weights: The right operand, whose rows are the contraction and columns the output features.
@@ -317,21 +290,8 @@ def pack_weights(weights: NDArray[np.float32]) -> NDArray[np.uint32]:
     return np.ascontiguousarray(ordered).reshape(-1)
 
 
-def assert_operands_discriminating(
-    activations: NDArray[np.float32], weights: NDArray[np.float32]
-) -> None:
+def assert_operands_discriminating(activations: NDArray[np.float32], weights: NDArray[np.float32]) -> None:
     """Rejects an operand pair whose product cannot observe the confusions a tiled GEMM can make.
-
-    Notes:
-        A test is only evidence for the axes its operands vary along. The check that stood for weeks
-        used a left operand whose token rows were all identical (``arange % 2`` over an even depth)
-        against weights constant along the contraction. Every 32-deep block then contributes the same
-        value, so a kernel that pairs the wrong activation block with the wrong weight block -- or
-        drops a block's results entirely -- returns exactly the same answer, bit for bit, at
-        ``rtol=0, atol=0``. That reads as the strongest possible evidence and is none at all.
-
-        Each permutation below models one such confusion. If the product does not move under it, the
-        operands cannot tell a kernel that makes it from one that does not.
 
     Args:
         activations: The left operand, whose rows are tokens and columns the contraction.
@@ -363,14 +323,42 @@ def assert_operands_discriminating(
             raise ValueError(message)
 
 
-def _single_launch_operands() -> tuple[NDArray[np.float32], NDArray[np.float32],
-                                       NDArray[np.float32], NDArray[np.uint32]]:
-    """Builds the operands every single-launch check shares.
+def build_operands(
+    tokens: int, depth: int, columns: int, *, kind: str, seed: int
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    """Builds one operand pair for a GEMM check.
 
-    Notes:
-        Each activation row holds one more leading one than the row above it, and the count restarts at a
-        different place per group and per step. Every row therefore sums to a different value, so a kernel that
-        transposed a tile would return a different product and fail the checks that use these.
+    Args:
+        tokens: Rows of the left operand.
+        depth: The contraction.
+        columns: Output features.
+        kind: ``structured`` for exactly representable operands, ``varying`` for operands that differ along every
+            axis.
+        seed: Seed for the varying operands, so two rounds can differ.
+
+    Returns:
+        The left and right operands, both on the BF16 grid.
+
+    Raises:
+        ValueError: If the varying operands cannot observe the confusions a tiled GEMM can make.
+    """
+    if kind == "structured":
+        left = np.arange(tokens * depth, dtype=np.float32).reshape(tokens, depth) % 2
+        scales = (2.0 ** -(np.arange(columns) % 4)) / 16.0
+        right = np.broadcast_to(scales, shape=(depth, columns)).astype(np.float32)
+        return left, right
+    rng = np.random.default_rng(seed)
+    left = _on_bf16_grid(values=rng.standard_normal((tokens, depth)).astype(np.float32))
+    right = _on_bf16_grid(values=rng.standard_normal((depth, columns)).astype(np.float32))
+    # Fails rather than handing back operands that would report a vacuous pass.
+    assert_operands_discriminating(activations=left, weights=right)
+    return left, right
+
+
+def _single_launch_operands() -> (
+    tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32], NDArray[np.uint16]]
+):
+    """Builds the operands every single-launch check shares.
 
     Returns:
         The activation tiles, the weight tiles, the product a host reference computes from them, and the packed
@@ -383,25 +371,26 @@ def _single_launch_operands() -> tuple[NDArray[np.float32], NDArray[np.float32],
                 activations[step, group, row, : (row + 4 * group + 8 * step) % _TILE + 1] = 1.0
     weights = np.full((_STEPS, _TILE, _TILE), 1.0 / 16.0, dtype=np.float32)
     expected = np.stack(
-        [sum(activations[step, group] @ weights[step] for step in range(_STEPS))
-         for group in range(_TOKEN_GROUPS)]
+        [sum(activations[step, group] @ weights[step] for step in range(_STEPS)) for group in range(_TOKEN_GROUPS)]
     )
     return activations, weights, expected, pack_gemm_input(activations=activations, weights=weights)
 
 
-def _gelu_table() -> NDArray[np.uint32]:
-    """Rebuilds the BF16 ROM image that tools/emit_sfu_tables.py writes for the SFU."""
+def _gelu_table() -> NDArray[np.uint16]:
+    """Rebuilds the BF16 ROM image the SFU's GELU table is programmed from."""
     centres = -8.0 + (np.arange(_GELU_TABLE_ENTRIES, dtype=np.float64) + 0.5) / 128.0
     values = (0.5 * centre * (1.0 + math.erf(centre / math.sqrt(2.0))) for centre in centres)
     return np.array([_bf16_round(value=value) for value in values], dtype="<u2")
 
 
 def _on_bf16_grid(values: NDArray[np.float32]) -> NDArray[np.float32]:
-    """Returns the values the device receives, which is the BF16 grid the host packing rounds them onto.
+    """Rounds values onto the BF16 grid, which is what the device receives.
 
-    Notes:
-        Shape-preserving including 0-d, because a reference computes with scalars as well as arrays
-        and numpy cannot re-view a 0-d array at a different itemsize.
+    Args:
+        values: The values to round, of any shape including 0-d.
+
+    Returns:
+        The rounded values, in the shape they arrived in.
     """
     array = np.asarray(values, dtype=np.float32)
     return from_bf16_words(words=as_bf16_words(values=array.reshape(-1))).reshape(array.shape)
@@ -424,13 +413,13 @@ def _fp32_abs_q7(bits: NDArray[np.uint32]) -> NDArray[np.int64]:
 
 
 def _bf16_round(value: float) -> int:
-    """Rounds one float to round-to-nearest-even BF16 bits, matching tools/emit_sfu_tables.py.
+    """Rounds one float to round-to-nearest-even BF16 bits, matching the table the SFU is programmed from.
 
     Args:
         value: The value to round.
 
     Returns:
-        The 16 BF16 bits.
+        The sixteen BF16 bits.
     """
     bits = struct.unpack("<I", struct.pack("<f", value))[0]
     return ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) & 0xFFFF

@@ -49,7 +49,7 @@ provision:
 	@$(HERE)minitpu/scripts/provision.sh
 
 run:
-	@$(PYTHON) $(HERE)run_minitpu.py
+	@$(PYTHON) $(HERE)run_example_kernel.py
 
 check:
 	@$(PYTHON) $(HERE)minitpu/scripts/check_package.py

@@ -121,28 +121,37 @@ Two costs are worth knowing because they are temporary, not inherent:
 
 ## Files
 
-The package is four layers. Each one only knows about the one below it.
+The package is three layers. Each one only knows about the one below it.
 
 | Path | Purpose |
 | --- | --- |
-| | **The chat stack** |
-| `minichat.py` | **Entry point for the demo.** Tokenizer, sampling, generation loop, and the PS's half of GPT-2: embeddings and the tied language head. `make chat`. |
-| `run_gpt2_forward.py` | The flat transformer body: eighteen launches per layer plus `forward` / `prefill` / `decode_step`. Read this to see the program. |
 | | **The kernels** |
 | `gpt2_kernels.py` | **Entry point for the checks.** Host drivers, layer references, the board suite. `make kernels`. |
 | `kernels.py` | Every assembled program. The machine has no hazard interlocks, so each schedule is a correctness argument and the comments carry it. |
 | `bf16.py` | Device geometry, BF16 packing, operand layouts, host references. Touches no device, so it can be checked by inspection. |
+| `layout.py` | Where a tensor's elements live and what that costs: the DMEM tiling ABI and the VMEM allocator. |
+| `dsl.py` | The kernel surface. The programmer writes layouts and tiling; every descriptor and `vld`/`vst` field is derived. |
 | | **The assembler** |
 | `asm.py` | Fills delay fields, and **rejects** what no delay can fix. |
+| `isa_model.py` | The per-opcode scheduling facts `asm.py` schedules against. Generated — run `tools/gen_isa_doc.py --write`, never edit by hand. |
 | | **The board** |
 | `minitpu/` | Bitstream, device-tree overlay, PL bring-up scripts. |
 | `minitpu_runtime/runtime/` | Board runtime: UIO, udmabuf, COPY, LAUNCH. |
 | `minitpu_runtime/minitpu/` | Hardware ABI, register map, launch limits. |
 | | **Examples and tests** |
-| `run_minitpu.py` | An editable example program, meant to be opened and changed. |
-| `run_minitpu_bare.py` | The same example against the explicit allocate/COPY/LAUNCH primitives. |
-| `run_layernorm.py` | Single-row LayerNorm at the faithful 768 width. |
+| `run_example_kernel.py` | A hand-written example program, meant to be opened and changed. `make run`. |
+| `run_compiled_kernel.py` | Launches the image the compiler produced. `tools/sim_triton_kernel.py` compiles it and copies it here. |
 | `tests/` | Host-only tests: assembler encodings, scheduling distances, the operand rule. `make check` runs them. |
+
+The two example runners are not variants of each other: `run_example_kernel.py`
+assembles its own source and calls it through the high-level callable, while
+`run_compiled_kernel.py` launches a pre-built `triton_kernel.bin` against the
+explicit allocate/COPY/LAUNCH primitives and reduces the drain on the host.
+
+**The chat stack is not in this tree.** `minichat.py` and `run_gpt2_forward.py`
+are described below and named by the `chat` target, but neither file ships here;
+the same is true of most of the `reproduce` targets. `make help`, `minitpu`,
+`provision`, `run`, `check`, `identity` and `kernels` are the ones that work.
 
 ## Reading `asm.py` first
 
@@ -167,7 +176,7 @@ numbers; `tb_isa_conformance.sv` holds the RTL to it and
 
 ## Writing a kernel
 
-Edit `run_minitpu.py`. The `@minitpu.asm` decorator runs the Python function as
+Edit `run_example_kernel.py`. The `@minitpu.asm` decorator runs the Python function as
 an assembler, emitting one 128-bit VLIW bundle per `minitpu.bundle` call. Every
 program must end in `F:halt`.
 
@@ -189,11 +198,13 @@ Arguments are C-contiguous `numpy.uint16` arrays — the BF16 wire format. Every
 argument before the last is an input; the last is the output. On a board whose
 UIO node is named differently, use `@minitpu(uio_name="my-minitpu")`.
 
-`run_minitpu.py` keeps its own copy of the example program on purpose: it is the
-file you open to see what one looks like. `tests/test_kernels.py` asserts that
-copy still assembles to the same image as `kernels.py`'s, because it once did
-not — a DMA row pitch stayed at 64 bytes after BF16-native halved a row to 32,
-so every descriptor read every other row, and nothing compared the two.
+`run_example_kernel.py` keeps its own copy of the example program on purpose: it
+is the file you open to see what one looks like. Nothing compares the two copies
+directly; each is held to a numpy reference on the board instead, `check_mul_add`
+in `gpt2_kernels.py` for `kernels.py`'s and `main` for its own. Keep it that way
+when you edit either: the copies once disagreed because a DMA row pitch stayed at
+64 bytes after BF16-native halved a row to 32, so every descriptor read every
+other row, and a check against the other copy would not have caught it.
 
 ## The chat demo
 

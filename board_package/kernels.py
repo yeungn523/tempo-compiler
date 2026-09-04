@@ -101,7 +101,7 @@ def single_mul_add() -> None:
         bundles[pc] = {"s": minitpu.smov_arg(0, 0) if tile == 0 else minitpu.saddi(0, 0, tile_bytes)}; pc += 1
         # The DMA row pitch, which is one lane stripe. This was a literal 64 until BF16-native
         # halved the container and nothing updated it, so every descriptor walked DRAM at twice
-        # the row size and read every other row. run_minitpu.py's copy of this kernel was fixed;
+        # the row size and read every other row. run_example_kernel.py's copy of this kernel was fixed;
         # this one was not, which is why the two disagreed.
         bundles[pc] = {"s": minitpu.smovi(1, _ROW_BYTES)}; pc += 1
         bundles[pc] = {"s": minitpu.smov_arg(2, 1) if tile == 0 else minitpu.saddi(2, 2, tile_bytes)}; pc += 1

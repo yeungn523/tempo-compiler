@@ -155,7 +155,7 @@ def main() -> int:
             )
             raise RuntimeError(message)
     print(f"copied   the image and its operands to {_BOARD}:{_BOARD_DIRECTORY}")
-    print(f"run      ssh {_BOARD} 'cd board_package && python3 run_triton.py'")
+    print(f"run      ssh {_BOARD} 'cd board_package && python3 run_compiled_kernel.py'")
     return 0
 
 

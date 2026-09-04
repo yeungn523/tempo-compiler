@@ -86,6 +86,7 @@ from bf16 import (  # noqa: E402,F401  -- re-exported: the board and tools impor
     _single_launch_operands,
     as_bf16_words,
     assert_operands_discriminating,
+    build_operands,
     from_bf16_words,
     gelu_lut_reference,
     layernorm_constants,
@@ -268,7 +269,7 @@ def upload_bias(h_bias: NDArray[np.float32]) -> ResidentWeights:
 #:
 #: Sound only while every launch in the process stages through `_stage_image`.
 #: Every driver in this module does. A program that also runs a decorated kernel
-#: from `run_minitpu.py`, which stages its own image through the runtime, would
+#: from `run_example_kernel.py`, which stages its own image through the runtime, would
 #: leave this stale -- so the cache belongs in the runtime rather than here once
 #: anything needs to mix the two.
 _RESIDENT_IMAGES: dict[bytes, int] = {}
@@ -2157,19 +2158,16 @@ def check_full_gemm(*, tokens: int = 32, depth: int = 768, columns: int = 3072) 
     """
     launches = tokens // _BLOCK_TOKENS
 
-    left = np.arange(tokens * depth, dtype=np.float32).reshape(tokens, depth) % 2
-    scales = (2.0 ** -(np.arange(columns) % 4)) / 16.0
-    right = np.broadcast_to(scales, shape=(depth, columns)).astype(np.float32)
+    left, right = build_operands(tokens, depth, columns, kind="structured", seed=0)
 
     started = time.perf_counter()
     actual = full_gemm(activations=left, weights=right)
     elapsed = time.perf_counter() - started
     np.testing.assert_allclose(actual, left @ right, rtol=0, atol=0)
 
-    rng = np.random.default_rng(0)
-    varying_left = _on_bf16_grid(values=rng.standard_normal((tokens, depth)).astype(np.float32))
-    varying_right = _on_bf16_grid(values=rng.standard_normal((depth, columns)).astype(np.float32))
-    assert_operands_discriminating(activations=varying_left, weights=varying_right)
+    # build_operands runs assert_operands_discriminating on this pair, so a set that stopped
+    # varying along an axis fails here rather than passing the check below for free.
+    varying_left, varying_right = build_operands(tokens, depth, columns, kind="varying", seed=0)
     varying_actual = full_gemm(activations=varying_left, weights=varying_right)
     expected = varying_left.astype(np.float64) @ varying_right.astype(np.float64)
     error = float(np.linalg.norm(varying_actual - expected) / np.linalg.norm(expected))

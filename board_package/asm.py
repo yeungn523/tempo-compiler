@@ -3,7 +3,7 @@ that makes a stream of them legal.
 
 The machine carries no hazard interlocks. It issues one bundle per cycle and the delay field is the only fetch-head
 hold, so every emitted image is spaced here before it reaches a board. The scheduling mirrors tb/bundle_scheduler.svh
-and both take their latencies from docs/isa_latency.json.
+and both take their latencies from compiler/minitpuisa.td.
 """
 
 from __future__ import annotations

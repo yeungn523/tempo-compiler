@@ -57,14 +57,17 @@ flash-attention reference anywhere here to check one against.
 
 ## Generated artifacts and single sources of truth
 
-- `docs/isa_latency.json` generates `docs/ISA_AND_INTERFACES.md`,
+- `compiler/minitpuisa.td` generates `docs/ISA_AND_INTERFACES.md`,
   `tb/isa_latency_pkg.sv` and `board_package/isa_model.py`. After editing it run
   `python3 tools/gen_isa_doc.py --write`; `--check` fails on a stale artifact.
+  It is TableGen read through `llvm-tblgen --dump-json`, so both need an
+  `llvm-tblgen` on PATH (or `$LLVM_TBLGEN`); nothing here needs an MLIR build.
+  A record left out of `kIsaOrder` is refused rather than silently dropped.
 - **That check is weaker here than upstream.** `tb/tb_isa_conformance.sv`, which
   asserts the published offsets equal `sequencer_pkg`'s `WB_W_*`, is not in this
   tree. `--check` proves the three artifacts agree with each other and nothing
   about the hardware. **Change the ISA in `minitpu-tmp` first**, where the RTL
-  can contradict you, then port the JSON.
+  can contradict you, then port the records.
 - `board_package/minitpu/platform.json` is the DMEM aperture map that ships with
   the bitstream; `runtime/address_space.py` mirrors it only as a fallback. The
   upstream `tools/check_platform_consistency.py` needs `fpga/` and is not here.

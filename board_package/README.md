@@ -170,7 +170,7 @@ can be enforced on every image, and `schedule()` is where to look:
 - `analyze_stalls` attributes every waiting cycle to the constraint that caused
   it, which is how the open hardware items are ranked.
 
-`docs/isa_latency.json` in the repo is the single source of truth for these
+`compiler/minitpuisa.td` in the repo is the single source of truth for these
 numbers; `tb_isa_conformance.sv` holds the RTL to it and
 `tools/gen_isa_doc.py --check` holds this package's constants to it.
 

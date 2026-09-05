@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Generate the ISA operation table and the RTL conformance package.
 
-`docs/isa_latency.json` is the single source of truth for the implemented
-scheduling contract.  Three artifacts are derived from it:
+`compiler/minitpuisa.td` is the single source of truth for the implemented
+scheduling contract.  It is read through `llvm-tblgen --dump-json`, so nothing
+here needs an MLIR build; the ODS operation definitions that will eventually
+join it are what needs `mlir-tblgen`, and they generate C++, not these.  Three
+artifacts are derived from it:
 
   docs/ISA_AND_INTERFACES.md   the operation table, between GENERATED markers
   tb/isa_latency_pkg.sv        constants tb_isa_conformance.sv checks the
@@ -20,11 +23,14 @@ from __future__ import annotations
 import argparse
 import re
 import json
+import os
 import pathlib
+import shutil
+import subprocess
 import sys
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
-SOURCE = REPO / "docs" / "isa_latency.json"
+SOURCE = REPO / "compiler" / "minitpuisa.td"
 DOC = REPO / "docs" / "ISA_AND_INTERFACES.md"
 PKG = REPO / "tb" / "isa_latency_pkg.sv"
 MODEL = REPO / "board_package" / "isa_model.py"
@@ -45,8 +51,159 @@ COLUMNS = (
 )
 
 
+TBLGEN_CANDIDATES = ("llvm-tblgen", "llvm-tblgen-18", "llvm-tblgen-17", "llvm-tblgen-19",
+                     "llvm-tblgen-20")
+"""Binaries tried in order when $LLVM_TBLGEN does not name one."""
+
+
+def _tblgen() -> str:
+    """Returns the llvm-tblgen to read the SSOT with.
+
+    Raises:
+        SystemExit: If none is on PATH, naming the environment variable that overrides the search.
+    """
+    override = os.environ.get("LLVM_TBLGEN")
+    if override:
+        return override
+    for candidate in TBLGEN_CANDIDATES:
+        found = shutil.which(candidate)
+        if found is not None:
+            return found
+    raise SystemExit(
+        f"Unable to read {SOURCE.relative_to(REPO)} without llvm-tblgen, which is not on PATH under any of "
+        f"{', '.join(TBLGEN_CANDIDATES)}. Install an LLVM package or set LLVM_TBLGEN to the binary."
+    )
+
+
+def _records() -> dict:
+    """Returns the TableGen record dump of the SSOT.
+
+    Raises:
+        SystemExit: If tblgen rejects the file, carrying its own diagnostic rather than a summary of one.
+    """
+    completed = subprocess.run([_tblgen(), "--dump-json", str(SOURCE)],
+                               capture_output=True, text=True)
+    if completed.returncode:
+        raise SystemExit(f"llvm-tblgen rejected {SOURCE.relative_to(REPO)}:\n{completed.stderr.strip()}")
+    return json.loads(completed.stdout)
+
+
+def _referenced(records: dict, entries: list) -> list:
+    """Resolves a field holding a list of record references to the records themselves."""
+    return [records[entry["def"]] for entry in entries]
+
+
+def _ordered(records: dict, cls: str, field: str) -> list:
+    """Returns every record of `cls`, in the order `kIsaOrder` names them.
+
+    TableGen's own record listing is sorted by record name rather than by definition order, and the order these
+    appear in is part of the contract, so the SSOT names it outright.
+
+    Raises:
+        SystemExit: If `kIsaOrder` omits a record. It is refused rather than dropped, because a mnemonic missing
+            from the generated model is a hazard the scheduler cannot then see.
+    """
+    listed = _referenced(records, records["kIsaOrder"][field])
+    named = {record["!name"] for record in listed}
+    missing = [name for name in records["!instanceof"].get(cls, ()) if name not in named]
+    if missing:
+        plural = "s" if len(missing) > 1 else ""
+        raise SystemExit(
+            f"{SOURCE.relative_to(REPO)} defines {cls} record{plural} {', '.join(missing)} that "
+            f"kIsaOrder.{field} does not list, so {'they' if plural else 'it'} would not reach the "
+            f"generated artifacts. Add {'them' if plural else 'it'} to the list."
+        )
+    return listed
+
+
+def _writeback(record: dict):
+    """Returns the writeback offset as the artifacts carry it: absent, one offset, or a range of beats.
+
+    An uninitialised offset states that the group reserves no write port at all, which is a different claim from
+    reserving it at cycle zero, so it stays distinguishable from a value here.
+    """
+    if record["writeback_offset"] is None:
+        return None
+    if record["writeback_last_offset"] is None:
+        return record["writeback_offset"]
+    return f"{record['writeback_offset']}..{record['writeback_last_offset']}"
+
+
+def _operations(records: dict) -> list:
+    """Returns one entry per operation group, shaped as the renderers below read it.
+
+    Notes:
+        An empty field is omitted rather than emitted, because `render_model` selects on whether a group names
+        opcodes at all and `_consumer` on whether it overrides its consumer offset.
+    """
+    groups = []
+    for record in _ordered(records, "OpGroup", "operations"):
+        entry = {
+            "slot": record["slot"],
+            "ops": record["mnemonics"],
+            "vreg_reads": record["vreg_reads"],
+            "vreg_writes": record["vreg_writes"],
+            "w": _writeback(record),
+            "issue": record["issue_requirement"],
+            "reads": record["register_reads"],
+            "writes": record["register_write"],
+            "port_a": bool(record["claims_read_port_a"]),
+        }
+        for key, value in (("opcodes", record["opcodes"]), ("rtl_enum", record["rtl_enumerators"]),
+                           ("rtl_param", record["rtl_parameter"]),
+                           ("consumer_override", record["consumer_override"])):
+            if value:
+                entry[key] = value
+        groups.append(entry)
+    return groups
+
+
+def _matrix(records: dict) -> dict:
+    """Returns the matrix commands' occupancy, result latency and port-A ownership."""
+    commands = _ordered(records, "MatrixCommand", "matrix_commands")
+    return {
+        "occupancy": {command["mnemonic"]: command["occupancy_cycles"] for command in commands},
+        "result_latency": {command["mnemonic"]: command["result_latency_cycles"] for command in commands
+                           if command["result_latency_cycles"] is not None},
+        "port_a_held_by": [command["mnemonic"] for command in commands if command["holds_read_port_a"]],
+    }
+
+
+def _resources(records: dict) -> dict:
+    """Returns each capacity's values, RTL parameter, asm.py constants and note."""
+    resources = {}
+    for record in _ordered(records, "Resource", "resources"):
+        spec = {value["name"]: value["value"]
+                for value in _referenced(records, record["values"])}
+        if record["rtl_parameter"]:
+            spec["rtl_param"] = record["rtl_parameter"]
+        spec["asm_constants"] = {constant["name"]: constant["resource_field"]
+                                 for constant in _referenced(records, record["asm_constants"])}
+        if record["note"]:
+            spec["note"] = record["note"]
+        resources[record["group"]] = spec
+    return resources
+
+
+def _profile(records: dict) -> dict:
+    """Returns the array geometry the writeback offsets are quoted against."""
+    record = records["kMiniTpuProfile"]
+    return {"num_lanes": record["lane_count"], "num_sublanes": record["sublane_count"],
+            "vreg_entries": record["vreg_entry_count"], "vreg_elements": record["vreg_element_count"],
+            "note": record["note"]}
+
+
 def _load() -> dict:
-    return json.loads(SOURCE.read_text())
+    """Returns the SSOT's records reshaped into the mapping every renderer below reads."""
+    records = _records()
+    return {
+        "profile": _profile(records),
+        "operations": _operations(records),
+        "rtl_params": {record["name"]: record["value"]
+                       for record in _ordered(records, "RtlParameter", "rtl_parameters")},
+        "matrix": _matrix(records),
+        "resources": _resources(records),
+    }
 
 
 def _consumer(entry: dict) -> str:
@@ -257,10 +414,10 @@ def check_asm_constants(data: dict) -> list:
                               source, re.MULTILINE)
             if match is None:
                 problems.append(f"board_package/asm.py does not define {name} "
-                                f"(docs/isa_latency.json resources.{group}.{field} = {expected})")
+                                f"(compiler/minitpuisa.td {group} resource, {field} = {expected})")
             elif int(match.group(1)) != expected:
                 problems.append(f"board_package/asm.py {name} = {match.group(1)}, but "
-                                f"docs/isa_latency.json resources.{group}.{field} = {expected}")
+                                f"compiler/minitpuisa.td {group} resource, {field} = {expected}")
     return problems
 
 
@@ -290,7 +447,7 @@ def main() -> int:
              if not p.exists() or p.read_text() != want]
     if stale:
         for path in stale:
-            print(f"STALE: {path} does not match docs/isa_latency.json", file=sys.stderr)
+            print(f"STALE: {path} does not match compiler/minitpuisa.td", file=sys.stderr)
         print("run: python3 tools/gen_isa_doc.py --write", file=sys.stderr)
         return 1
     drift = check_asm_constants(data)
@@ -299,7 +456,7 @@ def main() -> int:
             print(f"DRIFT: {message}", file=sys.stderr)
         return 1
     print("ISA doc, conformance package and asm.py constants are in sync "
-          "with docs/isa_latency.json")
+          "with compiler/minitpuisa.td")
     return 0
 
 

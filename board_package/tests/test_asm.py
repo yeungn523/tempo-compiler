@@ -1,6 +1,6 @@
 """Contains tests for the physical encodings and the hazard pricing performed by the public assembler.
 
-Mis-spacing is silent on a machine with no interlocks, so the distances asserted here track docs/isa_latency.json,
+Mis-spacing is silent on a machine with no interlocks, so the distances asserted here track compiler/minitpuisa.td,
 which tb/tb_isa_conformance.sv checks against the RTL's own WB_W_* constants.
 """
 

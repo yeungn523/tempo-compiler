@@ -29,7 +29,7 @@ class Profile
     string note = "";
 }
 
-def kMiniTpuProfile : Profile
+def MiniTpuProfile : Profile
 {
     let note = "W is the sequencer's single-write-port reservation offset; the earliest dependent consumer is L = W + 1.";
 }
@@ -90,7 +90,7 @@ class OpGroup<string slot_letter, list<string> mnemonic_names>
     list<string> rtl_enumerators = [];
 }
 
-def kVectorAlu : OpGroup<"E", ["vadd", "vsub", "vmul", "vmax", "vmin"]>
+def VectorAlu : OpGroup<"E", ["vadd", "vsub", "vmul", "vmax", "vmin"]>
 {
     let vreg_reads = "A+B";
     let vreg_writes = "1 full VREG";
@@ -104,7 +104,7 @@ def kVectorAlu : OpGroup<"E", ["vadd", "vsub", "vmul", "vmax", "vmin"]>
     let rtl_enumerators = ["E_VADD", "E_VSUB", "E_VMUL", "E_VMAX", "E_VMIN"];
 }
 
-def kVectorMove : OpGroup<"E", ["vmov"]>
+def VectorMove : OpGroup<"E", ["vmov"]>
 {
     let vreg_reads = "A";
     let vreg_writes = "1 full VREG";
@@ -118,7 +118,7 @@ def kVectorMove : OpGroup<"E", ["vmov"]>
     let rtl_enumerators = ["E_VMOV"];
 }
 
-def kVectorSfu : OpGroup<"E", ["vgelu", "vexp", "vrecip", "vrsqrt"]>
+def VectorSfu : OpGroup<"E", ["vgelu", "vexp", "vrecip", "vrsqrt"]>
 {
     let vreg_reads = "A";
     let vreg_writes = "1 full VREG";
@@ -132,7 +132,7 @@ def kVectorSfu : OpGroup<"E", ["vgelu", "vexp", "vrecip", "vrsqrt"]>
     let rtl_enumerators = ["E_VGELU", "E_VEXP", "E_VRECIP", "E_VRSQRT"];
 }
 
-def kVectorReduce : OpGroup<"E", ["vredsum", "vredmax"]>
+def VectorReduce : OpGroup<"E", ["vredsum", "vredmax"]>
 {
     let vreg_reads = "A, all 64 elements";
     let vreg_writes = "1 broadcast VREG";
@@ -146,7 +146,7 @@ def kVectorReduce : OpGroup<"E", ["vredsum", "vredmax"]>
     let rtl_enumerators = ["E_VREDSUM", "E_VREDMAX"];
 }
 
-def kTransposeIn : OpGroup<"E", ["vtxin"]>
+def TransposeIn : OpGroup<"E", ["vtxin"]>
 {
     let vreg_reads = "A";
     let vreg_writes = "the transpose staging array";
@@ -157,7 +157,7 @@ def kTransposeIn : OpGroup<"E", ["vtxin"]>
     let rtl_enumerators = ["E_VTXIN"];
 }
 
-def kTransposeOut : OpGroup<"E", ["vtxout"]>
+def TransposeOut : OpGroup<"E", ["vtxout"]>
 {
     let vreg_reads = "the transpose staging array";
     let vreg_writes = "1 full VREG";
@@ -169,7 +169,7 @@ def kTransposeOut : OpGroup<"E", ["vtxout"]>
     let rtl_enumerators = ["E_VTXOUT"];
 }
 
-def kVectorLoad : OpGroup<"X", ["vld"]>
+def VectorLoad : OpGroup<"X", ["vld"]>
 {
     let vreg_reads = "VMEM compute port";
     let vreg_writes = "1 full/masked VREG";
@@ -180,7 +180,7 @@ def kVectorLoad : OpGroup<"X", ["vld"]>
     let register_write = "vreg";
 }
 
-def kVectorStore : OpGroup<"X", ["vst"]>
+def VectorStore : OpGroup<"X", ["vst"]>
 {
     let vreg_reads = "A";
     let vreg_writes = "VMEM compute port";
@@ -189,7 +189,7 @@ def kVectorStore : OpGroup<"X", ["vst"]>
     let claims_read_port_a = 1;
 }
 
-def kMatrixLoad : OpGroup<"M", ["vmatload"]>
+def MatrixLoad : OpGroup<"M", ["vmatload"]>
 {
     let vreg_reads = "A over four VREGs";
     let vreg_writes = "MXU weight input";
@@ -200,7 +200,7 @@ def kMatrixLoad : OpGroup<"M", ["vmatload"]>
     let rtl_enumerators = ["M_VMATLOAD"];
 }
 
-def kMatrixPush : OpGroup<"M", ["vmatpush"]>
+def MatrixPush : OpGroup<"M", ["vmatpush"]>
 {
     let vreg_reads = "A over one VREG";
     let vreg_writes = "MXU activation input";
@@ -211,7 +211,7 @@ def kMatrixPush : OpGroup<"M", ["vmatpush"]>
     let rtl_enumerators = ["M_VMATPUSH"];
 }
 
-def kMatrixPop : OpGroup<"M", ["vmatpop"]>
+def MatrixPop : OpGroup<"M", ["vmatpop"]>
 {
     let vreg_reads = "MXU output";
     let vreg_writes = "1 VREG, four masked beats";
@@ -225,7 +225,7 @@ def kMatrixPop : OpGroup<"M", ["vmatpop"]>
     let rtl_enumerators = ["M_VMATPOP"];
 }
 
-def kScalar : OpGroup<"S", ["smovi", "smov_arg", "saddi", "smac", "sshl"]>
+def Scalar : OpGroup<"S", ["smovi", "smov_arg", "saddi", "smac", "sshl"]>
 {
     let vreg_reads = "no VREG";
     let vreg_writes = "one of four SREGs";
@@ -236,7 +236,7 @@ def kScalar : OpGroup<"S", ["smovi", "smov_arg", "saddi", "smac", "sshl"]>
     let rtl_enumerators = ["SMOVI", "SMOV_ARG", "SADDI", "SMAC", "SSHL"];
 }
 
-def kDescriptor : OpGroup<"D", ["vmemld", "vmemst"]>
+def Descriptor : OpGroup<"D", ["vmemld", "vmemst"]>
 {
     let vreg_reads = "other VMEM slot";
     let vreg_writes = "no VREG";
@@ -245,7 +245,7 @@ def kDescriptor : OpGroup<"D", ["vmemld", "vmemst"]>
     let register_reads = ["base_sreg", "stride_sreg"];
 }
 
-def kControl : OpGroup<"F", ["lbegin", "loop_end", "flush_slot", "halt", "vmemswap"]>
+def Control : OpGroup<"F", ["lbegin", "loop_end", "flush_slot", "halt", "vmemswap"]>
 {
     let vreg_reads = "none";
     let vreg_writes = "none";
@@ -274,12 +274,12 @@ class RtlParameter<string parameter_name, int offset_cycles>
     int value = offset_cycles;
 }
 
-def kWritebackAlu : RtlParameter<"WB_W_ALU", 5>;
-def kWritebackSfu : RtlParameter<"WB_W_SFU", 7>;
-def kWritebackReduce : RtlParameter<"WB_W_REDUCE", 15>;
-def kWritebackVectorLoad : RtlParameter<"WB_W_VLD", 6>;
-def kWritebackMatrixPopFirst : RtlParameter<"WB_W_MPOP_FIRST", 3>;
-def kWritebackMatrixPopLast : RtlParameter<"WB_W_MPOP_LAST", 6>;
+def WritebackAlu : RtlParameter<"WB_W_ALU", 5>;
+def WritebackSfu : RtlParameter<"WB_W_SFU", 7>;
+def WritebackReduce : RtlParameter<"WB_W_REDUCE", 15>;
+def WritebackVectorLoad : RtlParameter<"WB_W_VLD", 6>;
+def WritebackMatrixPopFirst : RtlParameter<"WB_W_MPOP_FIRST", 3>;
+def WritebackMatrixPopLast : RtlParameter<"WB_W_MPOP_LAST", 6>;
 
 /**
  * @brief Stores the occupancy and result latency of one matrix command, which are two separate scheduling inputs.
@@ -308,18 +308,18 @@ class MatrixCommand<string command_mnemonic, int busy_cycles>
     bit holds_read_port_a = 0;
 }
 
-def kMatrixLoadCommand : MatrixCommand<"vmatload", 18>
+def MatrixLoadCommand : MatrixCommand<"vmatload", 18>
 {
     let holds_read_port_a = 1;
 }
 
-def kMatrixPushCommand : MatrixCommand<"vmatpush", 5>
+def MatrixPushCommand : MatrixCommand<"vmatpush", 5>
 {
     let result_latency_cycles = 82;
     let holds_read_port_a = 1;
 }
 
-def kMatrixPopCommand : MatrixCommand<"vmatpop", 7>;
+def MatrixPopCommand : MatrixCommand<"vmatpop", 7>;
 
 /**
  * @brief Stores one named value belonging to a hardware capacity.
@@ -381,7 +381,7 @@ class Resource<string group_name>
     string note = "";
 }
 
-def kMatrixOutputFifo : Resource<"mxu_output_fifo">
+def MatrixOutputFifo : Resource<"mxu_output_fifo">
 {
     let rtl_parameter = "MXU_OUTPUT_FIFO_DEPTH";
     let values = [ResourceValue<"depth", 32>,
@@ -393,7 +393,7 @@ def kMatrixOutputFifo : Resource<"mxu_output_fifo">
     let note = "One per lane (mxu.sv gen_lane_output). A vmatpush streams NUM_SUBLANES activation rows and so produces that many entries; a vmatpop consumes the same across its masked beats. Overflow drops results silently -- vpu_fifo.sv has no replay path.";
 }
 
-def kLoopBuffer : Resource<"loop_buffer">
+def LoopBuffer : Resource<"loop_buffer">
 {
     let rtl_parameter = "LB_CAP";
     let values = [ResourceValue<"capacity_bundles", 24>];
@@ -401,7 +401,7 @@ def kLoopBuffer : Resource<"loop_buffer">
     let note = "A body longer than this refetches from IRAM instead of replaying. tools/pilot_loop_buffer.py measured no throughput step at the boundary on a board, so it bounds replay rather than speed.";
 }
 
-def kDelayField : Resource<"delay_field">
+def DelayField : Resource<"delay_field">
 {
     let rtl_parameter = "DELAY_W";
     let values = [ResourceValue<"width_bits", 6>];
@@ -409,7 +409,7 @@ def kDelayField : Resource<"delay_field">
     let note = "One bundle spaces at most 2**width-1 cycles, while a vmatpush result is 82 away, so every push-to-pop gap needs a filler bundle.";
 }
 
-def kDmaSlots : Resource<"dma_slots">
+def DmaSlots : Resource<"dma_slots">
 {
     let rtl_parameter = "DMA_SLOT_COUNT";
     let values = [ResourceValue<"count", 2>];
@@ -441,19 +441,19 @@ class EmissionOrder
     list<Resource> resources = [];
 }
 
-def kIsaOrder : EmissionOrder
+def IsaOrder : EmissionOrder
 {
-    let operations = [kVectorAlu, kVectorMove, kVectorSfu, kVectorReduce, kTransposeIn, kTransposeOut,
-                      kVectorLoad, kVectorStore,
-                      kMatrixLoad, kMatrixPush, kMatrixPop,
-                      kScalar, kDescriptor, kControl];
+    let operations = [VectorAlu, VectorMove, VectorSfu, VectorReduce, TransposeIn, TransposeOut,
+                      VectorLoad, VectorStore,
+                      MatrixLoad, MatrixPush, MatrixPop,
+                      Scalar, Descriptor, Control];
 
-    let rtl_parameters = [kWritebackAlu, kWritebackSfu, kWritebackReduce, kWritebackVectorLoad,
-                          kWritebackMatrixPopFirst, kWritebackMatrixPopLast];
+    let rtl_parameters = [WritebackAlu, WritebackSfu, WritebackReduce, WritebackVectorLoad,
+                          WritebackMatrixPopFirst, WritebackMatrixPopLast];
 
-    let matrix_commands = [kMatrixLoadCommand, kMatrixPushCommand, kMatrixPopCommand];
+    let matrix_commands = [MatrixLoadCommand, MatrixPushCommand, MatrixPopCommand];
 
-    let resources = [kMatrixOutputFifo, kLoopBuffer, kDelayField, kDmaSlots];
+    let resources = [MatrixOutputFifo, LoopBuffer, DelayField, DmaSlots];
 }
 
 // The dialect's operation definitions belong beside the scheduling records they constrain. Adding them makes the file

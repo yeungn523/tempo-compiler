@@ -223,5 +223,9 @@ docs/
 # FPGA bitstreams
 *.bit.bin
 
-# Agent instructions symlink (AGENTS.md is the tracked source)
+AGENTS.md
 CLAUDE.md
+
+# Analysis and inspection tooling, not part of the shipped compiler
+tools/check_codegen.py
+tools/golden/

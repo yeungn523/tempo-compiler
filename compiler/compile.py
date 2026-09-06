@@ -15,7 +15,7 @@ from triton.runtime import JITFunction
 from .frontend import compile_to_ttir
 
 _VREG_ENTRIES: int = 32
-"""Vector registers the file holds, matching kMiniTpuProfile's vreg_entry_count in compiler/minitpuisa.td."""
+"""Vector registers the file holds, matching MiniTpuProfile's vreg_entry_count in compiler/minitpuisa.td."""
 
 _ACCUMULATOR_VREGS: int = _TOKEN_GROUPS * _TILE_VREGS
 """Registers one output tile's accumulator occupies."""

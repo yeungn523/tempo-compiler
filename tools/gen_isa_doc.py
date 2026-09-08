@@ -112,6 +112,7 @@ def _load() -> dict[str, Any]:
     """Returns the source's records reshaped into the mapping every renderer below reads."""
     records = _records()
     return {
+        "profile": _profile(records),
         "operations": _operations(records),
         "rtl_params": {record["name"]: record["value"]
                        for record in _ordered(records, "RtlParameter", "rtl_parameters")},
@@ -182,6 +183,19 @@ def _ordered(records: dict[str, Any], record_class: str, field: str) -> list[dic
         )
         raise SystemExit(message)
     return listed
+
+
+def _profile(records: dict[str, Any]) -> dict[str, int]:
+    """Returns the array geometry every published offset is quoted against.
+
+    Notes:
+        Every integer field of the record reaches the model, rather than the ones this function happens to name, so
+        a capacity added to Profile is published without an edit here and cannot sit in the source unread while a
+        consumer hand-copies it. The fields sort by name, because the order is otherwise tblgen's to change.
+    """
+    record = records["MiniTpuProfile"]
+    return {name: value for name, value in sorted(record.items())
+            if not name.startswith("!") and isinstance(value, int) and not isinstance(value, bool)}
 
 
 def _operations(records: dict[str, Any]) -> list[dict[str, Any]]:
@@ -348,9 +362,16 @@ def _consumer(entry: dict[str, Any]) -> str:
 
 
 def _capacity(spec: dict[str, Any]) -> int | None:
-    """Returns the value the resource's first assembler constant names, or None when it names no constant."""
+    """Returns the resource's headline value, being the one its first assembler constant names.
+
+    A resource binding no assembler constant falls back to its first value, so a capacity no constant mirrors still
+    publishes a number rather than a dash.
+    """
     field = next(iter(spec["asm_constants"].values()), None)
-    return None if field is None else spec[field]
+    if field is not None:
+        return spec[field]
+    values = [name for name in spec if name not in {"rtl_param", "asm_constants", "note"}]
+    return spec[values[0]] if values else None
 
 
 def _render_package(data: dict[str, Any]) -> str:
@@ -382,6 +403,14 @@ def _render_model(data: dict[str, Any]) -> str:
         '"""',
         "",
         "from __future__ import annotations",
+        "",
+        "PROFILE: dict[str, int] = {",
+    ]
+    for name, value in data["profile"].items():
+        lines.append(f"    {_python_literal(name)}: {value},")
+    lines += [
+        "}",
+        '"""Array geometry every offset below is quoted against, and every capacity a consumer derives from it."""',
         "",
         "RTL_PARAMS: dict[str, int] = {",
     ]

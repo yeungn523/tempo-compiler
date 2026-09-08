@@ -490,12 +490,17 @@ class AsmKernel:
     """The name the kernel's error messages carry."""
     bundles: tuple[int, ...]
     """The bundle words the kernel emitted, in program order."""
+    placement: str | None = None
+    """The re-placement pass this kernel is built with, or None to take the one `MINITPU_PACK` selects.
+
+    Whether re-placement pays depends on what the kernel waits on, so the choice belongs to the kernel.
+    """
 
     def assemble(self, *, pad_to: int | None = None) -> tuple[int, ...]:
         """Returns the kernel's scheduled image, padded by repeating its final bundle.
 
-        Re-placement stays opt-in through `MINITPU_PACK`, and it forms part of the memo key because it changes the
-        image.
+        Re-placement comes from `placement`, or from `MINITPU_PACK` when the kernel names none. It forms part of the
+        memo key because it changes the image.
 
         Args:
             pad_to: The bundle count the image is padded to a multiple of, or None to leave it unpadded.
@@ -503,7 +508,8 @@ class AsmKernel:
         Returns:
             The scheduled bundle words.
         """
-        words = list(_scheduled(self.name, self.bundles, _placement()))
+        placement = _placement() if self.placement is None else self.placement
+        words = list(_scheduled(self.name, self.bundles, placement))
         if pad_to is not None:
             while len(words) % pad_to:
                 words.append(words[-1])
@@ -721,7 +727,7 @@ def analyze_stalls(words: list[int]) -> dict:
     return {"cycles": t_prev + 1, "bundles": len(words), "stalls": causes}
 
 
-def asm(function: Callable[[], None], *, namespace: str = "asm") -> AsmKernel:
+def asm(function: Callable[[], None], *, namespace: str = "asm", placement: str | None = None) -> AsmKernel:
     """Captures the bundles an explicit VLIW construction function emits.
 
     A fresh builder is bound into the function's own globals under `namespace` for the call and the previous
@@ -731,6 +737,7 @@ def asm(function: Callable[[], None], *, namespace: str = "asm") -> AsmKernel:
     Args:
         function: The kernel body, which emits its bundles through the bound builder.
         namespace: The global name the builder is bound to for the call.
+        placement: The re-placement pass the kernel is built with, or None to take the one `MINITPU_PACK` selects.
 
     Returns:
         The captured kernel.
@@ -749,7 +756,7 @@ def asm(function: Callable[[], None], *, namespace: str = "asm") -> AsmKernel:
             globals_dict.pop(namespace, None)
         else:
             globals_dict[namespace] = previous
-    kernel = AsmKernel(function.__name__, tuple(builder.bundles))
+    kernel = AsmKernel(function.__name__, tuple(builder.bundles), placement)
     kernel.assemble()
     return kernel
 

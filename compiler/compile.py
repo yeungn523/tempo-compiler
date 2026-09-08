@@ -10,12 +10,13 @@ import numpy as np
 from numpy.typing import NDArray
 
 from bf16 import _BLOCK_DEPTH, _BLOCK_TOKENS, _TILE, _TILE_VREGS, _TOKEN_GROUPS, _ZERO_TILE_WORDS
+from isa_model import PROFILE
 from triton.runtime import JITFunction
 
 from .frontend import compile_to_ttir
 
-_VREG_ENTRIES: int = 32
-"""Vector registers the file holds, matching MiniTpuProfile's vreg_entry_count in compiler/minitpuisa.td."""
+_VREG_ENTRIES: int = PROFILE["vreg_entry_count"]
+"""Vector registers the file holds, read from MiniTpuProfile in compiler/minitpuisa.td rather than restated here."""
 
 _ACCUMULATOR_VREGS: int = _TOKEN_GROUPS * _TILE_VREGS
 """Registers one output tile's accumulator occupies."""

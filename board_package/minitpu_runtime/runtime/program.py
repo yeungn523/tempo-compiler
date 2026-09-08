@@ -61,17 +61,19 @@ class minitpuAssembly:
     performs every runtime step.
     """
 
-    def asm(self, function=None, *, uio_name: str = "minitpu"):
+    def asm(self, function=None, *, uio_name: str = "minitpu", placement: str | None = None):
         """Assembles a function and returns its callable program wrapper.
 
         Args:
             function: The function to assemble, or None to return a decorator that takes it.
             uio_name: The UIO node name of the board the program runs on.
+            placement: The re-placement pass the kernel is built with, or None to take the one `MINITPU_PACK`
+                selects.
         """
         if function is None:
-            return lambda assembly_function: self.asm(assembly_function, uio_name=uio_name)
+            return lambda assembly_function: self.asm(assembly_function, uio_name=uio_name, placement=placement)
         assembler = import_module("asm")
-        image = assembler.asm(function, namespace="minitpu")
+        image = assembler.asm(function, namespace="minitpu", placement=placement)
         return minitpuKernel(image, uio_name=uio_name)
 
 

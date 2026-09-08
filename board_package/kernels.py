@@ -125,7 +125,7 @@ def single_mul_add() -> None:
 
 def build_looped_gemm(column_tiles: int, groups: int, *, activate: bool,
                       fuse_groups: bool = False, loop_blocks: int = _LOOP_BLOCKS,
-                      problems: int = 1, problem_activation_bytes: int = 0
+                      batch: int = 1, batch_activation_bytes: int = 0
                       ) -> MinitpuKernel:
     """Assembles the tiled GEMM with each block's staging hidden behind the previous block's compute.
 
@@ -142,14 +142,14 @@ def build_looped_gemm(column_tiles: int, groups: int, *, activate: bool,
         loop_blocks: Blocks of `_BLOCK_DEPTH` one contraction group accumulates. The default makes
             a group 192 deep, which is why GPT-2's contractions must be multiples of 192; attention
             wants 64, which is this at 2.
-        problems: INDEPENDENT products in one launch -- a grouped GEMM. This is the axis a
+        batch: INDEPENDENT products in one launch -- a grouped GEMM. This is the axis a
             block-diagonal operand was standing in for: attention runs 12 heads (and B sequences)
             that may not see each other, and encoding that as zeros off the diagonal costs a factor
             of `heads * B` in multiplies. As a loop level it costs a loop level.
 
             All three operands must be contiguous from one problem to the next, which is what makes
             the weight and drain pointers need no bookkeeping at all: they already walk forward.
-        problem_activation_bytes: How far the activation pointer moves between problems. Needed
+        batch_activation_bytes: How far the activation pointer moves between problems. Needed
             because the activation pointer, unlike the other two, is REWOUND for every output column
             tile -- each column tile re-reads the whole left operand.
 
@@ -166,8 +166,8 @@ def build_looped_gemm(column_tiles: int, groups: int, *, activate: bool,
             f"every block and a descriptor names its slot outright, so a group must carry an even count."
         )
         raise ValueError(message)
-    if problems < 1:
-        message = f"Unable to run {problems} products in one launch. At least one."
+    if batch < 1:
+        message = f"Unable to run {batch} products in one launch. At least one."
         raise ValueError(message)
 
     def looped_gemm() -> None:
@@ -227,17 +227,17 @@ def build_looped_gemm(column_tiles: int, groups: int, *, activate: bool,
         # It is rewound by SUBTRACTION instead -- the body's net movement is known
         # here, because every advance is emitted here -- which needs no register and
         # leaves the pointer free to walk on to the next problem.
-        grouped = problems > 1
-        if grouped:
-            # OUTSIDE the problem loop. Seeding the pointer inside it resets every
+        batched = batch > 1
+        if batched:
+            # OUTSIDE the batch loop. Seeding the pointer inside it resets every
             # problem to the first one's operand, which the first problem cannot
             # tell you: it is the only one for which that is the right answer.
             bundles[pc] = {"s": minitpu.smov_arg(0, 0)}; pc += 1
             pc += 2
-            bundles[pc] = {"f": minitpu.lbegin(problems)}; pc += 1
+            bundles[pc] = {"f": minitpu.lbegin(batch)}; pc += 1
 
         bundles[pc] = {"f": minitpu.lbegin(column_tiles)}; pc += 1
-        if not grouped:
+        if not batched:
             bundles[pc] = {"s": minitpu.smov_arg(0, 0)}; pc += 1               # sreg0 rewinds to this column tile
             pc += 1                                                        # scalar writeback latency
         bundles[pc] = {"s": minitpu.saddi(0, 0, _BLOCK_ACTIVATION_BYTES)}; pc += 1
@@ -298,19 +298,19 @@ def build_looped_gemm(column_tiles: int, groups: int, *, activate: bool,
         bundles[pc] = {"f": minitpu.loop_end()}; pc += 1                  # closes the group loop
         if fuse_groups:
             pc = emit_drain(pc)
-        if grouped:
+        if batched:
             # Undo this column tile's walk down the activation. Every term is a
             # `saddi` emitted above: the leading block, then per contraction group a
             # rewind of one block and an advance of `loop_blocks` of them.
             walked = _BLOCK_ACTIVATION_BYTES * (1 + groups * loop_blocks)
             pc = _advance(bundles, pc, 0, -walked)
         bundles[pc] = {"f": minitpu.loop_end()}; pc += 1                  # closes the column loop
-        if grouped:
+        if batched:
             # On to the next problem. The weight and drain pointers are already
             # there: both only ever walk forward, and one problem's operands end
             # exactly where the next one's begin.
-            pc = _advance(bundles, pc, 0, problem_activation_bytes)
-            bundles[pc] = {"f": minitpu.loop_end()}; pc += 1              # closes the problem loop
+            pc = _advance(bundles, pc, 0, batch_activation_bytes)
+            bundles[pc] = {"f": minitpu.loop_end()}; pc += 1              # closes the batch loop
         bundles[pc] = {"f": minitpu.halt()}; pc += 1
 
         for index in range(pc):
@@ -421,7 +421,9 @@ def build_elementwise_add(chunks: int, *, broadcast_right: bool = False) -> Mini
         for index in range(pc):
             minitpu.bundle(**bundles.get(index, {}))
 
-    return minitpu.asm(elementwise_add)
+    # Packs, because the hand placement pads with empty bundles that carry no wait. Dropping them shrinks the image
+    # and leaves the schedule as it was.
+    return minitpu.asm(elementwise_add, placement="pack")
 
 
 def build_tile_transpose(tiles: int, *, load_pitch: int, store_pitch: int,
@@ -1187,7 +1189,9 @@ def build_layernorm_rows(rows: int, *, packed: bool = False) -> MinitpuKernel:
         for index in range(pc):
             minitpu.bundle(**bundles.get(index, {}))
 
-    return minitpu.asm(layernorm_rows_kernel)
+    # Packs, because this kernel waits on a dependent chain of E-slot reductions rather than on the matrix array.
+    # Co-issuing the independent work between those links is what shortens it.
+    return minitpu.asm(layernorm_rows_kernel, placement="pack")
 
 
 def _emit_gemm_step(

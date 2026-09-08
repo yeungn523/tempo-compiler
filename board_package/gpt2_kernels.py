@@ -1530,7 +1530,7 @@ def _grouped_operands(rows: int, heads: int, head: int, span: int):
 
         `[heads, head_dim, span]` for the transposed keys and `[heads, span, head]`
         for the values -- one independent weight matrix per head, contiguous, which
-        is exactly what `build_looped_gemm(problems=heads)` walks.
+        is exactly what `build_looped_gemm(batch=heads)` walks.
 
     Args:
         rows: Padded rows attended over.
@@ -1694,8 +1694,8 @@ def _grouped_product(d_left, d_weights: ResidentWeights, *, heads: int, rows: in
         (name, columns // _TILE, depth, heads),
         lambda: build_looped_gemm(
             column_tiles=columns // _TILE, groups=1, activate=False,
-            fuse_groups=True, loop_blocks=depth // _BLOCK_DEPTH, problems=heads,
-            problem_activation_bytes=_BLOCK_TOKENS * depth * _ELEMENT_BYTES))
+            fuse_groups=True, loop_blocks=depth // _BLOCK_DEPTH, batch=heads,
+            batch_activation_bytes=_BLOCK_TOKENS * depth * _ELEMENT_BYTES))
     minitpuSetDevice(kernel.uio_name)
     d_image = _stage_image(image_bytes)
     d_out = _allocate_tensor(rows, heads * columns)

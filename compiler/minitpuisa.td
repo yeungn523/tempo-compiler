@@ -409,6 +409,13 @@ def DelayField : Resource<"delay_field">
     let note = "One bundle spaces at most 2**width-1 cycles, while a vmatpush result is 82 away, so every push-to-pop gap needs a filler bundle.";
 }
 
+def VectorMemory : Resource<"vmem">
+{
+    let values = [ResourceValue<"rows_per_slot", 8192>,
+                  ResourceValue<"slot_count", 2>];
+    let note = "Rows one lane holds in one software-owned slot, and the slots `vmemswap` alternates between. Compute and DMA address opposite slots, so a staged region reaching past rows_per_slot wraps inside its own slot rather than faulting and returns whatever the wrap lands on. These are the compute-addressed VMEM slots, which are not the dma_slots a flush mask selects between. No localparam name is quoted here because this tree carries no RTL to hold one against.";
+}
+
 def DmaSlots : Resource<"dma_slots">
 {
     let rtl_parameter = "DMA_SLOT_COUNT";
@@ -453,7 +460,7 @@ def IsaOrder : EmissionOrder
 
     let matrix_commands = [MatrixLoadCommand, MatrixPushCommand, MatrixPopCommand];
 
-    let resources = [MatrixOutputFifo, LoopBuffer, DelayField, DmaSlots];
+    let resources = [MatrixOutputFifo, LoopBuffer, DelayField, DmaSlots, VectorMemory];
 }
 
 // The dialect's operation definitions belong beside the scheduling records they constrain. Adding them makes the file

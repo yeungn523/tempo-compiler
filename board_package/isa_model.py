@@ -5,6 +5,14 @@ Run `python3 tools/gen_isa_doc.py --write` to generate.
 
 from __future__ import annotations
 
+PROFILE: dict[str, int] = {
+    "lane_count": 16,
+    "sublane_count": 4,
+    "vreg_element_count": 64,
+    "vreg_entry_count": 32,
+}
+"""Array geometry every offset below is quoted against, and every capacity a consumer derives from it."""
+
 RTL_PARAMS: dict[str, int] = {
     "WB_W_ALU": 5,
     "WB_W_SFU": 7,

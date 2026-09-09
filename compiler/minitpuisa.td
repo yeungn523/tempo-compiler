@@ -173,7 +173,7 @@ def VectorLoad : OpGroup<"X", ["vld"]>
 {
     let vreg_reads = "VMEM compute port";
     let vreg_writes = "1 full/masked VREG";
-    let issue_requirement = "II=1 when conflict-free; VMEM read latency parameter is 3, followed by shared writeback staging. A sublane bank conflict splits the access into one pass per colliding sublane: it holds the VMEM compute port for that many cycles AND delays the writeback by (degree - 1), so the earliest consumer is L = w + degree. Degree depends on sublane_stride and sublane_mask only, both immediates, so it is known at assembly time (vpu_bank_select.sv; see docs/VMEM.md)";
+    let issue_requirement = "II=1; VMEM read latency parameter is 3, followed by shared writeback staging. The NUM_SUBLANES sublanes read consecutive rows, so their banks are a permutation of the bank count and no access splits, which is why a schedule prices every access at one cycle (vpu_bank_select.sv)";
     let writeback_offset = 6;
     let rtl_parameter = "WB_W_VLD";
     let register_reads = [];
@@ -398,7 +398,7 @@ def LoopBuffer : Resource<"loop_buffer">
     let rtl_parameter = "LB_CAP";
     let values = [ResourceValue<"capacity_bundles", 24>];
     let asm_constants = [AsmConstant<"LB_CAP", "capacity_bundles">];
-    let note = "A body longer than this refetches from IRAM instead of replaying. tools/pilot_loop_buffer.py measured no throughput step at the boundary on a board, so it bounds replay rather than speed.";
+    let note = "A body longer than this refetches from IRAM instead of replaying, which bounds replay rather than speed.";
 }
 
 def DelayField : Resource<"delay_field">

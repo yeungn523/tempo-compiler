@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Device geometry, BF16 packing and the host references every check compares against."""
+"""Provides the device geometry, the BF16 packing and the host references every check compares against."""
 
 from __future__ import annotations
 
@@ -132,6 +132,9 @@ _ROW_TX_IN: int = _ROW_ADD_OUT + _MAX_DESCRIPTOR_ROWS
 
 _ROW_TX_OUT: int = _ROW_TX_IN + _TILE
 """The first VMEM row of the tile transpose's result."""
+
+_ROW_ADD_BIAS: int = _ROW_TX_OUT + _TILE
+"""First VMEM row of the replicated bias, which the broadcasting add reads at stride one."""
 
 _MODEL_WIDTH: int = 768
 """The GPT-2 model width in features."""

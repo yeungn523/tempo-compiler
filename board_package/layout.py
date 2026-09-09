@@ -1,75 +1,51 @@
-"""Where a tensor's elements live, and what that costs.
+"""Provides the layouts that say where a tensor's elements live, and what each one costs.
 
-Three levels, and only two of them are choices.
-
-**DMEM** is an ABI. A tensor written by one launch is read by the next, and no
-compiler sees that program -- `run_gpt2_forward.py` is Python calling drivers -- so
-the layout is written down rather than inferred. :class:`Tiled` is that writing.
-
-**VMEM** is per-launch scratch, and until now it was fourteen hardcoded row
-constants in `bf16.py` with no allocator. A kernel could not ask for "so many rows
-at a conflict-free pitch"; it was assigned a region by hand, and two kernels sharing
-a constant clobbered each other silently. :class:`VmemAllocator` is the fix, and it
-is the thing that makes VMEM tiling programmable rather than hardcoded.
-
-**VREG** is not a choice. A VREG is `NUM_SUBLANES x NUM_LANES` = 64 BF16 and always
-holds four VMEM rows; the only freedom is WHICH four, which is the sublane stride,
-and which axis they walk. Mosaic's `VectorLayout` carries bitwidth, offsets, tiling
-and an implicit dim because a TPU vreg is 8x128 and a tile can sit in it many ways.
-Ours has one way. That is why this file is two integers where theirs is six.
-
-Everything else here is derivation. Given a layout and an access, the descriptor
-fields, the `vld` fields and the bank-conflict cost follow by arithmetic --
-`tools/pilot_layout_derivation.py` checks that against every call site the shipping
-kernels use, at three GPT-2 shapes and at Qwen's.
+DMEM is an ABI, because a tensor one launch writes the next one reads and no compiler sees that program, so `Tiled`
+writes the layout down rather than inferring it. VMEM is per-launch scratch that `VmemAllocator` hands out in
+disjoint regions. A VREG is not a choice at all: it is `NUM_SUBLANES` by `NUM_LANES` and always holds that many
+consecutive VMEM rows. Everything else here is derivation, since the descriptor fields and the `vld` fields follow
+from a layout and an access by arithmetic.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 
-from bf16 import (_ELEMENT_BYTES, _MAX_DESCRIPTOR_ROWS, _NUM_LANES,
-                  _NUM_SUBLANES, _ROW_BYTES, _TILE, _VMEM_ENTRIES_PER_LANE)
-from asm import SUBLANE_STRIDE_W
-
-#: The largest sublane stride the X slot encodes, which caps a padded pitch.
-MAX_SUBLANE_STRIDE: int = (1 << SUBLANE_STRIDE_W) - 1
+from bf16 import (_BLOCK_DEPTH, _ELEMENT_BYTES, _LOOP_BLOCKS,
+                  _MAX_DESCRIPTOR_ROWS, _NUM_LANES, _NUM_SUBLANES, _ROW_BYTES,
+                  _TILE, _VMEM_ENTRIES_PER_LANE)
+from asm import AGU_SHIFT_W
 
 #: Axes a VREG's four sublanes can walk. The same DMEM layout costs differently
 #: depending on which one an access uses, and that is the whole banking story:
 #: a GEMM walks tokens (stride 1 when packed, conflict-free) while a softmax walks
-#: feature tiles (stride `tile_stride`, which is why the pitch gets padded).
+#: feature tiles, `tile_stride` rows apart.
 TOKEN = "token"
 FEATURE_TILE = "feature_tile"
 
 
 class LayoutError(ValueError):
-    """A layout the machine cannot express, or two that do not compose.
+    """Reports a layout the machine cannot express, or two that do not compose.
 
-    Raised rather than repaired. On this machine an inserted relayout is a launch,
-    and a launch costs about 1.2 ms of fixed time no matter how little it moves --
-    so silently fixing a mismatch would hide the single most expensive thing a
-    kernel can do. The message names both layouts and the cheapest fix.
+    Raised rather than repaired, because an inserted relayout is a launch and a launch costs about 1.2 ms of fixed
+    time however little it moves. The message names both layouts and the cheapest fix.
     """
 
 
 @dataclass(frozen=True)
 class Tiled:
-    """A DMEM layout: where element ``(*index, feature)`` of a tensor lives.
+    """Describes a DMEM layout, being where element `(*index, feature)` of a tensor lives.
 
         lane = feature mod NUM_LANES
         row  = sum(index[i] * strides[i]) + (feature div NUM_LANES) * tile_stride
 
     Attributes:
-        shape: The LOGICAL shape, whose last axis is features. Rank is not two --
-            a stacked per-head operand is rank 3, and the head stride is exactly the
-            number that was being computed by hand and getting silently wrong.
+        shape: The logical shape, whose last axis is features. A stacked per-head operand is rank three, so the
+            rank is not fixed at two.
         strides: Row stride per leading axis, one shorter than `shape`.
         tile_stride: Rows between one feature tile and the next.
-        replicated: The value does not vary along the leading axis, so one row
-            stands for all of them. A bias is one row; storing `rows` copies of it
-            costs 42.5 MB of DMEM across twelve layers at 256 rows.
+        replicated: Determines whether one row stands for every entry of the leading axis, which is what a bias
+            is.
     """
 
     shape: tuple[int, ...]
@@ -101,52 +77,67 @@ class Tiled:
 
     @staticmethod
     def packed(rows: int, features: int) -> "Tiled":
-        """What `pack_activations` writes: ``row = feature_tile * rows + token``."""
+        """Returns the layout `pack_activations` writes, being `row = feature_tile * rows + token`."""
         return Tiled((rows, features), (1,), rows)
 
     @staticmethod
     def weights(depth: int, columns: int) -> "Tiled":
-        """What `pack_weights` writes: ``row = column_tile * depth + k``."""
+        """Returns the layout `pack_weights` writes, being `row = column_tile * depth + k`."""
         return Tiled((depth, columns), (1,), depth)
 
     @staticmethod
     def row_major(rows: int, features: int) -> "Tiled":
-        """The host's own order. Never used on the device except by transpose."""
+        """Returns the host's own order, which reaches the device only through a transpose."""
         return Tiled((rows, features), (features // _NUM_LANES,), 1)
 
     @staticmethod
+    def token_major(rows: int, features: int) -> "Tiled":
+        """Returns the layout the packed softmax stages, being `row = token * stride + tile`.
+
+        The transpose of `packed`, so an access walking feature tiles reads consecutive rows. The stride is
+        `rows_per_token` of the tiles a token owns.
+        """
+        return Tiled((rows, features), (rows_per_token(features // _NUM_LANES),), 1)
+
+    @staticmethod
     def broadcast(rows: int, features: int) -> "Tiled":
-        """One row standing for `rows` of them -- a bias, or LayerNorm's gamma."""
+        """Returns the layout of one row standing for `rows` of them, which is what a bias is."""
         return Tiled((rows, features), (0,), 1, replicated=True)
 
     @staticmethod
     def stacked(count: int, rows: int, features: int, *, stride: int) -> "Tiled":
-        """`count` packed operands end to end, entry h starting `stride` rows on."""
+        """Returns `count` packed operands end to end, each starting `stride` rows past the last."""
         return Tiled((count, rows, features), (stride, 1), rows)
 
     # -- what the compiler derives ------------------------------------------
 
     @property
     def feature_tiles(self) -> int:
-        """Feature tiles one entry spans."""
+        """Returns the feature tiles one entry spans."""
         return self.shape[-1] // _NUM_LANES
 
     @property
     def token_stride(self) -> int:
-        """Rows one step along the token axis moves."""
+        """Returns the rows one step along the token axis moves."""
         return self.strides[-1]
 
     @property
     def leading_stride(self) -> int:
-        """Rows between consecutive entries of the OUTERMOST axis."""
+        """Returns the rows between consecutive entries of the outermost axis."""
         return self.strides[0]
 
     def extent_rows(self) -> int:
-        """Rows one entry of the outermost axis occupies."""
+        """Returns the rows one entry of the outermost axis occupies."""
         return self.feature_tiles * self.tile_stride
 
-    def sublane_stride(self, axis: str) -> int:
-        """Rows between consecutive sublanes of a VREG walking `axis`."""
+    def rows_between_sublanes(self, axis: str) -> int:
+        """Returns the rows between consecutive sublanes of a VREG walking `axis`.
+
+        One means the access is readable as it lies: a `vld` reads
+        NUM_SUBLANES CONSECUTIVE rows. Anything else has to be closed by the
+        layout, by packing DMEM or by landing the rows where the reader walks,
+        because the sublanes read consecutive rows and nothing else.
+        """
         if axis == TOKEN:
             return self.token_stride
         if axis == FEATURE_TILE:
@@ -154,26 +145,12 @@ class Tiled:
         message = f"Unable to walk axis {axis!r}; it is {TOKEN!r} or {FEATURE_TILE!r}."
         raise LayoutError(message)
 
-    def conflict(self, axis: str) -> int:
-        """Cycles one VREG access costs: gcd(stride, NUM_SUBLANES).
-
-        `vpu_bank_select` sends sublane s to bank ``(row + s * stride) mod
-        NUM_SUBLANES``, so a stride sharing a factor with the bank count collides.
-        Reported rather than fixed: which of PACK, DMA, PAD or a functional unit
-        answers it is a cost trade only the caller can make.
-        """
-        return math.gcd(self.sublane_stride(axis), _NUM_SUBLANES)
-
     def descriptor_stride_bytes(self) -> int:
-        """The DMA row stride, in bytes, walking the token axis."""
+        """Returns the DMA row stride in bytes, walking the token axis."""
         return self.token_stride * _ROW_BYTES
 
     def advance_after(self, inner_walk_rows: int) -> int:
-        """Rows to move after the inner loops, on top of what they already walked.
-
-        This is `head_advance`, and deriving it wrong produced two silent
-        generality bugs -- both times because two constants GPT-2 makes equal were
-        assumed equal everywhere. It is one formula.
+        """Returns the rows to move after the inner loops, on top of what they already walked.
 
         Args:
             inner_walk_rows: Rows the enclosed loops advance on their own.
@@ -184,7 +161,7 @@ class Tiled:
         return self.leading_stride - inner_walk_rows
 
     def composes_with(self, other: "Tiled") -> bool:
-        """Whether a consumer in `other` can read this without a relayout."""
+        """Determines whether a consumer in `other` reads this layout without a relayout."""
         return (self.token_stride == other.token_stride
                 and self.tile_stride == other.tile_stride)
 
@@ -200,7 +177,7 @@ class Tiled:
         if self.token_stride == other.token_stride:
             fix = (f"change one tile_stride: {self.tile_stride} vs "
                    f"{other.tile_stride}. A DMA descriptor names its own "
-                   f"destination row, so re-pitching on the way in is free.")
+                   f"destination row, so restriding on the way in is free.")
         else:
             fix = (f"the token strides differ ({self.token_stride} vs "
                    f"{other.token_stride}), so this needs a scatter -- a launch.")
@@ -216,76 +193,118 @@ class Tiled:
                 f"tile_stride={self.tile_stride}{tag})")
 
 
+def choose_loop_blocks(depth: int, *, limit: int = _LOOP_BLOCKS) -> int:
+    """Returns the blocks one accumulation group covers, for a contraction of `depth`.
+
+    The drain is emitted in pairs, so the count must be even, and a group must tile the contraction exactly, so it
+    must divide the block count.
+
+    Args:
+        depth: The contraction, a whole number of `_BLOCK_DEPTH`.
+        limit: The largest group to consider. A larger group amortises the group loop's prologue over more blocks,
+            so the largest legal one is taken.
+
+    Returns:
+        The blocks per group.
+
+    Raises:
+        LayoutError: If the depth is not a whole number of blocks, or no even count at or below `limit` divides it.
+    """
+    if depth <= 0 or depth % _BLOCK_DEPTH:
+        message = (
+            f"Unable to contract over {depth}. One accumulation block is "
+            f"{_BLOCK_DEPTH} deep, so the contraction must be a whole number of "
+            f"them."
+        )
+        raise LayoutError(message)
+    blocks = depth // _BLOCK_DEPTH
+    for candidate in range(limit - limit % 2, 1, -2):
+        if blocks % candidate == 0:
+            return candidate
+    message = (
+        f"Unable to cover a contraction of {depth} -- {blocks} blocks of "
+        f"{_BLOCK_DEPTH} -- in even groups of at most {limit}. The drain is "
+        f"emitted in pairs, so the group must be even, and it must divide the "
+        f"block count. Pad the contraction to a multiple of "
+        f"{2 * _BLOCK_DEPTH}."
+    )
+    raise LayoutError(message)
+
+
+def rows_per_token(tiles: int) -> int:
+    """Returns the VMEM rows one token owns when its feature tiles land consecutively.
+
+    Rounded up to a power of two, because the AGU reaches a token by shifting the loop index rather than multiplying
+    it. The padding never exceeds `tiles` rows a token and costs nothing to walk.
+
+    Args:
+        tiles: Feature tiles one token's row covers.
+
+    Returns:
+        Rows per token, a power of two at or above `tiles`.
+
+    Raises:
+        LayoutError: If the stride needs a shift wider than the AGU's field.
+    """
+    if tiles < 1:
+        message = f"Unable to lay out {tiles} feature tiles. At least one is needed."
+        raise LayoutError(message)
+    per_token = 1 << (tiles - 1).bit_length()
+    max_shift = (1 << AGU_SHIFT_W) - 1
+    if per_token.bit_length() - 1 > max_shift:
+        message = (
+            f"Unable to walk {per_token} rows per token. The AGU shift field is "
+            f"{AGU_SHIFT_W} bits, so the shift reaches {max_shift} and the stride "
+            f"{1 << max_shift}."
+        )
+        raise LayoutError(message)
+    return per_token
+
+
 @dataclass(frozen=True)
 class VmemRegion:
-    """Rows of one VMEM slot, owned by one staged tensor.
+    """Holds the rows of one VMEM slot that one staged tensor owns.
 
     Attributes:
         name: What asked for it, so a collision report can say who.
         base: First row.
         rows: Rows per feature tile.
-        pitch: Rows between one feature tile's base and the next. Equal to `rows`
-            when nothing is padded, and one more when the pitch was made odd.
+        tile_stride: Rows between one feature tile's base and the next. Equal to
+            `rows` unless a token owns a rounded-up number of them.
         tiles: Feature tiles staged here.
     """
 
     name: str
     base: int
     rows: int
-    pitch: int
+    tile_stride: int
     tiles: int
 
     @property
     def span(self) -> int:
-        """Rows this region occupies, padding included."""
-        return self.pitch * (self.tiles - 1) + self.rows
+        """Returns the rows this region occupies."""
+        return self.tile_stride * (self.tiles - 1) + self.rows
 
     @property
     def end(self) -> int:
-        """One past the last row."""
+        """Returns one past the region's last row."""
         return self.base + self.span
 
     def row(self, tile: int = 0, offset: int = 0) -> int:
-        """The VMEM row of `offset` within feature tile `tile`."""
+        """Returns the VMEM row of `offset` within feature tile `tile`."""
         if not 0 <= tile < self.tiles:
             message = (f"Unable to address tile {tile} of region {self.name!r}, "
                        f"which has {self.tiles}.")
             raise LayoutError(message)
-        return self.base + tile * self.pitch + offset
-
-    def conflict(self) -> int:
-        """Cycles a VREG access walking feature tiles costs here."""
-        return math.gcd(self.pitch, _NUM_SUBLANES)
-
-
-def conflict_free_pitch(rows: int) -> int:
-    """The smallest pitch at or above `rows` that is coprime with the bank count.
-
-    The oldest fix in the shared-memory literature -- pad the leading dimension so
-    the column stride is coprime with the bank count -- and the one this machine can
-    express, because a DMA descriptor names its own destination row. For a
-    power-of-two bank count it is simply the next odd number.
-    """
-    pitch = rows
-    while math.gcd(pitch, _NUM_SUBLANES) != 1:
-        pitch += 1
-    return pitch
+        return self.base + tile * self.tile_stride + offset
 
 
 class VmemAllocator:
-    """Hands out disjoint VMEM regions, at pitches that do not collide.
+    """Hands out disjoint VMEM regions, so two staged tensors cannot overlap.
 
-    This replaces fourteen hardcoded row constants in `bf16.py`. They worked, and
-    they are why a kernel could not choose its own tiling: raising the token block
-    meant re-deriving the map by hand, two kernels naming the same constant
-    clobbered each other silently across a launch boundary, and
-    `MAX_ATTENTION_ROWS = 320` is a consequence of where `_ROW_SOFTMAX_OUT` was put
-    rather than of how much VMEM there is.
-
-    Bump allocation, because a launch's regions all live as long as the launch.
-    Slot selection stays explicit: a DMA descriptor names its VMEM slot in the
-    immediate, so an allocator that silently spanned slots would produce addresses
-    the D slot and the X slot disagree about.
+    Bump allocation, because a launch's regions all live as long as the launch. Slot selection stays explicit: a
+    descriptor names its VMEM slot in the immediate, so an allocator spanning slots would produce addresses the D
+    slot and the X slot disagree about.
     """
 
     def __init__(self, *, slot: int = 0,
@@ -297,45 +316,33 @@ class VmemAllocator:
 
     @property
     def regions(self) -> tuple[VmemRegion, ...]:
-        """Everything handed out, in the order it was asked for."""
+        """Returns every region handed out, in the order it was asked for."""
         return tuple(self._regions)
 
     @property
     def used(self) -> int:
-        """Rows handed out."""
+        """Returns the rows handed out."""
         return self._next
 
-    def region(self, name: str, rows: int, *, tiles: int = 1,
-               conflict_free: bool = True) -> VmemRegion:
+    def region(self, name: str, rows: int, *, tiles: int = 1) -> VmemRegion:
         """Reserves `tiles` feature tiles of `rows` rows each.
 
         Args:
             name: What is being staged, for collision and overflow reports.
             rows: Rows one feature tile occupies.
-            tiles: Feature tiles staged side by side.
-            conflict_free: Pad the pitch so a VREG walking feature tiles does not
-                collide. Costs `tiles - 1` rows and nothing else. Pass False when
-                the access walks tokens instead, where the pitch is irrelevant.
+            tiles: Feature tiles staged side by side, `rows` apart. The
+                sublanes read consecutive rows, so nothing collides and the
+                stride needs no padding.
 
         Returns:
             The region.
 
         Raises:
-            LayoutError: If it does not fit, or the padded pitch exceeds what a
-                sublane stride encodes.
+            LayoutError: If it does not fit.
         """
         if rows < 1 or tiles < 1:
             message = (f"Unable to reserve {tiles} tiles of {rows} rows for "
                        f"{name!r}. Both must be positive.")
-            raise LayoutError(message)
-        pitch = conflict_free_pitch(rows) if conflict_free and tiles > 1 else rows
-        if tiles > 1 and pitch > MAX_SUBLANE_STRIDE:
-            message = (
-                f"Unable to walk a pitch of {pitch} for {name!r}. The sublane "
-                f"stride field is {SUBLANE_STRIDE_W} bits, so it reaches "
-                f"{MAX_SUBLANE_STRIDE}. Stage fewer rows per tile, or walk the "
-                f"token axis instead so the pitch does not enter the access."
-            )
             raise LayoutError(message)
         if rows > _MAX_DESCRIPTOR_ROWS:
             message = (
@@ -344,7 +351,49 @@ class VmemAllocator:
                 f"widen the field -- DMA_RESERVED_W has 85 spare bits."
             )
             raise LayoutError(message)
-        region = VmemRegion(name, self._next, rows, pitch, tiles)
+        region = VmemRegion(name, self._next, rows, rows, tiles)
+        if region.end > self.capacity:
+            message = (
+                f"Unable to place {name!r}: {region.span} rows at {self._next} "
+                f"runs past the slot's {self.capacity}. Already placed: "
+                f"{', '.join(f'{r.name}[{r.base}:{r.end}]' for r in self._regions)}"
+            )
+            raise LayoutError(message)
+        self._next = region.end
+        self._regions.append(region)
+        return region
+
+    def token_major_region(self, name: str, tokens: int, *, tiles: int) -> VmemRegion:
+        """Reserves `tokens` rows of `tiles` consecutive feature tiles each.
+
+        A token is contiguous here, so an access walking its tiles reads consecutive rows and the tokens are what
+        sit a stride apart. That stride is a power of two, because the AGU reaches a token by shifting the loop
+        index rather than multiplying it.
+
+        Args:
+            name: What is being staged, for collision and overflow reports.
+            tokens: Tokens staged.
+            tiles: Feature tiles one token owns.
+
+        Returns:
+            The region, whose `rows` is one token's tiles and whose
+            `tile_stride` is that rounded up to a power of two.
+
+        Raises:
+            LayoutError: If it does not fit, or one token needs more rows than a
+                descriptor moves.
+        """
+        if tokens < 1 or tiles < 1:
+            message = (f"Unable to reserve {tokens} tokens of {tiles} tiles for "
+                       f"{name!r}. Both must be positive.")
+            raise LayoutError(message)
+        if tiles > _MAX_DESCRIPTOR_ROWS:
+            message = (
+                f"Unable to gather {tiles} tiles for {name!r} in one descriptor: "
+                f"past the {_MAX_DESCRIPTOR_ROWS} the row field encodes."
+            )
+            raise LayoutError(message)
+        region = VmemRegion(name, self._next, tiles, rows_per_token(tiles), tokens)
         if region.end > self.capacity:
             message = (
                 f"Unable to place {name!r}: {region.span} rows at {self._next} "

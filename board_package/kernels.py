@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""Every assembled kernel: the programs, and the schedules that make them legal.
+"""Provides every assembled kernel, and the schedules that make each one legal.
 
-Separate from the drivers that launch them because these are the part worth reading closely. The
-machine has no hazard interlocks, so a schedule is a correctness argument, and the comments here
-carry it: what each spacing constant is for, which hardware resource bounds each burst, and what
-goes wrong when one is exceeded. board_package/asm.py's schedule() enforces what it can and rejects
-what it cannot fix.
+The machine has no hazard interlocks, so a schedule is a correctness argument and the comments here
+carry it. `asm.schedule` enforces what it can and rejects what it cannot fix.
 """
 
 from __future__ import annotations
@@ -20,7 +17,7 @@ sys.path.insert(0, str(HERE / "minitpu_runtime"))
 from collections.abc import Callable  # noqa: E402
 
 import asm as asm_module  # noqa: E402
-from asm import SUBLANE_STRIDE_W  # noqa: E402
+from asm import AGU_SHIFT_W  # noqa: E402
 from bf16 import (  # noqa: E402,F401
     HERE,
     _BLOCK_ACTIVATION_BYTES,
@@ -42,6 +39,7 @@ from bf16 import (  # noqa: E402,F401
     _MAX_DESCRIPTOR_ROWS,
     _ROW_TX_IN,
     _ROW_TX_OUT,
+    _ROW_ADD_BIAS,
     _ROW_ADD_LEFT,
     _ROW_ADD_OUT,
     _ROW_ADD_RIGHT,
@@ -99,10 +97,8 @@ def single_mul_add() -> None:
     tile_bytes = 16 * _ROW_BYTES
     for tile in range(4):
         bundles[pc] = {"s": minitpu.smov_arg(0, 0) if tile == 0 else minitpu.saddi(0, 0, tile_bytes)}; pc += 1
-        # The DMA row pitch, which is one lane stripe. This was a literal 64 until BF16-native
-        # halved the container and nothing updated it, so every descriptor walked DRAM at twice
-        # the row size and read every other row. run_example_kernel.py's copy of this kernel was fixed;
-        # this one was not, which is why the two disagreed.
+        # Carries the DMA row pitch, which is one lane stripe. Naming it as a literal instead walks DRAM at whatever
+        # that literal says, so a descriptor reads every other row and the result is plausible.
         bundles[pc] = {"s": minitpu.smovi(1, _ROW_BYTES)}; pc += 1
         bundles[pc] = {"s": minitpu.smov_arg(2, 1) if tile == 0 else minitpu.saddi(2, 2, tile_bytes)}; pc += 1
         bundles[pc] = {"s": minitpu.smov_arg(3, 2) if tile == 0 else minitpu.saddi(3, 3, tile_bytes)}; pc += 1
@@ -136,7 +132,7 @@ def build_looped_gemm(column_tiles: int, groups: int, *, activate: bool,
         fuse_groups: Accumulate every group into the resident output tiles and drain once per
             column tile, instead of draining a partial per group for the host to sum in float32.
             The accumulation is then BF16 rather than float32, which measures 1.16x the relative
-            error at GPT-2's contraction depth (tools/accum_precision.py). What it buys is that the
+            error at GPT-2's contraction depth. What it buys is that the
             product never has to reach the host at all: one drain per column tile instead of
             `groups`, no host reduction, and an output the next launch can consume where it lies.
         loop_blocks: Blocks of `_BLOCK_DEPTH` one contraction group accumulates. The default makes
@@ -221,17 +217,14 @@ def build_looped_gemm(column_tiles: int, groups: int, *, activate: bool,
         bundles[pc] = {"s": minitpu.saddi(2, 2, _BLOCK_WEIGHT_BYTES)}; pc += 1
         pc += 1
 
-        # A grouped launch cannot re-read arg0 to rewind the activation pointer: the
-        # four scalar registers hold three pointers and the row pitch, so there is
-        # nowhere to keep a per-problem base, and arg0 names only the first problem.
-        # It is rewound by SUBTRACTION instead -- the body's net movement is known
-        # here, because every advance is emitted here -- which needs no register and
-        # leaves the pointer free to walk on to the next problem.
+        # Rewinds the activation pointer by SUBTRACTION, because a grouped launch cannot re-read arg0: the four scalar
+        # registers hold three pointers and the row pitch, so there is nowhere to keep a per-problem base, and arg0
+        # names only the first problem. The body's net movement is known here because every advance is emitted here, so
+        # the rewind needs no register and leaves the pointer free to walk on to the next problem.
         batched = batch > 1
         if batched:
-            # OUTSIDE the batch loop. Seeding the pointer inside it resets every
-            # problem to the first one's operand, which the first problem cannot
-            # tell you: it is the only one for which that is the right answer.
+            # Seeds the pointer OUTSIDE the batch loop. Seeding it inside resets every problem to the first one's
+            # operand, which the first problem cannot tell you: it is the only one for which that is the right answer.
             bundles[pc] = {"s": minitpu.smov_arg(0, 0)}; pc += 1
             pc += 2
             bundles[pc] = {"f": minitpu.lbegin(batch)}; pc += 1
@@ -265,15 +258,14 @@ def build_looped_gemm(column_tiles: int, groups: int, *, activate: bool,
             bundles[pc] = {"s": minitpu.saddi(1, 1, OUTPUT_ROWS * ROW_BYTES)}; pc += 1
             return pc
 
-        # Fused: the accumulators clear once per column tile and carry every group, so the
-        # contraction sums on the device. Unfused: they clear and drain per group, and the host
-        # sums the partials in float32.
+        # Clears the accumulators once per column tile when fused, so they carry every group and the contraction sums on
+        # the device. Unfused: they clear and drain per group, and the host sums the partials in float32.
         if fuse_groups:
             pc = emit_clear(pc)
 
         bundles[pc] = {"f": minitpu.lbegin(groups)}; pc += 1
-        # Steps back and re-primes this group's first block. flush.slot blocks until dma_slot_done covers
-        # flush_mask_q, then clears it (sequencer.sv:318, :662); only a new descriptor re-asserts that bit.
+        # Steps back and re-primes this group's first block. flush.slot blocks until dma_slot_done covers flush_mask_q,
+        # then clears it (sequencer.sv:318, :662), and only a new descriptor re-asserts that bit.
         bundles[pc] = {"s": minitpu.saddi(0, 0, -_BLOCK_ACTIVATION_BYTES)}; pc += 1
         bundles[pc] = {"s": minitpu.saddi(2, 2, -_BLOCK_WEIGHT_BYTES)}; pc += 1
         pc += 1                                                           # scalar writeback latency
@@ -299,16 +291,14 @@ def build_looped_gemm(column_tiles: int, groups: int, *, activate: bool,
         if fuse_groups:
             pc = emit_drain(pc)
         if batched:
-            # Undo this column tile's walk down the activation. Every term is a
-            # `saddi` emitted above: the leading block, then per contraction group a
-            # rewind of one block and an advance of `loop_blocks` of them.
+            # Undoes this column tile's walk down the activation. Every term is a `saddi` emitted above: the leading
+            # block, then per contraction group a rewind of one block and an advance of `loop_blocks` of them.
             walked = _BLOCK_ACTIVATION_BYTES * (1 + groups * loop_blocks)
             pc = _advance(bundles, pc, 0, -walked)
         bundles[pc] = {"f": minitpu.loop_end()}; pc += 1                  # closes the column loop
         if batched:
-            # On to the next problem. The weight and drain pointers are already
-            # there: both only ever walk forward, and one problem's operands end
-            # exactly where the next one's begin.
+            # Moves on to the next problem. The weight and drain pointers are already there: both only ever walk
+            # forward, and one problem's operands end exactly where the next one's begin.
             pc = _advance(bundles, pc, 0, batch_activation_bytes)
             bundles[pc] = {"f": minitpu.loop_end()}; pc += 1              # closes the batch loop
         bundles[pc] = {"f": minitpu.halt()}; pc += 1
@@ -317,6 +307,13 @@ def build_looped_gemm(column_tiles: int, groups: int, *, activate: bool,
             minitpu.bundle(**bundles.get(index, {}))
 
     return minitpu.asm(looped_gemm)
+
+
+_ADD_CHUNK_TILE_SHIFT: int = (_MAX_DESCRIPTOR_ROWS // _BLOCK_TOKENS * _NUM_SUBLANES).bit_length() - 1
+"""Shift the broadcasting add advances its bias pointer by, one chunk at a time.
+
+A chunk is `_MAX_DESCRIPTOR_ROWS` rows of `_BLOCK_TOKENS` tokens, so it spans their quotient in feature
+tiles, and the bias holds `_NUM_SUBLANES` rows per tile."""
 
 
 def build_elementwise_add(chunks: int, *, broadcast_right: bool = False) -> MinitpuKernel:
@@ -364,9 +361,9 @@ def build_elementwise_add(chunks: int, *, broadcast_right: bool = False) -> Mini
 
         out_row = _ROW_TX_IN if broadcast_right else _ROW_ADD_OUT
         if broadcast_right:
-            # One bias row per feature tile. The 3072-wide FFN bias is 192 VMEM
-            # rows, so it takes two descriptors; the descriptor ABI tops out at
-            # 128. Stage it once per launch, not once per token block.
+            # Stages one bias row per feature tile. The 3072-wide FFN bias is 192 VMEM rows, so it takes two
+            # descriptors, because the descriptor ABI tops out at 128. It is staged once per launch, not once per token
+            # block.
             bias_rows = chunks * _MAX_DESCRIPTOR_ROWS // _BLOCK_TOKENS
             first = min(bias_rows, _MAX_DESCRIPTOR_ROWS)
             bundles[pc] = {"d": minitpu.dma_load(
@@ -387,19 +384,20 @@ def build_elementwise_add(chunks: int, *, broadcast_right: bool = False) -> Mini
             pc += 1
         bundles[pc] = {"f": minitpu.flush_slot(1 if broadcast_right else 3)}; pc += 1
 
-        # One VREG at a time, and the pair is loaded into the SAME two registers each
-        # time, so the add has to consume them before the next pair lands. Hoisting all
-        # the loads first -- which reads more naturally -- makes every add see only the
-        # last pair, and the board reports a plausible wrong answer rather than a fault.
+        # Loads one VREG at a time into the SAME two registers each time, so the add has to consume them before the next
+        # pair lands. Hoisting all the loads first, which reads more naturally, makes every add see only the last pair,
+        # and the board reports a plausible wrong answer rather than a fault.
         VLD_L, ALU_L = 7, 6
         for vreg in range(vregs):
             row = _NUM_SUBLANES * vreg
             bundles[pc] = {"x": minitpu.vld(0, _ROW_ADD_LEFT + row)}
             if broadcast_right:
                 feature_in_chunk = vreg // (_BLOCK_TOKENS // _NUM_SUBLANES)
+                # Reads a bias staged with each feature tile REPLICATED across the four sublane rows, so the four token
+                # rows of a VREG read four copies of the same tile at stride one.
                 bundles[pc + 1] = {"x": minitpu.vld(
-                    1, _ROW_ADD_RIGHT + feature_in_chunk, stride=0,
-                    agu=True, shift=2, level=0)}
+                    1, _ROW_ADD_BIAS + feature_in_chunk * _NUM_SUBLANES,
+                    agu=True, shift=_ADD_CHUNK_TILE_SHIFT, level=0)}
             else:
                 bundles[pc + 1] = {"x": minitpu.vld(1, _ROW_ADD_RIGHT + row)}
             add_at = pc + 1 + VLD_L
@@ -421,8 +419,8 @@ def build_elementwise_add(chunks: int, *, broadcast_right: bool = False) -> Mini
         for index in range(pc):
             minitpu.bundle(**bundles.get(index, {}))
 
-    # Packs, because the hand placement pads with empty bundles that carry no wait. Dropping them shrinks the image
-    # and leaves the schedule as it was.
+    # Packs, because the hand placement pads with empty bundles that carry no wait. Dropping them shrinks the image and
+    # leaves the schedule as it was.
     return minitpu.asm(elementwise_add, placement="pack")
 
 
@@ -474,8 +472,8 @@ def build_tile_transpose(tiles: int, *, load_pitch: int, store_pitch: int,
         """Transposes one tile per iteration, advancing both pointers."""
         bundles = {}
         pc = 0
-        # All four scalar registers are spoken for: two pointers and two pitches.
-        # The pitches are immediates because a kernel is built per shape anyway.
+        # Spends all four scalar registers here: two pointers and two pitches. The pitches are immediates because a
+        # kernel is built per shape anyway.
         bundles[pc] = {"s": minitpu.smovi(2, load_pitch * _ROW_BYTES)}; pc += 1
         bundles[pc] = {"s": minitpu.smovi(3, store_pitch * _ROW_BYTES)}; pc += 1
         bundles[pc] = {"s": minitpu.smov_arg(0, 0)}; pc += 1      # sreg0 = input
@@ -502,8 +500,8 @@ def build_tile_transpose(tiles: int, *, load_pitch: int, store_pitch: int,
         pc += 8
         bundles[pc] = {"d": minitpu.dma_store(0, _ROW_TX_OUT, _TILE, 1, 3)}; pc += 1
         bundles[pc] = {"f": minitpu.flush_slot(1)}; pc += 1
-        # Walking DOWN a source tile column advances the source by a whole tile of
-        # rows at its pitch; where the destination moves is the caller's to say.
+        # Advances the source by a whole tile of rows at its pitch, because this walks DOWN a source tile column. Where
+        # the destination moves is the caller's to say.
         bundles[pc] = {"s": minitpu.saddi(0, 0, _TILE * load_pitch * _ROW_BYTES)}; pc += 1
         bundles[pc] = {"s": minitpu.saddi(1, 1, store_advance * _ROW_BYTES)}; pc += 1
         pc += 2                    # scalar writeback, before the next descriptor reads it
@@ -515,20 +513,16 @@ def build_tile_transpose(tiles: int, *, load_pitch: int, store_pitch: int,
     return minitpu.asm(tile_transpose)
 
 
-#: Widest addend an S-slot immediate carries. `scalar_agu` sign-extends SADDI's
-#: 16-bit field, so a pointer rewind larger than this takes more than one add.
+#: Names the widest addend an S-slot immediate carries. `sequencer_scalar_agu` sign-extends SADDI's 16-bit field, so a
+#: pointer rewind larger than this takes more than one add.
 _MAX_SADDI = 0x7FFF
 
 
 def _advance(bundles: dict, pc: int, register: int, delta: int) -> int:
     """Emits the adds that move a pointer by `delta` bytes, however large it is.
 
-    A whole-matrix transpose rewinds its source pointer by nearly the size of the
-    array at the end of every tile column, and at GPT-2's widths that is tens of
-    thousands of bytes -- past what one signed 16-bit immediate holds. Splitting it
-    is arithmetic, not a new instruction, but it has to happen somewhere and the
-    scalar unit takes two bundles to write back with nothing to interlock it, so
-    each add is spaced from the next.
+    A displacement past what one signed 16-bit immediate holds is split across several adds, each spaced from the
+    next because the scalar unit takes two bundles to write back and interlocks nothing.
 
     Args:
         bundles: The program under construction, keyed by bundle index.
@@ -622,13 +616,13 @@ def build_matrix_transpose(down: int, across: int, *, load_pitch: int,
         bundles[pc] = {"d": minitpu.dma_store(0, _ROW_TX_OUT, _TILE, 1, 3)}; pc += 1
         bundles[pc] = {"f": minitpu.flush_slot(1)}; pc += 1
 
-        # Down the column.
+        # Steps down the column.
         pc = _advance(bundles, pc, 0, _TILE * load_pitch * _ROW_BYTES)
         pc = _advance(bundles, pc, 1, _ROW_BYTES)
         bundles[pc] = {"f": minitpu.loop_end()}; pc += 1
 
-        # Across to the next column: back to one row past this column's start, and
-        # on to the destination tile row this column becomes.
+        # Across to the next column: back to one row past this column's start, and on to the destination tile row this
+        # column becomes.
         pc = _advance(bundles, pc, 0, (1 - down * _TILE * load_pitch) * _ROW_BYTES)
         pc = _advance(bundles, pc, 1, (_TILE * store_pitch - down) * _ROW_BYTES)
         bundles[pc] = {"f": minitpu.loop_end()}; pc += 1
@@ -655,8 +649,7 @@ def build_head_transpose(heads: int, head_tiles: int, down: int, depth: int,
         sixteen CONSECUTIVE VMEM rows, and in the packed WEIGHT layout its
         transpose is sixteen consecutive rows as well -- so the staging tile that
         `vtxin` and `vtxout` already drive does the whole operation and the only
-        new thing is where the pointers walk. tools/check_attention_layout.py
-        checks that against the real packers rather than against a restatement.
+        new thing is where the pointers walk.
 
         Three loop levels, which is what `agu_level` bought: heads outermost, then
         the four feature tiles of a head, then the tiles down the token axis.
@@ -696,8 +689,8 @@ def build_head_transpose(heads: int, head_tiles: int, down: int, depth: int,
         """One tile per innermost iteration, one head per outermost."""
         bundles = {}
         pc = 0
-        # Both pitches are one: a tile is consecutive rows at each end. They still
-        # occupy registers because a descriptor names its stride by register.
+        # Names both pitches as one, because a tile is consecutive rows at each end. They still occupy registers because
+        # a descriptor names its stride by register.
         bundles[pc] = {"s": minitpu.smovi(2, _ROW_BYTES)}; pc += 1
         bundles[pc] = {"s": minitpu.smovi(3, _ROW_BYTES)}; pc += 1
         bundles[pc] = {"s": minitpu.smov_arg(0, 0)}; pc += 1      # sreg0 = packed K
@@ -728,8 +721,8 @@ def build_head_transpose(heads: int, head_tiles: int, down: int, depth: int,
         bundles[pc] = {"d": minitpu.dma_store(0, _ROW_TX_OUT, _TILE, 1, 3)}; pc += 1
         bundles[pc] = {"f": minitpu.flush_slot(1)}; pc += 1
 
-        # Down the token axis: the source runs on, the destination steps one whole
-        # tile-COLUMN of the weight matrix, because these tiles are a column of Kᵀ.
+        # Steps down the token axis, so the source runs on and the destination moves one whole tile-COLUMN of the weight
+        # matrix, because these tiles are a column of Kᵀ.
         pc = _advance(bundles, pc, 0, _TILE * _ROW_BYTES)
         pc = _advance(bundles, pc, 1, depth * _ROW_BYTES)
         bundles[pc] = {"f": minitpu.loop_end()}; pc += 1
@@ -738,9 +731,8 @@ def build_head_transpose(heads: int, head_tiles: int, down: int, depth: int,
         pc = _advance(bundles, pc, 1, (_TILE - down * depth) * _ROW_BYTES)
         bundles[pc] = {"f": minitpu.loop_end()}; pc += 1
 
-        # On to the next head's operand -- a block down a diagonal, or simply the
-        # next problem. The source never rewinds: K is walked once, straight
-        # through, which is what makes it one launch either way.
+        # Moves on to the next head's operand, a block down a diagonal or simply the next problem. The source never
+        # rewinds: K is walked once, straight through, which is what makes it one launch either way.
         pc = _advance(bundles, pc, 1, head_advance * _ROW_BYTES)
         bundles[pc] = {"f": minitpu.loop_end()}; pc += 1
 
@@ -810,9 +802,9 @@ def build_head_copy(heads: int, head_tiles: int, tokens: int, depth: int,
         pc = _advance(bundles, pc, 1, depth * _ROW_BYTES)
         bundles[pc] = {"f": minitpu.loop_end()}; pc += 1
 
-        # The inner loop already walked this head's feature tiles; where the next
-        # head's begins is the caller's to say -- one block further down a diagonal,
-        # or nowhere at all when the problems simply follow one another.
+        # Leaves this head's feature tiles to the inner loop, which already walked them. Where the next head's begins is
+        # the caller's to say, being one block further down a diagonal or nowhere at all when the problems simply follow
+        # one another.
         pc = _advance(bundles, pc, 1, head_advance * _ROW_BYTES)
         bundles[pc] = {"f": minitpu.loop_end()}; pc += 1
 
@@ -841,9 +833,9 @@ def build_softmax_rows(rows: int, *, chunks: int = 1) -> MinitpuKernel:
             `_MAX_DESCRIPTOR_ROWS` holds.
         chunks: How many such descriptors to stream inside one launch. A row is
             `_TILE_VREGS` VMEM rows and a descriptor's row count is seven bits, so
-            one descriptor reaches 32 softmax rows; the 384 score rows of a
-            32-token, 12-head layer used to need twelve LAUNCHES, each with its own
-            image staging, operand copy and result copy.
+            one descriptor reaches 32 softmax rows, and the 384 score rows of a
+            32-token, 12-head layer take twelve of them. Streaming them inside one
+            launch spares eleven image stagings, operand copies and result copies.
 
             Streaming them needs the inner loop to name its own nesting level: the
             row index rides the AGU, and `iv_by_level[0]` is the OUTERMOST loop, so
@@ -880,12 +872,10 @@ def build_softmax_rows(rows: int, *, chunks: int = 1) -> MinitpuKernel:
         bundles[pc] = {"f": minitpu.flush_slot(1)}; pc += 1
 
         bundles[pc] = {"f": minitpu.lbegin(rows)}; pc += 1
-        # AGU shift of 2 advances the row pointer by _TILE_VREGS VMEM rows per
-        # iteration, and level names THIS loop. The chunk loop is emitted
-        # unconditionally, so this is ALWAYS the inner one -- level 1 even at
-        # chunks = 1. Making it conditional on chunks > 1 looks right and is not:
-        # a one-iteration outer loop still occupies level 0, and the board returned
-        # 159 % relative error where the two-chunk simulation had passed.
+        # Shifts the AGU by 2, which advances the row pointer by _TILE_VREGS VMEM rows per iteration, and level names
+        # THIS loop. The chunk loop is emitted unconditionally, so this is ALWAYS the inner one, level 1 even at chunks
+        # = 1. Making it conditional on chunks > 1 looks right and is not, because a one-iteration outer loop still
+        # occupies level 0.
         level = 1
         bundles[pc] = {"x": minitpu.vld(0, _ROW_SCORES, agu=True, shift=2,
                                         level=level)}; pc += 1
@@ -913,50 +903,25 @@ def build_softmax_rows(rows: int, *, chunks: int = 1) -> MinitpuKernel:
     return minitpu.asm(softmax_rows_kernel)
 
 
-def build_softmax_packed(tokens: int, heads: int, *, span: int = _VREG_ELEMENTS,
-                         pitch: int | None = None) -> MinitpuKernel:
-    """Assembles the attention softmax over scores in the layout a GEMM leaves.
+def build_softmax_packed(tokens: int, heads: int, *,
+                         span: int = _VREG_ELEMENTS) -> MinitpuKernel:
+    """Assembles the attention softmax over the scores a grouped GEMM leaves.
 
-    Notes:
-        Two things make this kernel the one worth reading.
-
-        **It reads its rows where they lie.** The scores arrive PACKED, the layout a
-        fused GEMM drains and the next GEMM consumes, in which a row index is
-        `feature_tile * pitch + token`. A softmax row is one (token, head) pair and
-        a head spans `span / TILE` feature tiles, so the VMEM rows of one row sit
-        `pitch` apart. The alternative was to relayout the whole score array into
-        row-major and back, which is two more passes over it to avoid one field the
-        instruction has always carried.
-
-        **The pitch is a free choice, and it decides the bank conflict.**
-        `vpu_bank_select` sends sublane s to bank `(row + s * stride) mod
-        NUM_SUBLANES`, so the cost of an access is `gcd(stride, NUM_SUBLANES)`. The
-        natural pitch is `tokens`, and GPT-2's block is 32 tokens -- a multiple of
-        four, so every `vld` and `vst` here would take FOUR cycles instead of one.
-        Landing each feature tile one row further apart makes the pitch 33, which is
-        odd, which is conflict-free. It costs `span / TILE` rows of VMEM and nothing
-        else, and it needs no hardware: the pitch is where the DMA puts the tiles.
-
-        That is the oldest fix in the shared-memory literature -- pad the leading
-        dimension so the column stride is coprime with the bank count -- and it is
-        the one this machine can express, because a descriptor names its own
-        destination row.
+    A softmax row is one token and head pair. The scores are tile-major in DMEM, so one row's tiles sit `tokens` rows
+    apart there, and one descriptor per token gathers them into consecutive VMEM rows. That is what leaves every load
+    and store contiguous.
 
     Args:
         tokens: Rows in the score array, being the padded token count.
-        heads: Attention heads, each of which owns `span / TILE` feature tiles.
-        span: Keys one softmax row covers. A whole number of VREGs: `vredmax` and
-            `vredsum` reduce over exactly one, so a wider row is reduced with
-            `vmax` and `vadd` across several first.
-        pitch: VMEM rows between one feature tile and the next. Defaults to the
-            smallest conflict-free choice at or above `tokens`.
+        heads: Attention heads, each owning `span / _TILE` feature tiles.
+        span: Keys one softmax row covers, a whole number of VREGs because `vredmax` and `vredsum` reduce over
+            exactly one. A wider row is folded with `vmax` and `vadd` first.
 
     Returns:
         The program, taking the packed scores and the output as its arguments.
 
     Raises:
-        ValueError: If the span is not a whole number of VREGs, or the pitch
-            exceeds what a sublane stride encodes.
+        ValueError: If the span is not a whole number of VREGs, or the shape exceeds what the instruction encodes.
     """
     if span < _VREG_ELEMENTS or span % _VREG_ELEMENTS:
         message = (
@@ -964,36 +929,29 @@ def build_softmax_packed(tokens: int, heads: int, *, span: int = _VREG_ELEMENTS,
             f"one VREG, so a row is a whole number of {_VREG_ELEMENTS}."
         )
         raise ValueError(message)
-    if pitch is None:
-        # The smallest pitch at or above `tokens` that is coprime with the bank
-        # count. For a power-of-two NUM_SUBLANES that is simply the next odd number.
-        pitch = tokens if tokens % 2 else tokens + 1
-    if pitch < tokens:
-        message = (
-            f"Unable to lay out {tokens} tokens at a pitch of {pitch}. A feature "
-            f"tile's rows would overlap the next tile's."
-        )
-        raise ValueError(message)
-    max_stride = (1 << SUBLANE_STRIDE_W) - 1
-    if not 0 < pitch <= max_stride:
-        message = (
-            f"Unable to walk a pitch of {pitch}. The sublane stride field is "
-            f"{SUBLANE_STRIDE_W} bits, so it reaches {max_stride}."
-        )
-        raise ValueError(message)
-    if not 0 < tokens <= _MAX_DESCRIPTOR_ROWS:
-        message = (
-            f"Unable to move {tokens} rows in one descriptor. The row count field "
-            f"is seven bits, so a descriptor reaches {_MAX_DESCRIPTOR_ROWS}."
-        )
-        raise ValueError(message)
-
     vregs = span // _VREG_ELEMENTS         # VREGs one softmax row occupies
     tiles = span // _TILE                  # feature tiles one head owns
-    conflict_cycles = asm_module.sublane_conflict_cycles(pitch, 0xF)
 
-    # VREGs: the row itself, then a running reduction, the broadcast maximum, the
-    # exponentials, a second running reduction, the sum and its reciprocal.
+    # Rows per token, as a power of two: the AGU applies a SHIFT to the loop index, not a multiply, so `tiles` is
+    # rounded up. The padding is at most `tokens` rows of VMEM and costs nothing to walk.
+    rows_per_token = 1 << (tiles - 1).bit_length()
+    max_shift = (1 << AGU_SHIFT_W) - 1
+    if rows_per_token.bit_length() - 1 > max_shift:
+        message = (
+            f"Unable to walk {rows_per_token} rows per token. The AGU shift field is "
+            f"{AGU_SHIFT_W} bits, so the shift reaches {max_shift} and the stride "
+            f"{1 << max_shift}."
+        )
+        raise ValueError(message)
+    if tiles > _MAX_DESCRIPTOR_ROWS:
+        message = (
+            f"Unable to gather {tiles} feature tiles in one descriptor. The row "
+            f"count field reaches {_MAX_DESCRIPTOR_ROWS}."
+        )
+        raise ValueError(message)
+
+    # Spends the VREGs on the row itself, a running reduction, the broadcast maximum, the exponentials, a second running
+    # reduction, the sum and its reciprocal.
     v_in = list(range(vregs))
     v_acc = vregs
     v_max = vregs + 1
@@ -1002,37 +960,51 @@ def build_softmax_packed(tokens: int, heads: int, *, span: int = _VREG_ELEMENTS,
     v_sum = 2 * vregs + 3
     v_recip = 2 * vregs + 4
 
+    # Issues one descriptor per token, covering that token's tiles and landing them `rows_per_token` apart so
+    # the AGU reaches token t with a shift.
+    #
+    #   row = _ROW_SCORES + token * rows_per_token + tile
+    descriptors, rows_each = tokens, tiles
+    walk_bytes = _ROW_BYTES                    # the next token is one row on
+    head_bytes = tiles * tokens * _ROW_BYTES   # one head, in DMEM
+    agu_shift = (rows_per_token - 1).bit_length()
+
     def softmax_packed() -> None:
         """One head per outer iteration, one (token, head) score row per inner."""
         bundles = {}
         pc = 0
-        bundles[pc] = {"s": minitpu.smovi(3, _ROW_BYTES)}; pc += 1
+        # Names the DMA row stride, since a token's tiles are `tokens` rows apart in DMEM.
+        bundles[pc] = {"s": minitpu.smovi(2, tokens * _ROW_BYTES)}; pc += 1
         bundles[pc] = {"s": minitpu.smov_arg(0, 0)}; pc += 1      # sreg0 = packed scores
         bundles[pc] = {"s": minitpu.smov_arg(1, 2)}; pc += 1      # sreg1 = output
         pc += 1
         bundles[pc] = {"f": minitpu.lbegin(heads)}; pc += 1        # level 0
 
-        # One descriptor per feature tile, landing it at its own pitch. Two
-        # descriptor slots exist, so they go in pairs with a flush between.
-        for tile in range(tiles):
-            bundles[pc] = {"d": minitpu.dma_load(tile % 2, _ROW_SCORES + tile * pitch,
-                                                 tokens, 0, 3)}; pc += 1
-            bundles[pc] = {"s": minitpu.saddi(0, 0, tokens * _ROW_BYTES)}; pc += 2
-            if tile % 2 or tile == tiles - 1:
+        # Issues descriptors in pairs with a flush between, because only two slots exist. The pointer advance follows
+        # the descriptor that reads it.
+        for index in range(descriptors):
+            bundles[pc] = {"d": minitpu.dma_load(index % 2,
+                                                 _ROW_SCORES + index * rows_per_token,
+                                                 rows_each, 0, 2)}; pc += 1
+            bundles[pc] = {"s": minitpu.saddi(0, 0, walk_bytes)}; pc += 2
+            if index % 2 or index == descriptors - 1:
                 bundles[pc] = {"f": minitpu.flush_slot(3)}; pc += 1
+        # Moves on to the next head. The loads have all been flushed, so sreg0 is free.
+        if descriptors * walk_bytes != head_bytes:
+            bundles[pc] = {"s": minitpu.saddi(
+                0, 0, head_bytes - descriptors * walk_bytes)}; pc += 2
 
         bundles[pc] = {"f": minitpu.lbegin(tokens)}; pc += 1       # level 1
-        # Shift 0: the induction variable IS the token, and one token is one row of
-        # each tile's base. The four sublanes then reach four consecutive tiles.
+        # Reads the token as the induction variable, shifted by the rows a token owns. The four sublanes then reach four
+        # CONSECUTIVE feature tiles.
         for index, vreg in enumerate(v_in):
             bundles[pc] = {"x": minitpu.vld(vreg,
-                                            _ROW_SCORES + index * _NUM_SUBLANES * pitch,
-                                            agu=True, shift=0, level=1, stride=pitch)}
-            pc += conflict_cycles
+                                            _ROW_SCORES + index * _NUM_SUBLANES,
+                                            agu=True, shift=agu_shift, level=1)}
+            pc += 1
 
-        # The maximum, across VREGs then within one. `vmax` is elementwise and
-        # `vredmax` reduces a VREG, and they order BF16 identically -- which is why
-        # `bf16_gt` lives in vpu_pkg where both reach it, rather than in either.
+        # Takes the maximum across VREGs then within one. `vmax` is elementwise and `vredmax` reduces a VREG, and they
+        # order BF16 identically, which is why `bf16_gt` lives in vpu_pkg where both reach it, rather than in either.
         bundles[pc] = {"e": minitpu.vmov(v_acc, v_in[0])}; pc += 1
         for vreg in v_in[1:]:
             bundles[pc] = {"e": minitpu.vmax(v_acc, v_acc, vreg)}; pc += 1
@@ -1042,7 +1014,7 @@ def build_softmax_packed(tokens: int, heads: int, *, span: int = _VREG_ELEMENTS,
             bundles[pc] = {"e": minitpu.vsub(v_exp[index], vreg, v_max)}; pc += 1
             bundles[pc] = {"e": minitpu.vexp(v_exp[index], v_exp[index])}; pc += 1
 
-        # The sum, the same way: `vadd` across VREGs, `vredsum` within one.
+        # Takes the sum the same way, with `vadd` across VREGs and `vredsum` within one.
         bundles[pc] = {"e": minitpu.vmov(v_total, v_exp[0])}; pc += 1
         for vreg in v_exp[1:]:
             bundles[pc] = {"e": minitpu.vadd(v_total, v_total, vreg)}; pc += 1
@@ -1053,23 +1025,21 @@ def build_softmax_packed(tokens: int, heads: int, *, span: int = _VREG_ELEMENTS,
             bundles[pc] = {"e": minitpu.vmul(vreg, vreg, v_recip)}; pc += 1
         for index, vreg in enumerate(v_exp):
             bundles[pc] = {"x": minitpu.vst(vreg,
-                                            _ROW_SOFTMAX_OUT + index * _NUM_SUBLANES * pitch,
-                                            agu=True, shift=0, level=1, stride=pitch)}
-            pc += conflict_cycles
-        # The back edge is where a strided kernel gets caught: `schedule()` prices a
-        # split access along a straight line, and a loop's last bundle is adjacent in
-        # TIME to its first without being adjacent in the list. At a conflict-free
-        # pitch this costs nothing, which is the point.
-        pc += conflict_cycles - 1
+                                            _ROW_SOFTMAX_OUT + index * _NUM_SUBLANES,
+                                            agu=True, shift=agu_shift, level=1)}
+            pc += 1
         bundles[pc] = {"f": minitpu.loop_end()}; pc += 1
 
-        for tile in range(tiles):
-            bundles[pc] = {"d": minitpu.dma_store(tile % 2,
-                                                  _ROW_SOFTMAX_OUT + tile * pitch,
-                                                  tokens, 1, 3)}; pc += 1
-            bundles[pc] = {"s": minitpu.saddi(1, 1, tokens * _ROW_BYTES)}; pc += 2
-            if tile % 2 or tile == tiles - 1:
+        for index in range(descriptors):
+            bundles[pc] = {"d": minitpu.dma_store(index % 2,
+                                                  _ROW_SOFTMAX_OUT + index * rows_per_token,
+                                                  rows_each, 1, 2)}; pc += 1
+            bundles[pc] = {"s": minitpu.saddi(1, 1, walk_bytes)}; pc += 2
+            if index % 2 or index == descriptors - 1:
                 bundles[pc] = {"f": minitpu.flush_slot(3)}; pc += 1
+        if descriptors * walk_bytes != head_bytes:
+            bundles[pc] = {"s": minitpu.saddi(
+                1, 1, head_bytes - descriptors * walk_bytes)}; pc += 2
         bundles[pc] = {"f": minitpu.loop_end()}; pc += 1
         bundles[pc] = {"f": minitpu.halt()}; pc += 1
         for index in range(pc):
@@ -1126,9 +1096,8 @@ def build_layernorm_rows(rows: int, *, packed: bool = False) -> MinitpuKernel:
             bundles[pc] = slots
             pc += 1
 
-        # The constants are contiguous whichever layout the rows use, so they are
-        # loaded at the row pitch before sreg3 becomes the packed stride. There are
-        # only four scalar registers and all four are spoken for.
+        # Loads the constants at the row pitch before sreg3 becomes the packed stride, since they are contiguous
+        # whichever layout the rows use. There are only four scalar registers and all four are spoken for.
         emit(s=minitpu.smovi(3, _ROW_BYTES))
         emit(s=minitpu.smov_arg(0, 0))          # sreg0 = input
         emit(s=minitpu.smov_arg(1, 1))          # sreg1 = constants

@@ -111,7 +111,7 @@ _COLUMN_AXIS: str = "n"
 
 @dataclass(frozen=True)
 class LoopLevel:
-    """One loop of the emitted nest.
+    """Describes one loop of the emitted nest.
 
     Attributes:
         axis: Problem axis the loop walks, being "n" for output columns and "k" for the reduction. The token axis
@@ -125,7 +125,7 @@ class LoopLevel:
 
 @dataclass(frozen=True)
 class StagedOperand:
-    """One tensor staged into VMEM, and how its descriptor reaches it.
+    """Describes one tensor staged into VMEM, and how its descriptor reaches it.
 
     Attributes:
         name: What the operand is, for the messages a staging decision appears in.
@@ -147,7 +147,7 @@ class StagedOperand:
 
     @property
     def advance(self) -> int:
-        """Bytes the pointer moves once its descriptor has read it."""
+        """Returns the bytes the pointer moves once its descriptor has read it."""
         return self.rows * _ROW_BYTES
 
 
@@ -418,7 +418,7 @@ def _emit_prologue(*, put: Callable[..., None], builder: asm_module.AsmBuilder, 
     at += 1
     put(offset=at, s=builder.smov_arg(rd=_DRAIN_POINTER, arg=2))
     at += _SCALAR_GAP
-    put(offset=at, d=builder.dma_load(slot=0, vmem_row=_ROW_ZERO, rows=_ZERO_ROWS,
+    put(offset=at, d=builder.dma_load(slot=0, vmem_address=_ROW_ZERO, rows=_ZERO_ROWS,
                                       base_sreg=_DRAIN_POINTER, stride_sreg=_PITCH_REGISTER))
     at += 1
     put(offset=at, f=builder.flush_slot(mask=1))
@@ -471,7 +471,7 @@ def _emit_stage(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at:
     """
     row = vmem_slot * _VMEM_SLOT_STRIDE
     for operand in operands:
-        put(offset=at, d=builder.dma_load(slot=operand.dma_slot, vmem_row=operand.vmem_rows[step] + row,
+        put(offset=at, d=builder.dma_load(slot=operand.dma_slot, vmem_address=operand.vmem_rows[step] + row,
                                           rows=operand.rows, base_sreg=operand.pointer,
                                           stride_sreg=_PITCH_REGISTER))
         at += 1
@@ -497,7 +497,7 @@ def _emit_drain(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at:
                 x=builder.vst(vreg=_TILE_VREGS * group + vreg,
                               row=_ROW_OUTPUT + _TILE_ROWS * group + _NUM_SUBLANES * vreg))
     at += _TOKEN_GROUPS * _TILE_VREGS
-    put(offset=at, d=builder.dma_store(slot=0, vmem_row=_ROW_OUTPUT, rows=_OUTPUT_ROWS,
+    put(offset=at, d=builder.dma_store(slot=0, vmem_address=_ROW_OUTPUT, rows=_OUTPUT_ROWS,
                                        base_sreg=_DRAIN_POINTER, stride_sreg=_PITCH_REGISTER))
     at += 1
     put(offset=at, f=builder.flush_slot(mask=1))

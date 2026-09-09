@@ -1,27 +1,9 @@
-"""A kernel surface where layouts are written and addresses are derived.
+"""Provides a kernel surface where layouts are written and addresses are derived.
 
-Everything here follows from one division, which the measurements in
-SESSION_CHECKLIST.md argue for rather than assume:
-
-    the programmer writes    which layout a tensor is in, which VMEM pitch it is
-                             staged at, where a relayout happens, and how the
-                             launch is tiled
-    the compiler derives     every descriptor field, every vld and vst field, the
-                             loop level an AGU walk binds to, and what the access
-                             costs in bank cycles
-    the compiler refuses     a layout mismatch and a non-affine index; it never
-                             repairs either, because a repair is a launch
-    nobody decides           which layout is best -- there is no cost model here,
-                             and Mosaic does not have one either
-
-The surface is small because the machine is. A VMEM row IS one lane group and rows
-are the sublane axis, so the only freedom in a VREG access is which rows the four
-sublanes take: one stride, plus which loop level the base walks. That is why this
-file has `Vmem(pitch=...)` and `Ref.row(iv)` and nothing resembling Mosaic's
-`bitwidth`, `tiling` or `implicit_dim`.
-
-`tools/check_dsl.py` builds the packed softmax through this and holds the result
-against `kernels.build_softmax_packed`, bundle for bundle.
+The programmer writes which layout a tensor is in, which VMEM stride it is staged at, where a relayout happens and
+how the launch is tiled. Everything else follows from that: every descriptor field, every vld and vst field, and the
+loop level an AGU walk binds to. A layout mismatch or a non-affine index is refused rather than repaired, because a
+repair is a launch.
 """
 
 from __future__ import annotations
@@ -38,8 +20,7 @@ from runtime import minitpu
 #: `minitpu` above is the live runtime namespace, and `asm(program)` REPLACES it
 #: in this module's globals for the duration of a capture -- which is how
 #: `program` below reaches the builder. Importing it rather than relying on that
-#: injection keeps the name defined, which `tools/check_names.py` requires and
-#: which is not pedantry: a global that only exists during a capture is exactly
+#: injection keeps the name defined, which is not pedantry: a global that only exists during a capture is exactly
 #: the kind of name that goes stale without anything noticing.
 
 #: Words are built through a private assembler instance rather than the `minitpu`
@@ -51,18 +32,14 @@ ops = asm_module.AsmBuilder()
 
 @dataclass(frozen=True)
 class Vmem:
-    """A VMEM staging layout. The pitch is the programmer's, deliberately.
+    """A VMEM staging layout.
 
-    `pitch=None` asks for the smallest conflict-free choice. Passing a colliding
-    pitch is legal and costs `gcd(pitch, NUM_SUBLANES)` cycles per access -- the
-    compiler prices it and emits it, and `tools/demo_bank_conflicts.py` measures
-    3.13x on a board for the worst case. A surface that silently substituted the
-    good pitch would make the bad one unobservable.
+    There is one, and it holds no choice any more. A staged tensor lands each
+    token's feature tiles CONSECUTIVELY, so the reduction that walks them reads
+    at stride one. The `stride` this used to carry -- padded to be coprime with
+    the bank count, so a strided read did not split across cycles -- went with
+    the sublane stride it existed to price.
     """
-
-    pitch: int | None = None
-
-
 @dataclass
 class Ref:
     """A staged tensor: DMEM layout, VMEM region, and how to reach a row of it."""
@@ -75,16 +52,20 @@ class Ref:
     def row(self, level: int) -> "Access":
         """One VREG's worth, with the four sublanes walking feature tiles.
 
-        The base walks `level`'s induction variable by one row per step, because
-        one token is one row of every tile's base. The sublanes then reach four
-        consecutive tiles at the region's pitch.
+        A token owns `region.tile_stride` consecutive rows, so the induction variable
+        reaches token t with a SHIFT, and the four sublanes then read four
+        adjacent tiles of it.
         """
         return Access(self, level)
 
     @property
-    def conflict(self) -> int:
-        """Cycles one such access costs."""
-        return math.gcd(self.region.pitch, _NUM_SUBLANES)
+    def shift(self) -> int:
+        """The left shift the AGU applies to the induction variable.
+
+        The region's stride is a power of two precisely so this exists: the AGU
+        shifts the index, it does not multiply by it.
+        """
+        return (self.region.tile_stride - 1).bit_length()
 
 
 @dataclass(frozen=True)
@@ -95,8 +76,12 @@ class Access:
     level: int
 
     def base(self, group: int) -> int:
-        """VMEM row for sublane group `group` of this access."""
-        return self.ref.region.row(0) + group * _NUM_SUBLANES * self.ref.region.pitch
+        """VMEM row for sublane group `group` of this access.
+
+        A VREG spans `_NUM_SUBLANES` adjacent feature tiles, so the next one
+        starts that many rows on -- no stride enters, which is the whole change.
+        """
+        return self.ref.region.row(0) + group * _NUM_SUBLANES
 
 
 @dataclass
@@ -109,7 +94,7 @@ class Kernel:
     pc: int = 0
     level: int = -1
     _args: dict = field(default_factory=dict)
-    _pitch_sreg: int | None = None
+    _stride_sreg: int | None = None
 
     # -- what the programmer writes ----------------------------------------
 
@@ -138,49 +123,49 @@ class Kernel:
 
     def stage(self, name: str, dmem: Tiled, *, tiles: int, rows: int,
               vmem: Vmem, sreg: int) -> Ref:
-        """Brings `tiles` feature tiles into VMEM. THIS is the relayout.
+        """Brings `rows` tokens of `tiles` feature tiles into VMEM. THIS is the relayout.
 
-        One descriptor per tile, each landing at its own pitch, which is the whole
-        of a re-pitch: a descriptor names its own destination row, so changing the
-        VMEM layout on the way in costs nothing but the choice.
+        One descriptor per TOKEN, gathering that token's tiles -- which are
+        `rows` apart in DMEM -- into consecutive VMEM rows. A descriptor names
+        both its DMEM stride and its destination row, so the relayout costs
+        nothing but the choice to make it.
         """
-        conflict_free = vmem.pitch is None
-        region = self.vmem.region(name, rows, tiles=tiles,
-                                  conflict_free=conflict_free)
-        if vmem.pitch is not None and vmem.pitch != region.pitch:
-            region = VmemRegion(name, region.base, rows, vmem.pitch, tiles)
-        for tile in range(tiles):
-            self._emit(d=ops.dma_load(tile % 2, region.row(tile), rows,
-                                          sreg, self._pitch()))
-            self._emit(s=ops.saddi(sreg, sreg, rows * _ROW_BYTES), advance=2)
-            if tile % 2 or tile == tiles - 1:
+        region = self.vmem.token_major_region(name, rows, tiles=tiles)
+        for token in range(rows):
+            self._emit(d=ops.dma_load(token % 2, region.row(token), tiles,
+                                      sreg, self._stride()))
+            self._emit(s=ops.saddi(sreg, sreg, _ROW_BYTES), advance=2)
+            if token % 2 or token == rows - 1:
                 self._emit(f=ops.flush_slot(3))
+        # The descriptors walked one row per token; a head is `tiles` times that.
+        # The remainder is what puts the pointer on the next head.
+        self._emit(s=ops.saddi(sreg, sreg, (tiles - 1) * rows * _ROW_BYTES),
+                   advance=2)
         return Ref(name, dmem, region, self)
 
     def drain(self, ref: Ref, *, tiles: int, rows: int, sreg: int) -> None:
-        """Writes a staged region back out, one descriptor per tile."""
-        for tile in range(tiles):
-            self._emit(d=ops.dma_store(tile % 2, ref.region.row(tile), rows,
-                                           sreg, self._pitch()))
-            self._emit(s=ops.saddi(sreg, sreg, rows * _ROW_BYTES), advance=2)
-            if tile % 2 or tile == tiles - 1:
+        """Writes a staged region back out, one descriptor per token."""
+        for token in range(rows):
+            self._emit(d=ops.dma_store(token % 2, ref.region.row(token), tiles,
+                                       sreg, self._stride()))
+            self._emit(s=ops.saddi(sreg, sreg, _ROW_BYTES), advance=2)
+            if token % 2 or token == rows - 1:
                 self._emit(f=ops.flush_slot(3))
+        # As in `stage`: the pointer is walked on to the next head.
+        self._emit(s=ops.saddi(sreg, sreg, (tiles - 1) * rows * _ROW_BYTES),
+                   advance=2)
 
     def load(self, access: Access, vregs: list[int]) -> None:
-        """Derives one `vld` per VREG. Base, stride, level and spacing are ours."""
+        """Derives one `vld` per VREG. Base, shift and level are ours."""
         for group, vreg in enumerate(vregs):
-            self._emit(x=ops.vld(vreg, access.base(group), agu=True, shift=0,
-                                     level=access.level,
-                                     stride=access.ref.region.pitch),
-                       advance=access.ref.conflict)
+            self._emit(x=ops.vld(vreg, access.base(group), agu=True,
+                                 shift=access.ref.shift, level=access.level))
 
     def store(self, access: Access, vregs: list[int]) -> None:
         """Derives one `vst` per VREG, the same way."""
         for group, vreg in enumerate(vregs):
-            self._emit(x=ops.vst(vreg, access.base(group), agu=True, shift=0,
-                                     level=access.level,
-                                     stride=access.ref.region.pitch),
-                       advance=access.ref.conflict)
+            self._emit(x=ops.vst(vreg, access.base(group), agu=True,
+                                 shift=access.ref.shift, level=access.level))
 
     def compute(self, word: int) -> None:
         """One E-slot op, placed at the next bundle."""
@@ -188,16 +173,24 @@ class Kernel:
 
     # -- what the compiler does --------------------------------------------
 
-    def _pitch(self) -> int:
-        """The scalar register holding one DMEM row's byte pitch."""
-        if self._pitch_sreg is None:
+    def _stride(self) -> int:
+        """The scalar register holding a descriptor's DMEM row stride."""
+        if self._stride_sreg is None:
             raise LayoutError("prologue() must run before any descriptor")
-        return self._pitch_sreg
+        return self._stride_sreg
 
-    def prologue(self, *, pitch_sreg: int = 3) -> None:
-        """Emits the row pitch and binds every declared argument."""
-        self._pitch_sreg = pitch_sreg
-        self._emit(s=ops.smovi(pitch_sreg, _ROW_BYTES))
+    def prologue(self, *, stride_sreg: int = 2, stride_rows: int = 1) -> None:
+        """Emits the DMEM row stride and binds every declared argument.
+
+        Args:
+            stride_sreg: Which scalar register holds the stride.
+            stride_rows: DMEM rows between the rows one descriptor gathers. A
+                token's feature tiles are `tokens` rows apart, so this is the
+                token count, and it is why the stride is a register rather than
+                a fixed row stride.
+        """
+        self._stride_sreg = stride_sreg
+        self._emit(s=ops.smovi(stride_sreg, stride_rows * _ROW_BYTES))
         for _, (slot, sreg, _) in self._args.items():
             self._emit(s=ops.smov_arg(sreg, slot))
         self.pc += 1                       # scalar writeback before first use

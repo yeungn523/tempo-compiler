@@ -1,23 +1,10 @@
 #!/usr/bin/env python3
-"""GPT-2 on the MINITPU: what runs on the device, and the checks that say it is right.
+"""Provides the GPT-2 host drivers, the layer references and the checks that say the device path is right.
 
-This module is the entry point. Run it on a board and it executes every check in order:
-
-    python3 gpt2_kernels.py
-
-The package is three files, split by what a reader needs from each.
-
-    bf16.py     device geometry, BF16 packing, operand layouts, and the host references.
-                Touches no device, so it can be checked by inspection.
-    kernels.py  every assembled program. The machine has no hazard interlocks, so each
-                schedule is a correctness argument and the comments there carry it.
-    this file   the host drivers that stage operands and launch, the layer-level references,
-                and the checks. Composition lives here; arithmetic and schedules do not.
-
-What runs where is a deliberate split, not a limitation of the moment: the PL runs the hidden
-dimensions -- both projections, every attention head, both feed-forward products and LayerNorm --
-while the host holds residual adds, biases, head reshaping and the K transpose. Embedding and the
-language-model head are the PS's, by the same division.
+Running this module on a board executes every check in order. Composition lives here, while the arithmetic is in
+bf16.py and the schedules are in kernels.py. The PL runs the hidden dimensions, being both projections, every
+attention head, both feed-forward products and LayerNorm, and the host holds the residual adds, biases, head
+reshaping and the K transpose.
 """
 
 from __future__ import annotations
@@ -460,11 +447,10 @@ class DeviceTensorSlice:
 
 # Host staging is a fresh `minitpuHostAlloc` per call, deliberately. It is a bump
 # allocator with no per-region free (v1 by design), so a long-lived process that
-# sweeps many shapes will exhaust its 16 MiB udmabuf -- which is why
-# tools/bench_throughput.py takes one shape per process.
+# sweeps many shapes will exhaust its 16 MiB udmabuf, which is why a benchmark
+# takes one shape per process.
 #
-# Caching and reusing one region per role was tried and reverted. Two things break
-# it: a cached region does not survive `minitpuHostReset`, which the drivers call
+# Caching and reusing one region per role does not work. Two things break it: a cached region does not survive `minitpuHostReset`, which the drivers call
 # and which drops the udmabuf out from under every region carved from it; and the
 # helper cannot bind a device of its own without rebinding one in the middle of
 # whatever sequence its caller was running. Both show up as `instr_ready` never
@@ -1088,7 +1074,7 @@ def full_gemm(
                 words=h_drain.view.view("<u2")[_ZERO_TILE_WORDS:drain_words])
             tiles = partials.reshape(column_tiles, drained_groups, _BLOCK_TOKENS, _TILE)
             # With fuse_groups the device has already summed them and this axis is 1, so the sum
-            # is a no-op rather than the float32 reduction it used to be.
+            # is a no-op. Without it, this is the float32 reduction of the partials.
             summed = tiles.sum(axis=1, dtype=np.float32)
             result[token : token + _BLOCK_TOKENS] = summed.transpose(1, 0, 2).reshape(_BLOCK_TOKENS, columns)
     finally:
@@ -1580,7 +1566,7 @@ def attention(d_fused: DeviceTensor, *, heads: int = 12, causal: bool = True,
         are the same ordering, so the packed softmax reads the grouped output where
         it lies, head h's probabilities are the contiguous run the gather's problem
         h wants, and the gather's own output is the packed `[rows, model]` the
-        output projection consumes. tools/check_attention_layout.py checks it.
+        output projection consumes.
 
         The operands are what change: `d_keys` holds `heads` transposed key
         matrices end to end rather than one block-diagonal, which is the same

@@ -1,7 +1,7 @@
 """Contains tests for the physical encodings and the hazard pricing performed by the public assembler.
 
 Mis-spacing is silent on a machine with no interlocks, so the distances asserted here track compiler/minitpuisa.td,
-which tb/tb_isa_conformance.sv checks against the RTL's own WB_W_* constants.
+which the RTL's own WB_W_* constants are held against upstream.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_HERE))
 
 import asm  # noqa: E402
-from asm import AsmBuilder, mxu_output_fifo, schedule, sublane_conflict_cycles  # noqa: E402
+from asm import AsmBuilder, _delay_of, mxu_output_fifo, schedule  # noqa: E402
 
 
 class AssemblerEncodingTest(unittest.TestCase):
@@ -181,7 +181,7 @@ class FlushSlotTest(unittest.TestCase):
     def test_flushing_a_slot_never_issued_on_is_rejected(self) -> None:
         """Verifies that a flush mask covering an unissued slot raises."""
         def body(builder: AsmBuilder) -> None:
-            builder.bundle(d=builder.dma_load(slot=0, vmem_row=0, rows=4, base_sreg=0, stride_sreg=3))
+            builder.bundle(d=builder.dma_load(slot=0, vmem_address=0, rows=4, base_sreg=0, stride_sreg=3))
             builder.bundle(f=builder.flush_slot(mask=3))
             builder.bundle(f=builder.halt())
 
@@ -191,7 +191,7 @@ class FlushSlotTest(unittest.TestCase):
     def test_flushing_only_the_issued_slot_is_accepted(self) -> None:
         """Verifies that a flush mask covering the issued slot alone is accepted."""
         def body(builder: AsmBuilder) -> None:
-            builder.bundle(d=builder.dma_load(slot=0, vmem_row=0, rows=4, base_sreg=0, stride_sreg=3))
+            builder.bundle(d=builder.dma_load(slot=0, vmem_address=0, rows=4, base_sreg=0, stride_sreg=3))
             builder.bundle(f=builder.flush_slot(mask=1))
             builder.bundle(f=builder.halt())
 
@@ -200,8 +200,8 @@ class FlushSlotTest(unittest.TestCase):
     def test_both_slots_issued_lets_the_pair_flush(self) -> None:
         """Verifies that a two-slot flush mask is accepted once both slots carry a descriptor."""
         def body(builder: AsmBuilder) -> None:
-            builder.bundle(d=builder.dma_load(slot=0, vmem_row=0, rows=4, base_sreg=0, stride_sreg=3))
-            builder.bundle(d=builder.dma_load(slot=1, vmem_row=8, rows=4, base_sreg=2, stride_sreg=3))
+            builder.bundle(d=builder.dma_load(slot=0, vmem_address=0, rows=4, base_sreg=0, stride_sreg=3))
+            builder.bundle(d=builder.dma_load(slot=1, vmem_address=8, rows=4, base_sreg=2, stride_sreg=3))
             builder.bundle(f=builder.flush_slot(mask=3))
             builder.bundle(f=builder.halt())
 
@@ -210,61 +210,34 @@ class FlushSlotTest(unittest.TestCase):
     def test_a_descriptor_issued_after_the_flush_still_counts(self) -> None:
         """Verifies that a descriptor issued later in the stream satisfies an earlier flush."""
         def body(builder: AsmBuilder) -> None:
-            builder.bundle(d=builder.dma_load(slot=0, vmem_row=0, rows=4, base_sreg=0, stride_sreg=3))
+            builder.bundle(d=builder.dma_load(slot=0, vmem_address=0, rows=4, base_sreg=0, stride_sreg=3))
             builder.bundle(f=builder.flush_slot(mask=3))
-            builder.bundle(d=builder.dma_load(slot=1, vmem_row=8, rows=4, base_sreg=2, stride_sreg=3))
+            builder.bundle(d=builder.dma_load(slot=1, vmem_address=8, rows=4, base_sreg=2, stride_sreg=3))
             builder.bundle(f=builder.halt())
 
         self.assertTrue(_image(body))
 
 
-class SublaneConflictTest(unittest.TestCase):
-    """Verifies the cost a strided VMEM access carries and the delays that cost buys.
+class VmemAccessCostTest(unittest.TestCase):
+    """A VMEM access holds the compute port for exactly one cycle.
 
-    vpu_vmem's busy_o is observation only and does not gate acceptance, so schedule() has to price the held port.
+    The sublanes read consecutive rows, so their banks are a permutation and no access splits.
     """
 
-    def test_odd_strides_are_conflict_free(self) -> None:
-        """Verifies that an odd stride touches every bank once."""
-        for stride in (1, 3, 5, 7):
-            self.assertEqual(sublane_conflict_cycles(stride, 0xF), 1, f"stride {stride}")
-
-    def test_even_strides_collide(self) -> None:
-        """Verifies that an even stride holds the compute port for one cycle per collision."""
-        self.assertEqual(sublane_conflict_cycles(2, 0xF), 2)
-        self.assertEqual(sublane_conflict_cycles(4, 0xF), 4)
-        self.assertEqual(sublane_conflict_cycles(8, 0xF), 4)
-
-    def test_a_mask_can_dodge_a_collision(self) -> None:
-        """Verifies that masking out the colliding sublanes lowers the cost."""
-        self.assertEqual(sublane_conflict_cycles(4, 0b0001), 1)
-        self.assertEqual(sublane_conflict_cycles(4, 0b0101), 2)
-
-    def test_a_conflicting_load_delays_the_next_access(self) -> None:
-        """Verifies that a four-way conflicting load spaces the access that follows it."""
-        def body(builder: AsmBuilder) -> None:
-            builder.bundle(x=builder.vld(vreg=0, row=0, stride=4))
-            builder.bundle(x=builder.vld(vreg=1, row=64))
-            builder.bundle(f=builder.halt())
-
-        words = _image(body)
-        self.assertGreaterEqual(asm._delay_of(words[0]), 3)
-
-    def test_a_conflicting_load_also_writes_back_later(self) -> None:
-        """Verifies that a four-way conflicting load's consumer is legal at +10, as measured on the RTL."""
-        def body(builder: AsmBuilder) -> None:
-            builder.bundle(x=builder.vld(vreg=0, row=0, stride=4))
-            builder.bundle(e=builder.vadd(vd=1, va=0, vb=0))
-            builder.bundle(f=builder.halt())
-
-        words = _image(body)
-        self.assertEqual(asm._delay_of(words[0]), 9)
-
-    def test_a_zero_mask_is_rejected(self) -> None:
-        """Verifies that a load selecting no sublane raises."""
+    def test_a_load_does_not_delay_the_next_access(self) -> None:
+        """One access clears the compute port before the next issues."""
         builder = AsmBuilder()
-        with self.assertRaisesRegex(ValueError, "at least one"):
-            builder.vld(vreg=0, row=0, mask=0)
+        builder.bundle(x=builder.vld(vreg=0, row=0))
+        builder.bundle(x=builder.vld(vreg=1, row=64))
+        builder.bundle(f=builder.halt())
+        words = schedule(list(builder.bundles))
+        self.assertEqual(_delay_of(words[0]), 0)
+
+    def test_every_access_costs_one_cycle(self) -> None:
+        """The decoder prices each access at one cycle whichever sublanes it names."""
+        builder = AsmBuilder()
+        for mask in (0xF, 0b0101, 0b0001):
+            self.assertEqual(asm._decode(builder.vld(vreg=0, row=0, mask=mask))["vmem_cycles"], 1)
 
 
 class RememberedScheduleTest(unittest.TestCase):
@@ -365,7 +338,7 @@ def _fifo_capacity() -> int:
 def _kernel() -> asm.AsmKernel:
     """Returns a three-bundle kernel used to exercise the schedule memo."""
     builder = AsmBuilder()
-    builder.bundle(x=builder.vld(vreg=0, row=0, stride=4))
+    builder.bundle(x=builder.vld(vreg=0, row=0))
     builder.bundle(e=builder.vadd(vd=1, va=0, vb=0))
     builder.bundle(f=builder.halt())
     return asm.AsmKernel(name="remembered", bundles=tuple(builder.bundles))

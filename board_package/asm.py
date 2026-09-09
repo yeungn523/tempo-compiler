@@ -1,11 +1,8 @@
-"""Provides the packaging interface for the MINITPU's physical 128-bit VLIW bundles, and the software scheduling
-that makes a stream of them legal.
+"""Packages the MINITPU's 128-bit VLIW bundles and spaces a stream of them into a legal schedule.
 
-The machine carries no hazard interlocks. It issues one bundle per cycle and the delay field is the only fetch-head
-hold, so every emitted image is spaced here before it reaches a board. The scheduling mirrors tb/bundle_scheduler.svh
-and both take their latencies from compiler/minitpuisa.td.
+The machine carries no hazard interlocks, and the delay field is its only fetch-head hold, so every image
+is spaced here before it reaches a board. The latencies come from compiler/minitpuisa.td.
 """
-
 from __future__ import annotations
 
 import functools
@@ -45,14 +42,11 @@ BUNDLE_BYTES: int = 16
 BUNDLE_BITS: int = 128
 """Width of one physical VLIW bundle in bits."""
 
-HALT_BUNDLE: int = 0x0000000200000000
-"""Canonical F:halt word the current RTL encoder emits, carried as an exact physical word rather than re-encoded."""
-
 # Mirrors sequencer_pkg::compute_payload_t ({is_dma, e, m, x, s, f, delay, reserved}, MSB first) at NUM_LANES=16
 # and NUM_SUBLANES=4:
 #
-#   is_dma [127]   e [126:108]   m [107:101]   x [100:61]
-#   s [60:34]      f [33:7]      delay [6:1]   reserved [0]
+#   is_dma [127]   e [126:108]   m [107:101]   x [100:68]
+#   s [67:41]      f [40:14]      delay [13:8]  reserved [7:0]
 #
 # Derives every position below from these widths, so a width change in sequencer_pkg moves every position that
 # follows it.
@@ -63,7 +57,7 @@ E_SLOT_W: int = 19
 M_SLOT_W: int = 7
 """Width of the M slot in bits."""
 
-X_SLOT_W: int = 40
+X_SLOT_W: int = 33
 """Width of the X slot in bits."""
 
 S_SLOT_W: int = 27
@@ -85,8 +79,8 @@ COMPUTE_RESERVED_W: int = (BUNDLE_BITS - 1) - (
 NUM_SUBLANES: int = 4
 """Banks per lane, mirroring vpu_pkg's NUM_SUBLANES."""
 
-SUBLANE_STRIDE_W: int = 7
-"""Width of the X-slot stride immediate in bits."""
+AGU_SHIFT_W: int = 3
+"""Width of the X-slot AGU shift in bits, mirroring sequencer_pkg's X_SHIFT_W."""
 
 # Overlays one DMA descriptor on the storage the compute format spends on its E/M/X/S/F fields, with bit 127
 # selecting between the two. A co-issued slot therefore reaches no execution unit: it rewrites the descriptor bits
@@ -108,7 +102,7 @@ W_REDUCE: int = RTL_PARAMS["WB_W_REDUCE"]
 """Writeback offset of a reduction tree result."""
 
 W_VLD: int = RTL_PARAMS["WB_W_VLD"]
-"""Writeback offset of a conflict-free VMEM load, which a split load extends by its conflict degree."""
+"""Writeback offset of a VMEM load."""
 
 W_TRANSPOSE: int = _WRITEBACK["vtxout"]
 """Writeback offset of a vtxout, covering one registered read stage inside the unit and the shared writeback
@@ -147,10 +141,25 @@ _S_SHIFT: int = _X_SHIFT - S_SLOT_W
 _F_SHIFT: int = _S_SHIFT - F_SLOT_W
 """Bit position the F slot starts at."""
 
+_F_OP_SHIFT: int = _F_SHIFT + F_SLOT_W - 3
+"""Bit position the F slot's opcode starts at, three bits below the slot's top."""
+
+HALT_BUNDLE: int = _OPCODES["halt"] << _F_OP_SHIFT
+"""Canonical F:halt bundle, derived from the opcode and the slot position rather than written out."""
+
 _DELAY_SHIFT: int = _F_SHIFT - DELAY_W
 """Bit position the compute bundle's delay field starts at."""
 
-_DMA_DELAY_SHIFT: int = 85
+D_WIRE_W: int = 36
+"""Width of the DMA descriptor in bits, mirroring sequencer_pkg's d_wire_t."""
+
+_D_SHIFT: int = (BUNDLE_BITS - 1) - D_WIRE_W
+"""Bit position the DMA descriptor starts at."""
+
+DMA_RESERVED_W: int = _D_SHIFT - DELAY_W
+"""Bits the DMA format leaves unassigned once the descriptor and the delay field are placed."""
+
+_DMA_DELAY_SHIFT: int = _D_SHIFT - DELAY_W
 """Bit position the DMA bundle's delay field starts at, which the descriptor layout places apart from the
 compute one."""
 
@@ -158,7 +167,15 @@ assert _DELAY_SHIFT == COMPUTE_RESERVED_W, (
     "compute payload field positions disagree with the slot widths")
 
 def _e_opcodes(*, reads_b: bool | None = None, w: int | None = None) -> set[int]:
-    """Returns the E opcodes matching a second-operand read, a writeback offset, or both."""
+    """Returns the E opcodes matching an operand shape, a writeback offset, or both.
+
+    Args:
+        reads_b: Selects opcodes by whether they read the second source register, or None to ignore it.
+        w: Selects opcodes by writeback offset, or None to ignore it.
+
+    Returns:
+        The matching opcodes.
+    """
     return {
         opcode
         for group in OPERATIONS
@@ -233,6 +250,8 @@ class AsmBuilder:
     bundles: list[int]
 
     def __init__(self) -> None:
+        """Starts a builder holding no bundles.
+        """
         self.bundles = []
 
     def bundle(self, *words: int, **slots: int) -> None:
@@ -298,19 +317,44 @@ class AsmBuilder:
             self.bundle(int.from_bytes(data[offset : offset + BUNDLE_BYTES], "little"))
 
     def smov_arg(self, rd: int, arg: int) -> int:
-        """Returns an S-slot word moving the launch argument at index `arg` into a scalar register."""
+        """Returns an S-slot word binding a launch argument to a scalar register.
+
+        Args:
+            rd: Destination scalar register.
+            arg: Launch argument slot the address comes from.
+
+        Returns:
+            The S-slot word, shifted into its bundle field.
+        """
         return _compute_s(rd, arg, op=1)
 
     def smovi(self, rd: int, value: int) -> int:
-        """Returns an S-slot word moving an unsigned immediate into a scalar register."""
+        """Returns an S-slot word writing an immediate to a scalar register.
+
+        Args:
+            rd: Destination scalar register.
+            value: The immediate, read unsigned.
+
+        Returns:
+            The S-slot word, shifted into its bundle field.
+        """
         return _compute_s(rd, 0, op=0, imm=value)
 
     def saddi(self, rd: int, rs: int, value: int) -> int:
-        """Returns an S-slot word adding a signed immediate to a scalar register."""
+        """Returns an S-slot word adding an immediate to a scalar register.
+
+        Args:
+            rd: Destination scalar register.
+            rs: Source scalar register.
+            value: The addend, read signed so a rewind encodes.
+
+        Returns:
+            The S-slot word, shifted into its bundle field.
+        """
         return _compute_s(rd, rs, op=2, imm=value)
 
     def vld(self, vreg: int, row: int, *, agu: bool = False, shift: int = 0,
-            level: int = 0, stride: int = 1, mask: int = 0xF) -> int:
+            level: int = 0, mask: int = 0xF) -> int:
         """Returns an X-slot word loading NUM_SUBLANES VMEM rows into one VREG.
 
         Args:
@@ -320,15 +364,16 @@ class AsmBuilder:
             shift: Left shift applied to that induction variable.
             level: Which loop's induction variable the access reads, counting 0 as the outermost loop. A level
                 naming the wrong loop reads a plausible row and returns wrong numbers rather than faulting.
-            stride: Rows between consecutive sublanes. An even stride collides sublanes onto one bank and costs a
-                cycle per collision, which `schedule` prices.
             mask: Which of the NUM_SUBLANES sublanes take part.
+
+        Returns:
+            The X-slot word, shifted into its bundle field.
         """
         return _compute_x(False, vreg, row, agu=agu, shift=shift, level=level,
-                          stride=stride, mask=mask)
+                          mask=mask)
 
     def vst(self, vreg: int, row: int, *, agu: bool = False, shift: int = 0,
-            level: int = 0, stride: int = 1, mask: int = 0xF) -> int:
+            level: int = 0, mask: int = 0xF) -> int:
         """Returns an X-slot word storing one VREG across NUM_SUBLANES VMEM rows.
 
         Args:
@@ -337,11 +382,13 @@ class AsmBuilder:
             agu: Determines whether the loop induction variable is added to the row.
             shift: Left shift applied to that induction variable.
             level: Which loop's induction variable the access reads, under the `vld` convention.
-            stride: Rows between consecutive sublanes, priced as `vld` describes.
             mask: Which of the NUM_SUBLANES sublanes take part.
+
+        Returns:
+            The X-slot word, shifted into its bundle field.
         """
         return _compute_x(True, vreg, row, agu=agu, shift=shift, level=level,
-                          stride=stride, mask=mask)
+                          mask=mask)
 
     def vadd(self, vd: int, va: int, vb: int) -> int:
         """Returns an E-slot word writing the elementwise sum of two VREGs."""
@@ -364,18 +411,26 @@ class AsmBuilder:
         return _compute_e(12, vd, va, vb)
 
     def vtxin(self, va: int, quarter: int) -> int:
-        """Returns an E-slot word writing one VREG of rows into the transpose tile.
+        """Returns an E-slot word staging one VREG into a quarter of the transpose array.
 
-        Four of these fill a 16x16 tile, where quarter q takes tile rows 4q through 4q+3 from the source VREG's four
-        sublanes and writes no VREG. The unit holds the tile until `vtxout` drains it.
+        Args:
+            va: The VREG to stage.
+            quarter: Which quarter of the staging array it fills.
+
+        Returns:
+            The E-slot word, shifted into its bundle field.
         """
         return _compute_e(13, 0, va, quarter)
 
     def vtxout(self, vd: int, quarter: int) -> int:
-        """Returns an E-slot word reading one VREG of tile columns back out.
+        """Returns an E-slot word draining one quarter of the transpose array into a VREG.
 
-        Four of these drain the tile, where quarter q writes the destination with tile columns 4q through 4q+3, so
-        sublane s of lane l receives tile[l][4q + s].
+        Args:
+            vd: Destination VREG.
+            quarter: Which quarter of the staging array it drains.
+
+        Returns:
+            The E-slot word, shifted into its bundle field.
         """
         return _compute_e(14, vd, 0, quarter)
 
@@ -408,70 +463,119 @@ class AsmBuilder:
         return _compute_e(10, vd, va, 0)
 
     def vmatload(self, vreg: int) -> int:
-        """Returns an M-slot word parking a weight tile in the matrix array, read from the four VREGs starting at
-        `vreg`.
+        """Returns an M-slot word streaming four consecutive VREGs into the array's weight input.
+
+        Args:
+            vreg: First of the four VREGs the command reads.
+
+        Returns:
+            The M-slot word, shifted into its bundle field.
         """
         return _compute_m(1, vreg)
 
     def vmatpush(self, vreg: int) -> int:
-        """Returns an M-slot word streaming one VREG of activations into the matrix array, which reads it for the
-        push's whole occupancy.
+        """Returns an M-slot word streaming one VREG into the array's activation input.
+
+        Args:
+            vreg: The VREG the command reads.
+
+        Returns:
+            The M-slot word, shifted into its bundle field.
         """
         return _compute_m(2, vreg)
 
     def vmatpop(self, vreg: int) -> int:
-        """Returns an M-slot word draining one push's worth of results out of the matrix array across its masked
-        beats.
+        """Returns an M-slot word draining one result tile from the array into a VREG.
+
+        Args:
+            vreg: Destination VREG, written across the command's masked beats.
+
+        Returns:
+            The M-slot word, shifted into its bundle field.
         """
         return _compute_m(3, vreg)
 
     def lbegin(self, hi: int, *, lo: int = 0, step: int = 1) -> int:
-        """Returns an F-slot word opening a hardware loop over the half-open range [lo, hi) in steps of `step`, which
-        pushes a stack frame.
+        """Returns an F-slot word opening a hardware loop, which pushes a stack frame.
+
+        Args:
+            hi: Bound the loop stops at.
+            lo: Value the induction variable starts from.
+            step: Amount each iteration advances it by.
+
+        Returns:
+            The F-slot word, shifted into its bundle field.
         """
         return _compute_f(1, (int(lo) << 20) | (int(step) << 16) | int(hi))
 
     def loop_end(self) -> int:
-        """Returns an F-slot word closing the innermost hardware loop."""
+        """Returns an F-slot word closing the innermost hardware loop.
+
+        Returns:
+            The F-slot word, shifted into its bundle field.
+        """
         return _compute_f(2, 0)
 
-    def dma_load(self, slot: int, vmem_row: int, rows: int, base_sreg: int, stride_sreg: int) -> int:
+    def dma_load(self, slot: int, vmem_address: int, rows: int, base_sreg: int, stride_sreg: int) -> int:
         """Returns a complete DMA bundle reading host memory into VMEM.
 
-        The destination `vmem_row` carries the VMEM slot in its top bit, the host base and row stride are read
-        from the named scalar registers, and `flush_slot` later waits on `slot`.
-        """
-        return _dma(False, slot, vmem_row, rows, base_sreg, stride_sreg)
+        Args:
+            slot: Descriptor slot the transfer is issued on, which `flush_slot` later waits for.
+            vmem_address: Destination address, whose top bit selects the VMEM slot.
+            rows: Rows the descriptor moves.
+            base_sreg: Scalar register holding the host base address.
+            stride_sreg: Scalar register holding the host row stride.
 
-    def dma_store(self, slot: int, vmem_row: int, rows: int, base_sreg: int, stride_sreg: int) -> int:
+        Returns:
+            The complete DMA bundle word.
+        """
+        return _dma(False, slot, vmem_address, rows, base_sreg, stride_sreg)
+
+    def dma_store(self, slot: int, vmem_address: int, rows: int, base_sreg: int, stride_sreg: int) -> int:
         """Returns a complete DMA bundle writing VMEM back to host memory.
 
-        The source `vmem_row` carries the VMEM slot in its top bit, the host base and row stride are read from the
-        named scalar registers, and `flush_slot` later waits on `slot`.
+        Args:
+            slot: Descriptor slot the transfer is issued on, which `flush_slot` later waits for.
+            vmem_address: Source address, whose top bit selects the VMEM slot.
+            rows: Rows the descriptor moves.
+            base_sreg: Scalar register holding the host base address.
+            stride_sreg: Scalar register holding the host row stride.
+
+        Returns:
+            The complete DMA bundle word.
         """
-        return _dma(True, slot, vmem_row, rows, base_sreg, stride_sreg)
+        return _dma(True, slot, vmem_address, rows, base_sreg, stride_sreg)
 
     def vmemswap(self) -> int:
-        """Returns an F-slot word toggling which VMEM slot the X slot addresses.
+        """Returns an F-slot word exchanging the compute and DMA VMEM slots.
 
-        A DMA descriptor names its VMEM slot in an immediate rather than a register, so double buffering a kernel
-        works by swapping which slot compute owns rather than by rewriting the descriptor.
+        Returns:
+            The F-slot word, shifted into its bundle field.
         """
         return _compute_f(5, 0)
 
     def flush_slot(self, mask: int) -> int:
-        """Returns an F-slot word blocking until every DMA slot named in `mask` reports done.
+        """Returns an F-slot word blocking until every DMA slot the mask names reports done.
 
-        The mask is per DMA slot, so a mask naming a slot that never carried a descriptor waits forever and wedges
-        the device until the PL is reprogrammed.
+        Args:
+            mask: The descriptor slots to wait on, one bit each.
+
+        Returns:
+            The F-slot word, shifted into its bundle field.
         """
         return _flush(mask)
 
     def halt(self, word: int = HALT_BUNDLE) -> int:
-        """Returns the canonical halt bundle, which must be an image's final word.
+        """Returns the canonical F:halt bundle, which every image ends with.
+
+        Args:
+            word: The word to check, defaulting to the canonical one.
+
+        Returns:
+            The halt bundle.
 
         Raises:
-            ValueError: If `word` differs from the RTL's canonical halt encoding.
+            ValueError: If the word is not the canonical halt bundle.
         """
         if _bundle(word) != HALT_BUNDLE:
             message = (
@@ -527,30 +631,11 @@ class AsmKernel:
         return b"".join(word.to_bytes(BUNDLE_BYTES, "little") for word in self.assemble(pad_to=pad_to))
 
 
-def sublane_conflict_cycles(stride: int, mask: int) -> int:
-    """Returns the cycles the VMEM compute port is held by one X-slot access.
-
-    Notes:
-        vpu_bank_select.sv selects `bank[s] = (row + s*stride) mod NUM_SUBLANES`. Adding the row is a bijection on
-        Z/NUM_SUBLANES, so the base rotates which banks are touched while leaving their count alone, and the cost
-        follows from the stride and mask alone, both of which are immediates.
-
-    Args:
-        stride: Rows between consecutive sublanes.
-        mask: Which sublanes take part.
+def mxu_output_fifo() -> tuple[int, int, int]:
+    """Returns the matrix output FIFO's capacity and the entries each command moves.
 
     Returns:
-        The maximum number of enabled sublanes landing on one bank, which is 1 when conflict-free.
-    """
-    banks = [0] * NUM_SUBLANES
-    for sublane in range(NUM_SUBLANES):
-        if mask >> sublane & 1:
-            banks[(sublane * stride) % NUM_SUBLANES] += 1
-    return max(banks)
-
-
-def mxu_output_fifo() -> tuple[int, int, int]:
-    """Returns the MXU output FIFO's depth, its entries per vmatpush, and its entries per vmatpop.
+        The depth, the entries one vmatpush produces, and the entries one vmatpop consumes.
     """
     return _MXU_OUTPUT_FIFO_DEPTH, _MXU_ENTRIES_PER_PUSH, _MXU_ENTRIES_PER_POP
 
@@ -575,7 +660,7 @@ def place(words: list[int]) -> list[int]:
 
     The hand-placed padding inside each region is dropped and `schedule` re-derives the exact delay. Each region is
     then emitted in the order it was written, so the S and M slot placement the machine leaves to the compiler
-    survives by construction, at the cost of the co-issue `pack` reaches. `tools/check_pack.py` measures that cost.
+    survives by construction, at the cost of the co-issue `pack` reaches.
 
     Args:
         words: The emitted bundle stream, before scheduling.
@@ -783,7 +868,14 @@ def _bundle(value: int) -> int:
 
 
 def _is_halt(word: int) -> bool:
-    """Determines whether one bundle word carries the canonical F:halt encoding."""
+    """Determines whether one bundle is the canonical halt.
+
+    Args:
+        word: The bundle word to inspect.
+
+    Returns:
+        True when the word is the halt bundle.
+    """
     return word == HALT_BUNDLE
 
 
@@ -811,7 +903,8 @@ def _check_dma_exclusive(slots: dict[str, int]) -> None:
 def _compute_s(rd: int, rs: int, *, op: int, imm: int = 0) -> int:
     """Returns the S-slot word for one scalar operation, shifted into its field.
 
-    scalar_agu.sv sign-extends the immediate field for SADDI and zero-extends it for SMOVI, so the accepted range
+    sequencer_scalar_agu.sv sign-extends the immediate field for SADDI and zero-extends it for SMOVI, so the
+    accepted range
     spans both. Masking the immediate is what lets SADDI encode a negative addend. Without it, a negative immediate
     corrupts the word and an immediate above 0xFFFF overflows into the rs field, silently in both cases.
 
@@ -839,86 +932,98 @@ def _compute_s(rd: int, rs: int, *, op: int, imm: int = 0) -> int:
 
 
 def _compute_e(op: int, rd: int, ra: int, rb: int) -> int:
-    """Returns the E-slot word for one vector operation, where the unary opcodes hold `rb` at zero."""
+    """Returns the E-slot word for one vector operation, shifted into its field.
+
+    Args:
+        op: The E opcode.
+        rd: Destination VREG.
+        ra: First source VREG.
+        rb: Second source VREG, ignored by the unary opcodes.
+
+    Returns:
+        The E-slot word, shifted into its bundle field.
+    """
     e = (int(op) << 15) | (int(rd) << 10) | (int(ra) << 5) | int(rb)
     return e << _E_SHIFT
 
 
 def _compute_m(op: int, reg: int) -> int:
-    """Returns the M-slot word for one matrix operation, keyed 1 for vmatload, 2 for vmatpush and 3 for vmatpop."""
+    """Returns the M-slot word for one matrix command, shifted into its field.
+
+    Args:
+        op: The M subop.
+        reg: The VREG the command reads or writes.
+
+    Returns:
+        The M-slot word, shifted into its bundle field.
+    """
     return ((int(op) << 5) | int(reg)) << _M_SHIFT
 
 
 def _compute_x(store: bool, vreg: int, row: int, *, agu: bool, shift: int,
-               level: int = 0, stride: int = 1, mask: int = 0xF) -> int:
+               level: int = 0, mask: int = 0xF) -> int:
     """Returns the X-slot word for one VMEM access, shifted into its field.
-
-    Notes:
-        The 40-bit x_slot_t at NUM_SUBLANES=4, ROW_ADDR_W=13 and SUBLANE_STRIDE_W=7 is laid out as valid[39],
-        op[38], vreg_idx[37:33], literal[32:20], agu_valid[19], agu_level[18:17], agu_shift[16:14], sreg_valid[13],
-        sreg_idx[12:11], sublane_stride[10:4] and sublane_mask[3:0]. The literal occupies 13 bits growing upward
-        from bit 20, so widening it moves valid, op and vreg_idx alone.
 
     Args:
         store: Determines whether the access writes VMEM rather than reading it.
         vreg: The VREG the access writes or reads.
-        row: First VMEM row, before the AGU and SREG terms are added.
+        row: First VMEM row, before the AGU and SREG terms are added. The NUM_SUBLANES sublanes read from there
+            onward, one row each.
         agu: Determines whether the loop induction variable is added to the row.
         shift: Left shift applied to that induction variable.
-        level: Which loop's induction variable the access reads, counting 0 as the outermost loop.
-        stride: Rows between consecutive sublanes.
+        level: Which loop's induction variable the access reads, counting 0 as the outermost loop. A kernel naming
+            the wrong loop reads a plausible row and returns wrong numbers rather than faulting.
         mask: Which sublanes take part.
 
     Returns:
         The X-slot word, shifted into its bundle field.
 
     Raises:
-        ValueError: If the stride overflows its field, the mask names no sublane, or the level overflows the
-            loop stack.
+        ValueError: If the mask names no sublane, or the level overflows the loop stack.
     """
-    if not 0 <= stride < (1 << SUBLANE_STRIDE_W):
-        message = (
-            f"Unable to encode the given sublane stride. The field is {SUBLANE_STRIDE_W} bits, so the stride must "
-            f"be under {1 << SUBLANE_STRIDE_W}, but got {stride}."
-        )
-        raise ValueError(message)
     if not 0 < mask < (1 << NUM_SUBLANES):
         message = (
             f"Unable to encode the given sublane mask. The mask must name at least one of the {NUM_SUBLANES} "
             f"sublanes, but got 0x{mask:x}."
         )
         raise ValueError(message)
-    x = (1 << 39) | (int(store) << 38) | (int(vreg) << 33) | (int(row) << 20)
+    x = (1 << 32) | (int(store) << 31) | (int(vreg) << 26) | (int(row) << 13)
     if not 0 <= level < (1 << LEVEL_SEL_W):
         message = (
             f"Unable to encode the given AGU level. The field is {LEVEL_SEL_W} bits, so the loop stack is "
             f"{1 << LEVEL_SEL_W} deep with level 0 the outermost loop, but got {level}."
         )
         raise ValueError(message)
-    x |= int(agu) << 19 | int(level) << 17 | int(shift) << 14 | (int(stride) << 4) | int(mask)
+    x |= int(agu) << 12 | int(level) << 10 | int(shift) << 7 | int(mask)
     return x << _X_SHIFT
 
 
 def _compute_f(op: int, payload: int) -> int:
-    """Returns the F-slot word for one control operation, keyed 1 for loop begin, 2 for loop end and 5 for
-    vmemswap.
+    """Returns the F-slot word for one control operation, shifted into its field.
+
+    Args:
+        op: The F opcode, being 1 for loop begin, 2 for loop end and 5 for vmemswap.
+        payload: The operation's immediate.
+
+    Returns:
+        The F-slot word, shifted into its bundle field.
     """
-    return (int(op) << (_F_SHIFT + F_SLOT_W - 3)) | (int(payload) << _F_SHIFT)
+    return (int(op) << _F_OP_SHIFT) | (int(payload) << _F_SHIFT)
 
 
-def _dma(store: bool, slot: int, vmem_row: int, rows: int, base_sreg: int, stride_sreg: int) -> int:
+def _dma(store: bool, slot: int, vmem_address: int, rows: int, base_sreg: int, stride_sreg: int) -> int:
     """Returns a complete DMA bundle carrying one descriptor.
 
     Notes:
-        The 36-bit d_wire_t at ROW_ADDR_W=13, where vmem_row is the 14-bit concatenation of the slot bit and the
-        row, is laid out as is_store[35], slot_sel[34], vmem_row[33:20], src_mode[19], pool_idx[18:11], rows[10:4],
-        base_sreg[3:2] and stride_sreg[1:0]. src_mode is held at D_SRC_SREG, so the base and stride are read from
-        scalar registers.
+        The 36-bit d_wire_t at ADDRESS_W=13, where vmem_address is the 14-bit concatenation of the slot bit and
+        the row, is laid out as is_store[35], slot_sel[34], vmem_address[33:20], src_mode[19], pool_idx[18:11],
+        rows[10:4], base_sreg[3:2] and stride_sreg[1:0]. src_mode is held at D_SRC_SREG, so the base and stride are 
+        read from scalar registers.
 
     Args:
         store: Determines whether the descriptor writes host memory rather than reading it.
         slot: Which DMA slot carries the descriptor.
-        vmem_row: The VMEM row, whose top bit selects the VMEM slot.
+        vmem_address: The VMEM address, whose top bit selects the VMEM slot.
         rows: Number of rows the descriptor transfers.
         base_sreg: Scalar register holding the host base address.
         stride_sreg: Scalar register holding the host row stride.
@@ -926,14 +1031,21 @@ def _dma(store: bool, slot: int, vmem_row: int, rows: int, base_sreg: int, strid
     Returns:
         The complete DMA bundle word.
     """
-    d = (int(store) << 35) | (int(slot) << 34) | (int(vmem_row) << 20)
+    d = (int(store) << 35) | (int(slot) << 34) | (int(vmem_address) << 20)
     d |= (1 << 19) | ((int(rows) - 1) << 4) | (int(base_sreg) << 2) | int(stride_sreg)
-    return (1 << 127) | (d << 91)
+    return (1 << (BUNDLE_BITS - 1)) | (d << _D_SHIFT)
 
 
 def _flush(mask: int) -> int:
-    """Returns the F-slot word blocking until every DMA slot named in `mask` reports done."""
-    return (3 << (_F_SHIFT + F_SLOT_W - 3)) | (int(mask) << _F_SHIFT)
+    """Returns the F-slot word blocking until every DMA slot the mask names reports done.
+
+    Args:
+        mask: The descriptor slots to wait on, one bit each.
+
+    Returns:
+        The F-slot word, shifted into its bundle field.
+    """
+    return (_F_FLUSH << _F_OP_SHIFT) | (int(mask) << _F_SHIFT)
 
 
 def _decode(word: int) -> dict:
@@ -989,17 +1101,14 @@ def _decode(word: int) -> dict:
             # it costs a scheduling gap alone, which is the safe direction here.
             d["writes"].append((rd, W_TRANSPOSE))
     if x:
-        store, vreg = (x >> 38) & 1, (x >> 33) & 0x1F
-        # Carries one bit per sublane, so sublane_mask is NUM_SUBLANES bits wide.
-        d["vmem_cycles"] = sublane_conflict_cycles((x >> 4) & ((1 << SUBLANE_STRIDE_W) - 1),
-                                                   x & ((1 << NUM_SUBLANES) - 1))
+        store, vreg = (x >> 31) & 1, (x >> 26) & 0x1F
+        # The sublanes read consecutive rows, so their banks are a permutation and no access splits.
+        d["vmem_cycles"] = 1
         if store:
             d["reads"].add(vreg)
             d["port_a"] = True
         else:
-            # Merges a split load one pass per cycle, so its writeback lands (degree - 1) cycles later than a
-            # conflict-free one. Measured against the RTL, a 4-way conflicting vld's consumer is legal at 10.
-            d["writes"].append((vreg, W_VLD + d["vmem_cycles"] - 1))
+            d["writes"].append((vreg, W_VLD))
     if d["m_op"] == 1:
         # Reads NUM_LANES/NUM_SUBLANES consecutive registers.
         d["reads"].update((d["m_reg"] + r) & 0x1F for r in range(4))
@@ -1014,11 +1123,18 @@ def _decode(word: int) -> dict:
 
 
 def _port_a_readers(word: int) -> list[str]:
-    """Names every VREG read-port-A consumer one bundle issues, empty for a DMA bundle.
+    """Returns every VREG read-port-A consumer one bundle issues, empty for a DMA bundle.
 
-    vpu.sv's `effective_raddr_a` is a single physical port behind a static-priority mux the matrix controller wins,
-    so two consumers in one bundle issue together and the loser silently reads the winner's address. A vmatpop and
-    a vld stay out of this, reading the array's own output and VMEM.
+    Notes:
+        vpu.sv's `effective_raddr_a` is one physical port behind a static-priority mux the matrix controller wins, so
+        two consumers issued together leave the loser silently reading the winner's address. A vmatpop and a vld stay
+        out of it, reading the array's own output and VMEM.
+
+    Args:
+        word: The bundle word to inspect.
+
+    Returns:
+        The consumers, named by slot.
     """
     if (word >> 127) & 1:
         return []
@@ -1026,7 +1142,7 @@ def _port_a_readers(word: int) -> list[str]:
     if (word >> _E_SHIFT) & ((1 << E_SLOT_W) - 1):
         readers.append("E")
     x = (word >> _X_SHIFT) & ((1 << X_SLOT_W) - 1)
-    if x and (x >> 38) & 1:
+    if x and (x >> 31) & 1:
         readers.append("X:vst")
     m = (word >> _M_SHIFT) & ((1 << M_SLOT_W) - 1)
     m_op = (m >> 5) & 0x3 if m else 0
@@ -1038,7 +1154,14 @@ def _port_a_readers(word: int) -> list[str]:
 
 
 def _slot_mask(word: int) -> int:
-    """Returns one bit per occupied E, M, X, S and F slot, from bit 0, so two bundles are testable as disjoint."""
+    """Returns one bit per occupied slot, so two bundles are testable as disjoint.
+
+    Args:
+        word: The bundle word to inspect.
+
+    Returns:
+        A mask carrying the E, M, X, S and F slots from bit 0 upward.
+    """
     mask = 0
     for bit, (shift, width) in enumerate(((_E_SHIFT, E_SLOT_W), (_M_SHIFT, M_SLOT_W),
                                           (_X_SHIFT, X_SLOT_W), (_S_SHIFT, S_SLOT_W),
@@ -1051,11 +1174,18 @@ def _slot_mask(word: int) -> int:
 def _is_barrier(word: int) -> bool:
     """Determines whether a bundle must keep its emitted position exactly.
 
-    A DMA bundle is a barrier, because a descriptor's completion is observed through `flush_slot` and VMEM aliasing
-    against a `vld` is beyond what this pass proves. So is any F slot, which preserves control flow bit for bit. M
-    and S slots are barriers because their consumers sit outside the region: a descriptor reads the SREG an S op
-    writes across the barrier that ends it, and `_pack_region` prices the uninterlocked scalar writeback only
-    against the ops it holds.
+    Notes:
+        A DMA bundle is a barrier, because a descriptor's completion is observed through `flush_slot` and VMEM
+        aliasing against a vld is beyond what this pass proves. So is any F slot, which preserves control flow bit for
+        bit. M and S slots are barriers because their consumers sit outside the region: a descriptor reads the SREG an
+        S op writes across the barrier that ends it, and `_pack_region` prices the uninterlocked scalar writeback only
+        against the ops it holds.
+
+    Args:
+        word: The bundle word to inspect.
+
+    Returns:
+        True when the bundle is immovable.
     """
     if (word >> 127) & 1:
         return True
@@ -1067,34 +1197,71 @@ def _is_barrier(word: int) -> bool:
 
 
 def _wb_span_of(decoded: dict, w: int) -> range:
-    """Returns the offsets, relative to issue, one writeback holds the port for, widened over a vmatpop's beats."""
+    """Returns the offsets, relative to issue, one writeback holds the port for.
+
+    Args:
+        decoded: The bundle's decoded fields.
+        w: The writeback offset the span is taken around.
+
+    Returns:
+        The offsets, widened over a vmatpop's masked beats.
+    """
     if decoded["m_op"] == 3 and w == W_MPOP_LAST:
         return range(W_MPOP_FIRST, W_MPOP_LAST + 1)
     return range(w, w + 1)
 
 
 def _wb_span(decoded: dict) -> list[int]:
-    """Returns every offset, relative to issue, one bundle holds a writeback port for."""
+    """Returns every offset, relative to issue, one bundle holds a writeback port for.
+
+    Args:
+        decoded: The bundle's decoded fields.
+
+    Returns:
+        The offsets, one entry per beat a writeback occupies.
+    """
     return [s for _, w in decoded["writes"] for s in _wb_span_of(decoded, w)]
 
 
 def _delay_of(word: int) -> int:
-    """Reads the cycles a bundle holds the fetch head for, honouring the two bundle formats."""
+    """Returns the cycles one bundle's delay field holds the fetch head for.
+
+    Args:
+        word: The bundle word to read.
+
+    Returns:
+        The delay, in cycles.
+    """
     shift = _DMA_DELAY_SHIFT if (word >> 127) & 1 else _DELAY_SHIFT
     return (word >> shift) & ((1 << DELAY_W) - 1)
 
 
 def _set_delay(word: int, cycles: int) -> int:
-    """Replaces a bundle's delay field, honouring the two bundle formats."""
+    """Returns one bundle carrying the given delay, whichever format it is.
+
+    Args:
+        word: The bundle word to rewrite.
+        cycles: The delay to place, which must fit the field.
+
+    Returns:
+        The bundle with its delay field replaced.
+    """
     shift = _DMA_DELAY_SHIFT if (word >> 127) & 1 else _DELAY_SHIFT
     return (word & ~(((1 << DELAY_W) - 1) << shift)) | (cycles << shift)
 
 
 def _check_matrix_fifo(words: list[int]) -> None:
-    """Rejects a schedule able to overflow the MXU's per-lane output FIFO.
+    """Raises when a burst of pushes would overflow the matrix output FIFO.
+
+    Notes:
+        Overflow drops results silently, because vpu_fifo.sv carries no replay path, so the burst is refused here
+        rather than measured on a board.
+
+    Args:
+        words: The bundle stream to check, in program order.
 
     Raises:
-        ValueError: If a vmatpush leaves more results outstanding than one lane's FIFO holds.
+        ValueError: If the outstanding pushes exceed what the FIFO holds.
     """
     outstanding = 0
     peak_index = None
@@ -1122,15 +1289,17 @@ def _check_matrix_fifo(words: list[int]) -> None:
 
 
 def _check_flush_slots(words: list[int]) -> None:
-    """Rejects a stream flushing a DMA slot no descriptor in it ever targets.
+    """Raises when a flush waits on a descriptor slot the kernel never issued on.
 
-    `flush_slot` blocks until `dma_slot_done` covers every bit of its mask and only a descriptor
-    re-asserts that bit, so waiting on an unused slot never returns and the device stays wedged with no
-    timeout and no error. Slots are counted over the whole stream rather than per flush, because a loop
-    body's flush legitimately collects a descriptor issued in the previous iteration.
+    Notes:
+        flush_slot blocks until dma_slot_done covers every bit of its mask and only a descriptor asserts that bit, so
+        flushing an unused slot wedges the device until the PL is reprogrammed.
+
+    Args:
+        words: The bundle stream to check, in program order.
 
     Raises:
-        ValueError: If a flush names a DMA slot the stream issues no descriptor on.
+        ValueError: If a flush names a slot no descriptor has issued on.
     """
     issued = {d["dma_slot"] for d in map(_decode, words) if d["dma"]}
     for index, word in enumerate(words):
@@ -1148,10 +1317,13 @@ def _check_flush_slots(words: list[int]) -> None:
 
 
 def _check_port_a_exclusive(words: list[int]) -> None:
-    """Rejects a bundle naming more than one VREG read-port-A consumer.
+    """Raises when one bundle co-issues two VREG read-port-A consumers.
+
+    Args:
+        words: The bundle stream to check, in program order.
 
     Raises:
-        ValueError: If one bundle co-issues two consumers of VREG read port A.
+        ValueError: If a bundle carries more than one port-A consumer.
     """
     for index, word in enumerate(words):
         readers = _port_a_readers(word)
@@ -1216,8 +1388,8 @@ def _pack_region(ops: list[int]) -> list[int]:
                 # Owns port A for the whole of the vmatload's occupancy.
                 gap = max(gap, occupancy)
             if that["vmem_cycles"] and this["vmem_cycles"]:
-                if (((word >> _X_SHIFT) >> 38) & 1
-                        or ((ops[earlier] >> _X_SHIFT) >> 38) & 1):
+                if (((word >> _X_SHIFT) >> 31) & 1
+                        or ((ops[earlier] >> _X_SHIFT) >> 31) & 1):
                     gap = max(gap, 1)
             if gap:
                 ready = max(ready, at + gap)
@@ -1280,7 +1452,10 @@ def _reframe(words: list[int], region_placer: Callable[[list[int]], list[int]]) 
 
 
 def _schedule_cache_dir() -> Path | None:
-    """Returns the directory where schedules are remembered between processes, or None when the memo is off.
+    """Returns the directory the schedule memo lives in, or None when none is usable.
+
+    Returns:
+        The directory, created if absent, or None when it cannot be made.
     """
     setting = os.environ.get("MINITPU_SCHEDULE_CACHE")
     if setting == "off":
@@ -1292,16 +1467,24 @@ def _schedule_cache_dir() -> Path | None:
 
 @functools.lru_cache(maxsize=1)
 def _scheduler_digest() -> bytes:
-    """Digests this module's own source, so a scheduler change invalidates the memo.
+    """Returns a digest of this scheduler's own source, so a changed pass invalidates every entry.
 
-    Without it, editing `schedule` would leave every remembered image stale, which this machine hides: it carries
-    no interlock and no bounds check, and returns plausible numbers.
+    Returns:
+        The digest bytes.
     """
     return hashlib.sha256(Path(__file__).read_bytes()).digest()
 
 
 def _schedule_digest(bundles: tuple[int, ...], placement: str) -> str:
-    """Names the remembered schedule for one bundle stream under one re-placement pass."""
+    """Returns the memo key one unscheduled stream and placement pass hash to.
+
+    Args:
+        bundles: The unscheduled bundle words.
+        placement: The re-placement pass the stream is scheduled under.
+
+    Returns:
+        The digest naming this stream's cache entry.
+    """
     accumulator = hashlib.sha256()
     accumulator.update(_scheduler_digest())
     accumulator.update(placement.encode())
@@ -1312,7 +1495,13 @@ def _schedule_digest(bundles: tuple[int, ...], placement: str) -> str:
 
 
 def _remembered_schedule(digest: str) -> tuple[int, ...] | None:
-    """Reads back a remembered schedule, or None when the memo is off, absent or unsound.
+    """Returns the scheduled words a previous run cached, or None when nothing was cached.
+
+    Args:
+        digest: The memo key to look up.
+
+    Returns:
+        The cached words, or None on a miss or an unreadable entry.
     """
     directory = _schedule_cache_dir()
     if directory is None:
@@ -1332,7 +1521,12 @@ def _remembered_schedule(digest: str) -> tuple[int, ...] | None:
 
 
 def _remember_schedule(digest: str, words: tuple[int, ...]) -> None:
-    """Writes a schedule down for the next process, atomically or not at all."""
+    """Writes one scheduled stream to the cross-process memo, leaving a failed write silent.
+
+    Args:
+        digest: The memo key to store under.
+        words: The scheduled bundle words.
+    """
     directory = _schedule_cache_dir()
     if directory is None:
         return
@@ -1356,7 +1550,11 @@ _PLACEMENTS: dict[str, Callable[[list[int]], list[int]] | None] = {
 
 
 def _placement() -> str:
-    """Reads the re-placement pass `MINITPU_PACK` selects, where "1" is an accepted spelling of "pack"."""
+    """Returns the re-placement pass `MINITPU_PACK` selects, where "1" is an accepted spelling of "pack".
+
+    Returns:
+        The pass name, empty when the builder's own placement is kept.
+    """
     selected = os.environ.get("MINITPU_PACK", "")
     return "pack" if selected == "1" else selected
 
@@ -1403,6 +1601,5 @@ def _scheduled(name: str, bundles: tuple[int, ...], placement: str) -> tuple[int
     return words
 
 
-__all__ = ["AsmBuilder", "AsmKernel", "BUNDLE_BITS", "BUNDLE_BYTES", "LEVEL_SEL_W", "SUBLANE_STRIDE_W",
-           "analyze_stalls", "asm", "mxu_output_fifo", "pack", "place", "schedule",
-           "sublane_conflict_cycles"]
+__all__ = ["AGU_SHIFT_W", "AsmBuilder", "AsmKernel", "BUNDLE_BITS", "BUNDLE_BYTES", "LEVEL_SEL_W",
+           "analyze_stalls", "asm", "mxu_output_fifo", "pack", "place", "schedule"]

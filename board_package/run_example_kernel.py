@@ -136,13 +136,13 @@ def bf16_mul_add() -> None:
 
         bundles[program_counter] = {
             "d": minitpu.dma_load(
-                slot=0, vmem_row=_ROW_LEFT, rows=_TILE_ROWS, base_sreg=_SREG_LEFT, stride_sreg=_SREG_ROW_STRIDE
+                slot=0, vmem_address=_ROW_LEFT, rows=_TILE_ROWS, base_sreg=_SREG_LEFT, stride_sreg=_SREG_ROW_STRIDE
             )
         }
         program_counter += 1
         bundles[program_counter] = {
             "d": minitpu.dma_load(
-                slot=1, vmem_row=_ROW_RIGHT, rows=_TILE_ROWS, base_sreg=_SREG_RIGHT, stride_sreg=_SREG_ROW_STRIDE
+                slot=1, vmem_address=_ROW_RIGHT, rows=_TILE_ROWS, base_sreg=_SREG_RIGHT, stride_sreg=_SREG_ROW_STRIDE
             )
         }
         program_counter += 1
@@ -167,7 +167,7 @@ def bf16_mul_add() -> None:
 
         bundles[program_counter] = {
             "d": minitpu.dma_store(
-                slot=0, vmem_row=_ROW_OUTPUT, rows=_TILE_ROWS, base_sreg=_SREG_OUTPUT, stride_sreg=_SREG_ROW_STRIDE
+                slot=0, vmem_address=_ROW_OUTPUT, rows=_TILE_ROWS, base_sreg=_SREG_OUTPUT, stride_sreg=_SREG_ROW_STRIDE
             )
         }
         program_counter += 1

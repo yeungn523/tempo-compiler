@@ -1125,8 +1125,7 @@ def _require_norm_fits(*, name: str, width_rows: int, const_rows: int, out_row: 
         raise ValueError(message)
 
 
-def build_layernorm_rows(rows: int, *, width: int = _MODEL_WIDTH,
-                         packed: bool = False) -> MinitpuKernel:
+def build_layernorm_rows(rows: int, *, packed: bool = False) -> MinitpuKernel:
     """Assembles LayerNorm over several hidden rows, one per loop iteration.
 
     Notes:
@@ -1140,8 +1139,6 @@ def build_layernorm_rows(rows: int, *, width: int = _MODEL_WIDTH,
 
     Args:
         rows: Hidden rows to normalise in one launch.
-        width: Features in one hidden row, which sets the VMEM rows a row occupies, the VREGs its
-            reductions cover and where the constants block starts.
         packed: Read and write in the layout a GEMM operand uses -- `[tiles, tokens,
             TILE]` -- instead of plain row-major. This is a DMEM LAYOUT choice, and
             it costs nothing but two scalar values: a descriptor computes
@@ -1159,7 +1156,7 @@ def build_layernorm_rows(rows: int, *, width: int = _MODEL_WIDTH,
     Returns:
         The program, taking the input, the constants and the output pointers as its arguments.
     """
-    width_rows, width_vregs = _norm_geometry(width)
+    width_rows, width_vregs = _norm_geometry(_MODEL_WIDTH)
     gamma_row = width_rows                     # the row block ends where x ends
     beta_row = gamma_row + width_rows
     zero_row = beta_row + width_rows

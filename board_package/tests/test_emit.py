@@ -46,6 +46,28 @@ class EmitterConformanceTest(unittest.TestCase):
         self.assertEqual(tuple(asm.schedule(list(self.derived))), self.hand)
 
 
+class EmitterSerialisationTest(unittest.TestCase):
+    """Covers the emitted stream as the image bytes a compiler backend writes out."""
+
+    def test_the_emitted_stream_serialises_to_the_hand_written_image(self) -> None:
+        """Asserts the emitted stream, wrapped in a kernel, writes the bytes the hand-written builder does."""
+        for fuse_groups in (False, True):
+            for column_tiles in (1, 3, 6):
+                for groups in (1, 3):
+                    for loop_blocks in (2, 4):
+                        with self.subTest(fuse_groups=fuse_groups, column_tiles=column_tiles, groups=groups,
+                                          loop_blocks=loop_blocks):
+                            hand = kernels.build_looped_gemm(
+                                column_tiles, groups, activate=False, fuse_groups=fuse_groups,
+                                loop_blocks=loop_blocks).image.to_bytes(pad_to=4)
+                            derived = asm.AsmKernel(
+                                name="looped_gemm",
+                                bundles=emit.looped_gemm_stream(
+                                    column_tiles=column_tiles, groups=groups, loop_blocks=loop_blocks,
+                                    fuse_groups=fuse_groups)).to_bytes(pad_to=4)
+                            self.assertEqual(derived, hand)
+
+
 class EmitterStagingTest(unittest.TestCase):
     """Covers the staging analysis the emitter places its loads from."""
 

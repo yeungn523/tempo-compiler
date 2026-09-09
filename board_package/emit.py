@@ -282,7 +282,8 @@ def step_stream(*, activation_row: int, weight_row: int, close_loop: bool) -> tu
     return _flatten(emit_gemm_step(activation_row=activation_row, weight_row=weight_row, close_loop=close_loop))
 
 
-def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int) -> dict[int, dict[str, int]]:
+def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int,
+                     fuse_groups: bool = False) -> dict[int, dict[str, int]]:
     """Returns the tiled GEMM's bundles, keyed by their offset from the image's first bundle.
 
     Notes:
@@ -293,6 +294,9 @@ def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int) -> dic
         column_tiles: Output column tiles the product covers, being the outer loop's trip count.
         groups: Reduction groups each column tile accumulates, being the middle loop's trip count.
         loop_blocks: Accumulation blocks one group carries, which the two way unroll halves into a trip count.
+        fuse_groups: Determines whether the accumulators stay resident across every group and drain once per
+            column tile, summing the contraction on the device in BF16, rather than draining a partial per
+            group for the host to sum in float32.
 
     Returns:
         The image's bundles, keyed by offset, each holding the slot words that bundle issues.
@@ -327,6 +331,11 @@ def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int) -> dic
     at += 1
     at = _emit_rewind(put=put, builder=builder, at=at, loop=nest[0], operands=staged)
 
+    # Clears the accumulators once per column tile, so they carry every group and the contraction sums in BF16 on
+    # the device.
+    if fuse_groups:
+        at = _emit_clear(put=put, builder=builder, at=at)
+
     put(offset=at, f=builder.lbegin(nest[1].trips))
     at += 1
     # Steps back over the block the column loop's head advanced past, so each group re-reads its first block.
@@ -340,7 +349,8 @@ def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int) -> dic
         if step + 1 < _STEPS:
             put(offset=at, f=builder.flush_slot(mask=3))
             at += 1
-    at = _emit_clear(put=put, builder=builder, at=at)
+    if not fuse_groups:
+        at = _emit_clear(put=put, builder=builder, at=at)
 
     put(offset=at, f=builder.lbegin(nest[2].trips))
     at += 1
@@ -352,27 +362,33 @@ def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int) -> dic
     # Returns both descriptor slots, which the group's trailing prefetch still owns, for the drain to use.
     put(offset=at, f=builder.flush_slot(mask=3))
     at += 1
-    at = _emit_drain(put=put, builder=builder, at=at)
+    if not fuse_groups:
+        at = _emit_drain(put=put, builder=builder, at=at)
     put(offset=at, f=builder.loop_end())
     at += 1
+    if fuse_groups:
+        at = _emit_drain(put=put, builder=builder, at=at)
     put(offset=at, f=builder.loop_end())
     at += 1
     put(offset=at, f=builder.halt())
     return bundles
 
 
-def looped_gemm_stream(*, column_tiles: int, groups: int, loop_blocks: int) -> tuple[int, ...]:
+def looped_gemm_stream(*, column_tiles: int, groups: int, loop_blocks: int,
+                       fuse_groups: bool = False) -> tuple[int, ...]:
     """Returns the tiled GEMM as the contiguous bundle words it places, zero filling the offsets it leaves.
 
     Args:
         column_tiles: Output column tiles the product covers.
         groups: Reduction groups each column tile accumulates.
         loop_blocks: Accumulation blocks one group carries.
+        fuse_groups: Determines whether the accumulators drain once per column tile rather than once per group.
 
     Returns:
         The bundle words, in placement order.
     """
-    return _flatten(emit_looped_gemm(column_tiles=column_tiles, groups=groups, loop_blocks=loop_blocks))
+    return _flatten(emit_looped_gemm(column_tiles=column_tiles, groups=groups, loop_blocks=loop_blocks,
+                                     fuse_groups=fuse_groups))
 
 
 def _innermost_staging(*, nest: tuple[LoopLevel, ...],

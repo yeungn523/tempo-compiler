@@ -873,15 +873,14 @@ def build_softmax_rows(rows: int, *, chunks: int = 1) -> MinitpuKernel:
         bundles[pc] = {"f": minitpu.flush_slot(1)}; pc += 1
 
         bundles[pc] = {"f": minitpu.lbegin(rows)}; pc += 1
-        # Shifts the AGU by 2, which advances the row pointer by _TILE_VREGS VMEM rows per iteration, and level names
-        # THIS loop. The chunk loop is emitted unconditionally, so this is ALWAYS the inner one, level 1 even at chunks
-        # = 1. Making it conditional on chunks > 1 looks right and is not, because a one-iteration outer loop still
-        # occupies level 0.
+        # Shifts the AGU by 2, which advances the row pointer by _TILE_VREGS VMEM rows per iteration. The level names
+        # this loop, and it is level 1 at every chunk count, because the chunk loop is emitted unconditionally and
+        # occupies level 0 even when it runs one iteration.
         level = 1
         bundles[pc] = {"x": minitpu.vld(0, _ROW_SCORES, agu=True, shift=2,
                                         level=level)}; pc += 1
         bundles[pc] = {"e": minitpu.vredmax(1, 0)}; pc += 1
-        bundles[pc] = {"e": minitpu.vsub(2, 0, 1)}; pc += 1        # <= 0, which is exp's domain
+        bundles[pc] = {"e": minitpu.vsub(2, 0, 1)}; pc += 1
         bundles[pc] = {"e": minitpu.vexp(3, 2)}; pc += 1
         bundles[pc] = {"e": minitpu.vredsum(4, 3)}; pc += 1
         bundles[pc] = {"e": minitpu.vrecip(5, 4)}; pc += 1
@@ -1125,13 +1124,8 @@ def build_layernorm_rows(rows: int, *, packed: bool = False) -> MinitpuKernel:
     """Assembles LayerNorm over several hidden rows, one per loop iteration.
 
     Notes:
-        gamma, beta and the three broadcast scalars are staged once and stay resident; only the row
-        itself is streamed, one DMA in and one out per iteration, with the pointers walked by scalar
-        adds the way the GEMM walks its operands. A hidden row is 48 VMEM rows, which is not a power
-        of two, so the AGU's `iv << shift` cannot step it -- the scalar add can.
-
         The body runs to a few hundred bundles, well past `LB_CAP`, so it refetches from IRAM each
-        iteration rather than replaying from the loop buffer. That costs throughput, not correctness.
+        iteration rather than replaying from the loop buffer.
 
     Args:
         rows: Hidden rows to normalise in one launch.

@@ -33,7 +33,9 @@ from bf16 import (  # noqa: E402
     pack_weights,
 )
 from compiler import plan, read_program, signature_of, stage  # noqa: E402
-from kernels import build_looped_gemm  # noqa: E402
+from compiler.compile import Launch  # noqa: E402
+from asm import AsmKernel  # noqa: E402
+from emit import looped_gemm_stream  # noqa: E402
 
 
 @triton.jit
@@ -61,6 +63,10 @@ def matmul_kernel(
         tl.program_id would leave that axis to the launch instead, because a grid dimension is an argument rather
         than module content. The step of each loop is what names the axis it walks, so the token loop must step by
         BLOCK_M and the feature loop by BLOCK_N for the reader to tell them apart.
+
+        The vector register file holds 32 registers, of which one block's accumulator, activation and weight tiles
+        claim 24 at BLOCK_M 32 and BLOCK_N 16. A 16 by 16 block claims 16 and a 16 by 32 block claims 28, while a 32
+        by 32 block claims 40, so the shape above is among the largest the file holds.
     """
     offs_k = tl.arange(0, BLOCK_K)
     for block in range(0, M, BLOCK_M):
@@ -76,6 +82,30 @@ def matmul_kernel(
                 weight_pointers += BLOCK_K * stride_bk
             output_pointers = output_pointer + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
             tl.store(output_pointers, accumulator)
+
+
+def generated_gemm_image(launch: Launch) -> bytes:
+    """Returns the GEMM image the emitter generates for one launch, as against the hand-written builder's.
+
+    Args:
+        launch: The launch the planner produced.
+
+    Returns:
+        The image bytes, padded to the loader's boundary.
+
+    Raises:
+        NotImplementedError: If the launch activates its staged tiles, which the emitter does not place yet.
+    """
+    if launch.activate:
+        message = (
+            "Unable to generate a launch that activates its staged tiles. The emitter places the staging, the "
+            "matrix commands and the drain only, so such a launch must come from `kernels.build_looped_gemm` "
+            "until the activation is placed here too."
+        )
+        raise NotImplementedError(message)
+    bundles = looped_gemm_stream(column_tiles=launch.column_tiles, groups=launch.groups,
+                                 loop_blocks=launch.loop_blocks, fuse_groups=launch.fuse_groups)
+    return AsmKernel(name="looped_gemm", bundles=bundles).to_bytes(pad_to=4)
 
 
 def main() -> int:
@@ -106,9 +136,7 @@ def main() -> int:
     rows = launch.row_blocks * _BLOCK_TOKENS
     columns = launch.column_tiles * matmul.columns
 
-    image = build_looped_gemm(column_tiles=launch.column_tiles, groups=launch.groups, activate=launch.activate,
-                              fuse_groups=launch.fuse_groups,
-                              loop_blocks=launch.loop_blocks).image.to_bytes(pad_to=4)
+    image = generated_gemm_image(launch)
     left, right = stage(*build_operands(rows, matmul.reduction, columns, kind="varying", seed=0),
                         matmul=matmul, launch=launch)
 
@@ -124,6 +152,7 @@ def main() -> int:
     out = _HERE.parent / "build" / "compiled_kernel"
     out.mkdir(parents=True, exist_ok=True)
     (out / "triton_kernel.bin").write_bytes(image)
+    
     # Derives every size the launch needs, so the board allocates and reshapes without deriving anything of its
     # own. The slack on each operand is the block the kernel prefetches past the last one.
     np.savez(

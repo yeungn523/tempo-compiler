@@ -4,7 +4,7 @@ HERE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 PYTHON ?= python3 -u
 
 .PHONY: help minitpu provision run check chat kernels reproduce \
-        identity batch throughput boundary memory layout trace
+        identity batch throughput boundary trace
 
 help:
 	@echo "sudo make minitpu  - set the PL clock, program the PL, provision UIO/udmabuf"
@@ -17,8 +17,6 @@ help:
 	@echo "  make boundary   - the 2 activation copies a pass makes (~30 s)"
 	@echo "  make throughput - warm body time, tokens/s, FLOP rates (~60 s)"
 	@echo "  make chat       - TTFT and decode rate, 5-token prompt (~30 s)"
-	@echo "  make memory     - VMEM bank cost, DMEM stride cost     (~90 s)"
-	@echo "  make layout     - a layout choice, predicted vs measured (~30 s)"
 	@echo "  make trace      - the 18 launches one layer issues     (seconds)"
 	@echo
 	@echo "make run       - assemble and run the editable MINITPU program"
@@ -114,12 +112,6 @@ throughput:
 	@MINITPU_PL_CLOCK_MHZ=$(CLOCK_MHZ) $(PYTHON) $(HERE)bench_throughput.py
 	@MINITPU_PL_CLOCK_MHZ=$(CLOCK_MHZ) $(PYTHON) $(HERE)bench_throughput.py 1 32
 	@MINITPU_PL_CLOCK_MHZ=$(CLOCK_MHZ) $(PYTHON) $(HERE)bench_throughput.py 1 256
-
-memory:
-	@$(PYTHON) $(HERE)demo_bank_conflicts.py --device
-
-layout:
-	@$(PYTHON) $(HERE)demo_layout_cost.py --device
 
 trace:
 	@$(PYTHON) $(HERE)run_gpt2_forward.py --trace

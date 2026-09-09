@@ -20,6 +20,7 @@ import asm as asm_module  # noqa: E402
 from asm import AGU_SHIFT_W  # noqa: E402
 from bf16 import (  # noqa: E402,F401
     HERE,
+    MAX_ATTENTION_ROWS,
     _BLOCK_ACTIVATION_BYTES,
     _BLOCK_DEPTH,
     _BLOCK_TOKENS,
@@ -97,7 +98,7 @@ def single_mul_add() -> None:
     tile_bytes = 16 * _ROW_BYTES
     for tile in range(4):
         bundles[pc] = {"s": minitpu.smov_arg(0, 0) if tile == 0 else minitpu.saddi(0, 0, tile_bytes)}; pc += 1
-        # Carries the DMA row pitch, which is one lane stripe. Naming it as a literal instead walks DRAM at whatever
+        # Carries the DMA row stride, which is one lane stripe. Naming it as a literal instead walks DRAM at whatever
         # that literal says, so a descriptor reads every other row and the result is plausible.
         bundles[pc] = {"s": minitpu.smovi(1, _ROW_BYTES)}; pc += 1
         bundles[pc] = {"s": minitpu.smov_arg(2, 1) if tile == 0 else minitpu.saddi(2, 2, tile_bytes)}; pc += 1
@@ -206,7 +207,7 @@ def build_looped_gemm(column_tiles: int, groups: int, *, activate: bool,
             return pc
 
         pc = 0
-        bundles[pc] = {"s": minitpu.smovi(3, ROW_BYTES)}; pc += 1             # sreg3 = the pitch every packer writes
+        bundles[pc] = {"s": minitpu.smovi(3, ROW_BYTES)}; pc += 1             # sreg3 = the stride every packer writes
         bundles[pc] = {"s": minitpu.smov_arg(1, 2)}; pc += 1                  # sreg1 = drain buffer base
         pc += 1                                                           # scalar writeback latency
         bundles[pc] = {"d": minitpu.dma_load(0, _ROW_ZERO, _TILE, 1, 3)}; pc += 1
@@ -218,7 +219,7 @@ def build_looped_gemm(column_tiles: int, groups: int, *, activate: bool,
         pc += 1
 
         # Rewinds the activation pointer by SUBTRACTION, because a grouped launch cannot re-read arg0: the four scalar
-        # registers hold three pointers and the row pitch, so there is nowhere to keep a per-problem base, and arg0
+        # registers hold three pointers and the row stride, so there is nowhere to keep a per-problem base, and arg0
         # names only the first problem. The body's net movement is known here because every advance is emitted here, so
         # the rewind needs no register and leaves the pointer free to walk on to the next problem.
         batched = batch > 1
@@ -329,10 +330,10 @@ def build_elementwise_add(chunks: int, *, broadcast_right: bool = False) -> Mini
         covers, so a larger tensor is more iterations rather than a different kernel.
 
         With `broadcast_right`, the right operand is one feature row rather than
-        `BLOCK_TOKENS` materialised copies. It is staged once, then a stride-zero
-        `vld` broadcasts each feature tile across the four token rows in a VREG.
-        This is the reuse mode the X slot already encodes; materialising a bias by
-        shape had hidden it behind copies and tens of megabytes of DMEM.
+        `BLOCK_TOKENS` materialised copies. `pack_bias` repeats each feature tile
+        across the four sublane rows, so one contiguous `vld` gives every token row
+        of a VREG the same tile. Four copies of a vector cost far less than a
+        materialised `[tokens, features]` tensor.
 
     Args:
         chunks: Iterations, each covering `_MAX_DESCRIPTOR_ROWS` VMEM rows.
@@ -424,7 +425,7 @@ def build_elementwise_add(chunks: int, *, broadcast_right: bool = False) -> Mini
     return minitpu.asm(elementwise_add, placement="pack")
 
 
-def build_tile_transpose(tiles: int, *, load_pitch: int, store_pitch: int,
+def build_tile_transpose(tiles: int, *, load_stride: int, store_stride: int,
                          store_advance: int) -> MinitpuKernel:
     """Assembles a 16x16 tile transpose, one tile per loop iteration.
 
@@ -440,23 +441,23 @@ def build_tile_transpose(tiles: int, *, load_pitch: int, store_pitch: int,
 
     Args:
         tiles: Tiles to transpose in one launch, walked along the row axis.
-        load_pitch: Rows between consecutive rows OF ONE TILE in the source, in
-            VMEM rows. A tile of a row-major [R, C] array is 16 rows at pitch
+        load_stride: Rows between consecutive rows OF ONE TILE in the source, in
+            VMEM rows. A tile of a row-major [R, C] array is 16 rows at stride
             C / NUM_LANES, not 16 consecutive rows -- this is the first kernel here
             that needed a descriptor stride other than one, and every other kernel
             in this package still walks at stride one.
-        store_pitch: The same for the destination.
+        store_stride: The same for the destination.
         store_advance: Rows the destination pointer moves per tile.
 
     Note:
         All three are required, with no defaults, because the two callers disagree
         on every one of them and a default is right for only one. A stack of square
-        tiles is pitch 1 and advance `_TILE`; a tile column of a matrix is pitch
+        tiles is stride 1 and advance `_TILE`, and a tile column of a matrix is stride
         `C / NUM_LANES` and advance 1, because tile (i, j) becomes tile (j, i) and
-        it is the destination tile's OWN rows that `store_pitch` separates. Giving
+        it is the destination tile's OWN rows that `store_stride` separates. Giving
         this a default silently rewrote the stacked caller's descriptors from
         stride 1 to stride 16, and every simulation still passed: the one shape
-        under test named its pitches explicitly.
+        under test named its strides explicitly.
 
     Returns:
         The program, taking the input and output pointers as its arguments.
@@ -472,10 +473,10 @@ def build_tile_transpose(tiles: int, *, load_pitch: int, store_pitch: int,
         """Transposes one tile per iteration, advancing both pointers."""
         bundles = {}
         pc = 0
-        # Spends all four scalar registers here: two pointers and two pitches. The pitches are immediates because a
+        # Spends all four scalar registers here: two pointers and two strides. The strides are immediates because a
         # kernel is built per shape anyway.
-        bundles[pc] = {"s": minitpu.smovi(2, load_pitch * _ROW_BYTES)}; pc += 1
-        bundles[pc] = {"s": minitpu.smovi(3, store_pitch * _ROW_BYTES)}; pc += 1
+        bundles[pc] = {"s": minitpu.smovi(2, load_stride * _ROW_BYTES)}; pc += 1
+        bundles[pc] = {"s": minitpu.smovi(3, store_stride * _ROW_BYTES)}; pc += 1
         bundles[pc] = {"s": minitpu.smov_arg(0, 0)}; pc += 1      # sreg0 = input
         bundles[pc] = {"s": minitpu.smov_arg(1, 2)}; pc += 1      # sreg1 = output
         pc += 1
@@ -500,9 +501,9 @@ def build_tile_transpose(tiles: int, *, load_pitch: int, store_pitch: int,
         pc += 8
         bundles[pc] = {"d": minitpu.dma_store(0, _ROW_TX_OUT, _TILE, 1, 3)}; pc += 1
         bundles[pc] = {"f": minitpu.flush_slot(1)}; pc += 1
-        # Advances the source by a whole tile of rows at its pitch, because this walks DOWN a source tile column. Where
+        # Advances the source by a whole tile of rows at its stride, because this walks DOWN a source tile column. Where
         # the destination moves is the caller's to say.
-        bundles[pc] = {"s": minitpu.saddi(0, 0, _TILE * load_pitch * _ROW_BYTES)}; pc += 1
+        bundles[pc] = {"s": minitpu.saddi(0, 0, _TILE * load_stride * _ROW_BYTES)}; pc += 1
         bundles[pc] = {"s": minitpu.saddi(1, 1, store_advance * _ROW_BYTES)}; pc += 1
         pc += 2                    # scalar writeback, before the next descriptor reads it
         bundles[pc] = {"f": minitpu.loop_end()}; pc += 1
@@ -542,8 +543,8 @@ def _advance(bundles: dict, pc: int, register: int, delta: int) -> int:
     return pc
 
 
-def build_matrix_transpose(down: int, across: int, *, load_pitch: int,
-                           store_pitch: int) -> MinitpuKernel:
+def build_matrix_transpose(down: int, across: int, *, load_stride: int,
+                           store_stride: int) -> MinitpuKernel:
     """Assembles a whole [R, C] transpose as ONE launch, over a two-deep loop.
 
     Notes:
@@ -558,7 +559,7 @@ def build_matrix_transpose(down: int, across: int, *, load_pitch: int,
         walks down one, and the whole matrix is a single image and a single launch.
 
         The pointer arithmetic is the entire content. Down a column the source moves
-        a whole tile of rows at its pitch and the destination moves one row, because
+        a whole tile of rows at its stride and the destination moves one row, because
         tile (i, j) becomes tile (j, i). Across to the next column the source moves
         back to one row past where the column started -- nearly the whole array, and
         the reason `_advance` exists -- while the destination moves on to the tile
@@ -567,8 +568,8 @@ def build_matrix_transpose(down: int, across: int, *, load_pitch: int,
     Args:
         down: Tiles down a column, R / NUM_LANES / ... i.e. R / 16.
         across: Tile columns, C / 16.
-        load_pitch: VMEM rows between consecutive rows of the source, C / NUM_LANES.
-        store_pitch: The same for the destination, R / NUM_LANES.
+        load_stride: VMEM rows between consecutive rows of the source, C / NUM_LANES.
+        store_stride: The same for the destination, R / NUM_LANES.
 
     Returns:
         The program, taking the source and destination pointers as its arguments.
@@ -587,8 +588,8 @@ def build_matrix_transpose(down: int, across: int, *, load_pitch: int,
         """Transposes one tile per inner iteration, one tile column per outer."""
         bundles = {}
         pc = 0
-        bundles[pc] = {"s": minitpu.smovi(2, load_pitch * _ROW_BYTES)}; pc += 1
-        bundles[pc] = {"s": minitpu.smovi(3, store_pitch * _ROW_BYTES)}; pc += 1
+        bundles[pc] = {"s": minitpu.smovi(2, load_stride * _ROW_BYTES)}; pc += 1
+        bundles[pc] = {"s": minitpu.smovi(3, store_stride * _ROW_BYTES)}; pc += 1
         bundles[pc] = {"s": minitpu.smov_arg(0, 0)}; pc += 1      # sreg0 = source
         bundles[pc] = {"s": minitpu.smov_arg(1, 2)}; pc += 1      # sreg1 = destination
         pc += 1
@@ -617,14 +618,14 @@ def build_matrix_transpose(down: int, across: int, *, load_pitch: int,
         bundles[pc] = {"f": minitpu.flush_slot(1)}; pc += 1
 
         # Steps down the column.
-        pc = _advance(bundles, pc, 0, _TILE * load_pitch * _ROW_BYTES)
+        pc = _advance(bundles, pc, 0, _TILE * load_stride * _ROW_BYTES)
         pc = _advance(bundles, pc, 1, _ROW_BYTES)
         bundles[pc] = {"f": minitpu.loop_end()}; pc += 1
 
         # Across to the next column: back to one row past this column's start, and on to the destination tile row this
         # column becomes.
-        pc = _advance(bundles, pc, 0, (1 - down * _TILE * load_pitch) * _ROW_BYTES)
-        pc = _advance(bundles, pc, 1, (_TILE * store_pitch - down) * _ROW_BYTES)
+        pc = _advance(bundles, pc, 0, (1 - down * _TILE * load_stride) * _ROW_BYTES)
+        pc = _advance(bundles, pc, 1, (_TILE * store_stride - down) * _ROW_BYTES)
         bundles[pc] = {"f": minitpu.loop_end()}; pc += 1
 
         bundles[pc] = {"f": minitpu.halt()}; pc += 1
@@ -689,7 +690,7 @@ def build_head_transpose(heads: int, head_tiles: int, down: int, depth: int,
         """One tile per innermost iteration, one head per outermost."""
         bundles = {}
         pc = 0
-        # Names both pitches as one, because a tile is consecutive rows at each end. They still occupy registers because
+        # Names both strides as one, because a tile is consecutive rows at each end. They still occupy registers because
         # a descriptor names its stride by register.
         bundles[pc] = {"s": minitpu.smovi(2, _ROW_BYTES)}; pc += 1
         bundles[pc] = {"s": minitpu.smovi(3, _ROW_BYTES)}; pc += 1
@@ -921,12 +922,19 @@ def build_softmax_packed(tokens: int, heads: int, *,
         The program, taking the packed scores and the output as its arguments.
 
     Raises:
-        ValueError: If the span is not a whole number of VREGs, or the shape exceeds what the instruction encodes.
+        ValueError: If the span is not a whole number of VREGs, the scores or their result overrun the VMEM,
+            or the shape exceeds what the instruction encodes.
     """
     if span < _VREG_ELEMENTS or span % _VREG_ELEMENTS:
         message = (
             f"Unable to softmax a row of {span}. `vredmax` and `vredsum` reduce over "
             f"one VREG, so a row is a whole number of {_VREG_ELEMENTS}."
+        )
+        raise ValueError(message)
+    if span > MAX_ATTENTION_ROWS:
+        message = (
+            f"Unable to softmax a row of {span}. The scores stage between `_ROW_SCORES` and "
+            f"`_ROW_SOFTMAX_OUT`, which holds a row of at most {MAX_ATTENTION_ROWS}."
         )
         raise ValueError(message)
     vregs = span // _VREG_ELEMENTS         # VREGs one softmax row occupies
@@ -941,6 +949,19 @@ def build_softmax_packed(tokens: int, heads: int, *,
             f"Unable to walk {rows_per_token} rows per token. The AGU shift field is "
             f"{AGU_SHIFT_W} bits, so the shift reaches {max_shift} and the stride "
             f"{1 << max_shift}."
+        )
+        raise ValueError(message)
+    staged = tokens * rows_per_token
+    if staged > _ROW_SOFTMAX_OUT - _ROW_SCORES:
+        message = (
+            f"Unable to stage {tokens} tokens of {rows_per_token} rows. The scores own the "
+            f"{_ROW_SOFTMAX_OUT - _ROW_SCORES} rows below `_ROW_SOFTMAX_OUT`, but that wants {staged}."
+        )
+        raise ValueError(message)
+    if _ROW_SOFTMAX_OUT + staged > _VMEM_ENTRIES_PER_LANE:
+        message = (
+            f"Unable to write {staged} rows from `_ROW_SOFTMAX_OUT`. A lane holds {_VMEM_ENTRIES_PER_LANE} "
+            f"rows, but that reaches {_ROW_SOFTMAX_OUT + staged}."
         )
         raise ValueError(message)
     if tiles > _MAX_DESCRIPTOR_ROWS:
@@ -1096,7 +1117,7 @@ def build_layernorm_rows(rows: int, *, packed: bool = False) -> MinitpuKernel:
             bundles[pc] = slots
             pc += 1
 
-        # Loads the constants at the row pitch before sreg3 becomes the packed stride, since they are contiguous
+        # Loads the constants at the row stride before sreg3 becomes the packed one, since they are contiguous
         # whichever layout the rows use. There are only four scalar registers and all four are spoken for.
         emit(s=minitpu.smovi(3, _ROW_BYTES))
         emit(s=minitpu.smov_arg(0, 0))          # sreg0 = input

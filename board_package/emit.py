@@ -96,8 +96,8 @@ _OUTPUT_ROWS: int = _TOKEN_GROUPS * _TILE
 _DRAIN_POINTER: int = 1
 """Scalar register holding the drain buffer's host address."""
 
-_PITCH_REGISTER: int = 3
-"""Scalar register holding one DMEM row's byte pitch, which every descriptor reads as its stride."""
+_STRIDE_REGISTER: int = 3
+"""Scalar register holding one DMEM row's byte stride, which every descriptor reads."""
 
 _SCALAR_GAP: int = asm_module.W_SCALAR + 1
 """Bundles a scalar write must clear before a descriptor may read the register, the unit interlocking nothing."""
@@ -414,12 +414,12 @@ def _innermost_staging(*, nest: tuple[LoopLevel, ...],
 
 def _emit_prologue(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int) -> int:
     """Binds the launch arguments and fills the clearing tile, returning the next free offset."""
-    put(offset=at, s=builder.smovi(rd=_PITCH_REGISTER, value=_ROW_BYTES))
+    put(offset=at, s=builder.smovi(rd=_STRIDE_REGISTER, value=_ROW_BYTES))
     at += 1
     put(offset=at, s=builder.smov_arg(rd=_DRAIN_POINTER, arg=2))
     at += _SCALAR_GAP
     put(offset=at, d=builder.dma_load(slot=0, vmem_address=_ROW_ZERO, rows=_ZERO_ROWS,
-                                      base_sreg=_DRAIN_POINTER, stride_sreg=_PITCH_REGISTER))
+                                      base_sreg=_DRAIN_POINTER, stride_sreg=_STRIDE_REGISTER))
     at += 1
     put(offset=at, f=builder.flush_slot(mask=1))
     at += 1
@@ -473,7 +473,7 @@ def _emit_stage(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at:
     for operand in operands:
         put(offset=at, d=builder.dma_load(slot=operand.dma_slot, vmem_address=operand.vmem_rows[step] + row,
                                           rows=operand.rows, base_sreg=operand.pointer,
-                                          stride_sreg=_PITCH_REGISTER))
+                                          stride_sreg=_STRIDE_REGISTER))
         at += 1
         put(offset=at, s=builder.saddi(rd=operand.pointer, rs=operand.pointer, value=operand.advance))
         at += 1
@@ -498,7 +498,7 @@ def _emit_drain(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at:
                               row=_ROW_OUTPUT + _TILE_ROWS * group + _NUM_SUBLANES * vreg))
     at += _TOKEN_GROUPS * _TILE_VREGS
     put(offset=at, d=builder.dma_store(slot=0, vmem_address=_ROW_OUTPUT, rows=_OUTPUT_ROWS,
-                                       base_sreg=_DRAIN_POINTER, stride_sreg=_PITCH_REGISTER))
+                                       base_sreg=_DRAIN_POINTER, stride_sreg=_STRIDE_REGISTER))
     at += 1
     put(offset=at, f=builder.flush_slot(mask=1))
     at += 1

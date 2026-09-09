@@ -1,8 +1,7 @@
 """Provides a kernel surface where layouts are written and addresses are derived.
 
 The programmer writes which layout a tensor is in, which VMEM stride it is staged at, where a relayout happens and
-how the launch is tiled. Everything else follows from that: every descriptor field, every vld and vst field, and the
-loop level an AGU walk binds to. A layout mismatch or a non-affine index is refused rather than repaired, because a
+how the launch is tiled. A layout mismatch or a non-affine index is refused rather than repaired, because a
 repair is a launch.
 """
 
@@ -17,16 +16,7 @@ from layout import LayoutError, Tiled, VmemAllocator, VmemRegion
 import asm as asm_module
 from runtime import minitpu
 
-#: `minitpu` above is the live runtime namespace, and `asm(program)` REPLACES it
-#: in this module's globals for the duration of a capture -- which is how
-#: `program` below reaches the builder. Importing it rather than relying on that
-#: injection keeps the name defined, which is not pedantry: a global that only exists during a capture is exactly
-#: the kind of name that goes stale without anything noticing.
 
-#: Words are built through a private assembler instance rather than the `minitpu`
-#: namespace, which only becomes an `AsmBuilder` inside `asm(function)`. The two
-#: produce identical words -- `AsmBuilder`'s methods are pure encoders -- and this
-#: way a kernel can be constructed before anything is being captured.
 ops = asm_module.AsmBuilder()
 
 
@@ -36,9 +26,7 @@ class Vmem:
 
     There is one, and it holds no choice any more. A staged tensor lands each
     token's feature tiles CONSECUTIVELY, so the reduction that walks them reads
-    at stride one. The `stride` this used to carry -- padded to be coprime with
-    the bank count, so a strided read did not split across cycles -- went with
-    the sublane stride it existed to price.
+    at stride one.
     """
 @dataclass
 class Ref:

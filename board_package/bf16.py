@@ -26,7 +26,7 @@ _NUM_LANES: int = 16
 """The number of MXU lanes, which is how many values one VMEM row holds."""
 
 _ROW_BYTES: int = _NUM_LANES * _ELEMENT_BYTES
-"""The byte size of one VMEM row, which is the pitch every DMA descriptor walks DRAM at."""
+"""The byte size of one VMEM row, which is the stride every DMA descriptor walks DRAM at."""
 
 _VMEM_ENTRIES_PER_LANE: int = 8192
 """The number of rows one VMEM lane holds."""
@@ -115,6 +115,33 @@ _ROW_SOFTMAX_OUT: int = 1024
 _VREG_ELEMENTS: int = _NUM_LANES * _NUM_SUBLANES
 """The number of values one vector register holds."""
 
+def _max_attention_rows() -> int:
+    """Returns the rows one attention launch covers, bounded by the VMEM the scores are staged in.
+
+    A token's feature tiles land consecutively, so the rows one token owns is a power of two and the gap between
+    `_ROW_SCORES` and `_ROW_SOFTMAX_OUT` is what bounds the span.
+
+    Returns:
+        The rows, a whole number of VREG spans.
+
+    Raises:
+        ValueError: If the gap cannot hold one row per token of a block.
+    """
+    per_token = (_ROW_SOFTMAX_OUT - _ROW_SCORES) // _BLOCK_TOKENS
+    if per_token < 1:
+        message = (
+            f"Unable to stage {_BLOCK_TOKENS} tokens of scores in {_ROW_SOFTMAX_OUT - _ROW_SCORES} rows. Move "
+            f"`_ROW_SOFTMAX_OUT`."
+        )
+        raise ValueError(message)
+    rows_per_token = 1 << (per_token.bit_length() - 1)
+    return rows_per_token * _TILE // _VREG_ELEMENTS * _VREG_ELEMENTS
+
+
+MAX_ATTENTION_ROWS: int = _max_attention_rows()
+"""Rows one attention launch covers, which the score staging bounds rather than the VREG a reduction spans."""
+
+
 _MAX_DESCRIPTOR_ROWS: int = 128
 """The largest number of rows one DMA descriptor moves, which is the chunk every staged region is sized in."""
 
@@ -158,20 +185,54 @@ _LN_EPSILON: float = 1e-5
 """The variance floor LayerNorm adds before taking the reciprocal square root."""
 
 
-def layernorm_constants(gamma: NDArray[np.float32], beta: NDArray[np.float32]) -> NDArray[np.uint16]:
+def layernorm_constants(gamma: NDArray[np.float32], beta: NDArray[np.float32], *,
+                        width: int | None = None) -> NDArray[np.uint16]:
     """Packs the resident half of a LayerNorm launch: gamma, beta and three broadcast scalars.
 
     Args:
-        gamma: The per-feature scale.
-        beta: The per-feature shift.
+        gamma: The per-feature scale, `width` long.
+        beta: The per-feature shift, `width` long.
+        width: The model width the mean divides by, defaulting to GPT-2's. A caller with another width must say
+            so, because the reciprocal is baked in here and nothing downstream can tell it disagrees with the row
+            it is applied to.
 
     Returns:
         The container words the launch stages in VMEM.
+
+    Raises:
+        ValueError: If the operands are not one row of `width` features each.
     """
+    width = _MODEL_WIDTH if width is None else width
+    _require_norm_operands(width=width, gamma=gamma, beta=beta)
     zero = np.zeros(_VREG_ELEMENTS, dtype=np.float32)
-    inverse = np.full(_VREG_ELEMENTS, 1.0 / _MODEL_WIDTH, dtype=np.float32)
+    inverse = np.full(_VREG_ELEMENTS, 1.0 / width, dtype=np.float32)
     epsilon = np.full(_VREG_ELEMENTS, _LN_EPSILON, dtype=np.float32)
     return as_bf16_words(values=np.concatenate([gamma, beta, zero, inverse, epsilon]))
+
+
+def _require_norm_operands(*, width: int, **operands: NDArray[np.float32]) -> None:
+    """Rejects a normalisation operand that is not exactly one row of `width` features.
+
+    Args:
+        width: Features one normalised row covers.
+        operands: The per-feature vectors to check, named for the message.
+
+    Raises:
+        ValueError: If the width is not a whole number of VREGs, or an operand disagrees with it.
+    """
+    if width <= 0 or width % _VREG_ELEMENTS:
+        message = (
+            f"Unable to normalise a row of {width} features. The reductions are per VREG, so a row is a whole "
+            f"number of {_VREG_ELEMENTS}."
+        )
+        raise ValueError(message)
+    for name, values in operands.items():
+        if values.ndim != 1 or values.size != width:
+            message = (
+                f"Unable to use {name} of shape {values.shape} at width {width}. It must be exactly one row of "
+                f"{width} features."
+            )
+            raise ValueError(message)
 
 
 def as_bf16_words(values: NDArray[np.float32]) -> NDArray[np.uint16]:
@@ -267,6 +328,30 @@ def pack_activations(activations: NDArray[np.float32]) -> NDArray[np.uint16]:
         raise ValueError(message)
     words = as_bf16_words(values=activations)
     return np.ascontiguousarray(words.reshape(tokens, depth // _TILE, _TILE).transpose(1, 0, 2)).reshape(-1)
+
+
+def pack_bias(bias: NDArray[np.float32]) -> NDArray[np.uint16]:
+    """Lays a bias row out in the order a stride-one broadcast read visits it.
+
+    A VREG holds `_NUM_SUBLANES` token rows of one feature tile, and each of them wants the same tile of the bias,
+    so repeating every tile that many times makes the read contiguous.
+
+    Args:
+        bias: One value per feature, a whole number of `_NUM_LANES`-wide tiles.
+
+    Returns:
+        The BF16 words, each feature tile repeated `_NUM_SUBLANES` times.
+
+    Raises:
+        ValueError: If it is not one row of whole tiles.
+    """
+    if bias.ndim != 1 or bias.size % _NUM_LANES:
+        message = (
+            f"Unable to pack a bias of shape {bias.shape}. It must be one row of whole {_NUM_LANES}-lane tiles."
+        )
+        raise ValueError(message)
+    tiles = as_bf16_words(values=bias).reshape(-1, _NUM_LANES)
+    return np.ascontiguousarray(np.repeat(tiles, _NUM_SUBLANES, axis=0)).reshape(-1)
 
 
 def pack_weights(weights: NDArray[np.float32]) -> NDArray[np.uint16]:

@@ -376,7 +376,17 @@ def _capacity(spec: dict[str, Any]) -> int | None:
 
 def _render_package(data: dict[str, Any]) -> str:
     """Returns the generated SystemVerilog package carrying one localparam per published offset and opcode."""
-    lines = [f"// {_HEADER}", "", "package isa_latency_pkg;"]
+    lines = [
+        # Emits the licence header every other source carries here rather than adding it afterwards, since --check
+        # would call the file stale the moment it had one.
+        "// Copyright MiniTPU Authors",
+        "// SPDX-License-Identifier: Apache-2.0",
+        "",
+        f"// {_HEADER}",
+        "//",
+        "// Concepts: ISA latency contract, writeback offset, generated artifact.",
+        "package isa_latency_pkg;",
+    ]
 
     params = dict(data["rtl_params"])
     for spec in data["resources"].values():

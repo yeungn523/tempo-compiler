@@ -25,6 +25,7 @@ sys.path.insert(0, str(HERE / "minitpu_runtime"))
 
 from bf16 import (  # noqa: E402,F401  -- re-exported: the board and tools import them from here
     HERE,
+    MAX_ATTENTION_ROWS,
     _BLOCK_ACTIVATION_BYTES,
     _BLOCK_DEPTH,
     _BLOCK_TOKENS,
@@ -78,6 +79,7 @@ from bf16 import (  # noqa: E402,F401  -- re-exported: the board and tools impor
     gelu_lut_reference,
     layernorm_constants,
     pack_activations,
+    pack_bias,
     pack_gemm_input,
     pack_weights,
 )
@@ -233,13 +235,17 @@ def upload_weights(h_weights: NDArray[np.float32]) -> ResidentWeights:
 
 
 def upload_bias(h_bias: NDArray[np.float32]) -> ResidentWeights:
-    """Upload one feature row in the order a stride-zero VMEM read broadcasts it."""
+    """Uploads one feature row, replicated so a stride-one VMEM read broadcasts it.
+
+    A VREG holds `_NUM_SUBLANES` token rows of one feature tile, and every one of them wants the same tile of the
+    bias, so repeating each tile that many times in DMEM makes that a plain contiguous read.
+    """
     if h_bias.ndim != 1 or h_bias.size % _NUM_LANES:
         raise ValueError(
             f"Unable to upload bias shape {h_bias.shape}. It must be one row of "
             f"whole {_NUM_LANES}-lane tiles."
         )
-    words = as_bf16_words(values=_on_bf16_grid(values=h_bias.astype(np.float32)))
+    words = pack_bias(_on_bf16_grid(values=h_bias.astype(np.float32)))
     minitpuSetDevice(single_halt.uio_name)
     host = minitpuHostAlloc(words.nbytes)
     host.view.view("<u2")[:words.size] = words
@@ -450,11 +456,11 @@ class DeviceTensorSlice:
 # sweeps many shapes will exhaust its 16 MiB udmabuf, which is why a benchmark
 # takes one shape per process.
 #
-# Caching and reusing one region per role does not work. Two things break it: a cached region does not survive `minitpuHostReset`, which the drivers call
-# and which drops the udmabuf out from under every region carved from it; and the
-# helper cannot bind a device of its own without rebinding one in the middle of
-# whatever sequence its caller was running. Both show up as `instr_ready` never
-# returning -- the device left mid-command -- rather than as a wrong answer, and
+# Caching and reusing one region per role does not work. Two things break it. A cached region does not survive
+# `minitpuHostReset`, which the drivers call and which drops the udmabuf out from under every region carved from it. The
+# helper also cannot bind a device of its own without rebinding one in the middle of whatever sequence its caller was
+# running. Both show up as `instr_ready` never returning, the device left mid-command, rather than as a wrong answer,
+# and
 # the second attempt took the board from 6 of 16 to 0 of 16. The fix belongs in the
 # allocator, as a real per-region free, not in a cache layered over one that has none.
 
@@ -682,15 +688,14 @@ def transpose_2d(h_matrix: NDArray[np.float32]) -> NDArray[np.float32]:
     """Transposes a whole [rows, columns] array on the device.
 
     Notes:
-        A 16x16 tile of a row-major array is 16 rows at pitch `columns / NUM_LANES`,
+        A 16x16 tile of a row-major array is 16 rows at stride `columns / NUM_LANES`,
         not 16 consecutive rows, so this is the first thing in the package that
-        needed a DMA descriptor stride other than one. Every other kernel here
-        walks VMEM at sublane stride 1 with a full mask; the flexibility was in the
-        encoding the whole time and nothing reached for it.
+        needs a DMA descriptor stride other than one. Every other kernel here reads
+        consecutive VMEM rows with a full mask.
 
         Tile (i, j) of the source becomes tile (j, i) of the destination, and that
         placement is pointer arithmetic: one launch per source tile COLUMN walks
-        that column's tiles with `load_pitch = columns / NUM_LANES` and lands them
+        that column's tiles with `load_stride = columns / NUM_LANES` and lands them
         consecutively in the destination row they belong to.
 
     Args:
@@ -714,8 +719,8 @@ def transpose_2d(h_matrix: NDArray[np.float32]) -> NDArray[np.float32]:
     kernel, image_bytes = _kernel_and_image(
         ("transpose2d", down, across, columns // _NUM_LANES, rows // _NUM_LANES),
         lambda: build_matrix_transpose(down=down, across=across,
-                                       load_pitch=columns // _NUM_LANES,
-                                       store_pitch=rows // _NUM_LANES))
+                                       load_stride=columns // _NUM_LANES,
+                                       store_stride=rows // _NUM_LANES))
     minitpuSetDevice(kernel.uio_name)
     minitpuHostReset()
     d_owned: list[int] = []
@@ -776,7 +781,7 @@ def transpose_tiles(h_tiles: NDArray[np.float32]) -> NDArray[np.float32]:
         ("transpose", tiles),
         # A [tiles * 16, 16] stack: one matrix row is exactly one VMEM row, so the
         # rows of a tile are consecutive, and each result lands a whole tile on.
-        lambda: build_tile_transpose(tiles=tiles, load_pitch=1, store_pitch=1,
+        lambda: build_tile_transpose(tiles=tiles, load_stride=1, store_stride=1,
                                      store_advance=_TILE))
     minitpuSetDevice(kernel.uio_name)
     minitpuHostReset()
@@ -859,9 +864,9 @@ def add_bias_resident(d_left: DeviceTensor, d_bias: ResidentWeights, *,
                       d_out: DeviceTensor | None = None) -> DeviceTensor:
     """Adds one resident feature row to every token row.
 
-    The bias stays as one packed row in DMEM. The kernel stages it once and uses
-    stride-zero VMEM reads to broadcast it across tokens, instead of materialising
-    a `[tokens, features]` tensor for every layer and execution shape.
+    The bias is packed with each feature tile repeated across the four sublane rows, so the kernel stages it once
+    and one contiguous read broadcasts it across tokens. That is far cheaper than materialising a
+    `[tokens, features]` tensor for every layer and execution shape.
     """
     if d_bias.depth != 1 or d_bias.columns != d_left.features:
         raise ValueError(
@@ -1399,15 +1404,6 @@ def attention_head(
     scores = full_gemm(activations=_pad_columns(scaled, contraction), weights=padded(key.T.copy()))
     weights = softmax_rows(scores=scores)
     return full_gemm(activations=_pad_columns(weights, contraction), weights=padded(value))
-
-
-#: Rows one attention launch can cover. Every query sees
-#: every row of the batch, so a head's diagonal block is `span` wide and the softmax
-#: stages `span / TILE` feature tiles at a padded pitch between `_ROW_SCORES` and
-#: `_ROW_SOFTMAX_OUT`. That gap is what bounds it, not the VREG a reduction covers.
-MAX_ATTENTION_ROWS: int = (
-    (_ROW_SOFTMAX_OUT - _ROW_SCORES) // (_BLOCK_TOKENS + 1) * _TILE
-    // _VREG_ELEMENTS * _VREG_ELEMENTS)
 
 
 def _sequence_length(*, rows: int, valid: int, sequences: int) -> int:

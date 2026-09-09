@@ -45,7 +45,7 @@ _SREG_LEFT: int = 0
 """The scalar register holding the DRAM base address of the left operand."""
 
 _SREG_ROW_STRIDE: int = 1
-"""The scalar register holding the DMA row pitch."""
+"""The scalar register holding the DMA row stride."""
 
 _SREG_RIGHT: int = 2
 """The scalar register holding the DRAM base address of the right operand."""

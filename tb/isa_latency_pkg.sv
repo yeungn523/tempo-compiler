@@ -1,5 +1,9 @@
-// Run `python3 tools/gen_isa_doc.py --write` to generate.
+// Copyright MiniTPU Authors
+// SPDX-License-Identifier: Apache-2.0
 
+// Run `python3 tools/gen_isa_doc.py --write` to generate.
+//
+// Concepts: ISA latency contract, writeback offset, generated artifact.
 package isa_latency_pkg;
   localparam int unsigned DOC_WB_W_ALU = 5;
   localparam int unsigned DOC_WB_W_SFU = 7;

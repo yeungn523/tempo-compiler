@@ -25,7 +25,6 @@ from .device import (
 )
 from .launch import minitpuLaunchKernel
 from .memcpy import MemcpyKind, minitpuDrain, minitpuMemcpy, minitpuMemcpyAsync
-from .perf import PerfDelta, PerfSample, read_perf
 from .program import MinitpuKernel, minitpu, minitpuAssembly, minitpuKernel, minitpuRunKernel
 
 __all__ = [
@@ -35,8 +34,6 @@ __all__ = [
     "MinitpuKernel",
     "Mmio",
     "MockMmio",
-    "PerfDelta",
-    "PerfSample",
     "UdmabufBuffer",
     "UioMmio",
     "ZCU102_ADDRESS_SPACE",
@@ -60,5 +57,4 @@ __all__ = [
     "minitpuRunKernel",
     "minitpuSetDevice",
     "open_device",
-    "read_perf",
 ]

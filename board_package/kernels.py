@@ -1101,10 +1101,6 @@ def _norm_geometry(width: int) -> tuple[int, int]:
 def _require_norm_fits(*, name: str, width_rows: int, const_rows: int, out_row: int) -> None:
     """Rejects a width whose staged row and constants would reach the output block.
 
-    Nothing in hardware checks a VMEM region against its neighbour and a launch boundary does not clear VMEM, so an
-    overlap is a silently wrong answer rather than a fault. The output row is a constant chosen for one model width,
-    and this is what tells a wider one that it no longer holds.
-
     Args:
         name: The kernel the regions belong to, which is what the diagnostic names.
         width_rows: VMEM rows one hidden row occupies.

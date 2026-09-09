@@ -44,7 +44,8 @@ class MinitpuBackend(BaseBackend):
     """Compiles Triton kernels for this machine, stopping at the tt dialect.
 
     Triton declares six abstract methods. Four are empty because this machine adds no dialects, supplies no device
-    specific modules, and runs no stage past the tt dialect, and a subclass omitting them cannot be instantiated.
+    specific modules, and runs no stage past the tt dialect. `get_codegen_implementation` is a seventh that BaseBackend 
+    does not declare and every backend must still carry: `make_ir` takes its return value as an argument.
     """
 
     @staticmethod
@@ -75,8 +76,15 @@ class MinitpuBackend(BaseBackend):
         """Returns the device specific implementations of Triton's interface modules, of which there are none."""
         return {}
 
-    def add_stages(self, stages: dict, options: _MinitpuOptions) -> None:
-        """Registers the compilation stages, of which this backend runs none past the tt dialect."""
+    def add_stages(self, stages: dict, options: _MinitpuOptions, *_) -> None:
+        """Registers the compilation stages, of which this backend runs none past the tt dialect.
+
+        Notes:
+            Absorbs the arguments past the two BaseBackend declares, because Triton's own driver passes a third:
+            `compiler.py` calls `backend.add_stages(stages, options, src.language)`. Nothing here reaches that
+            call, since the frontend drives `make_ir` rather than `triton.compile`, so the trailing arguments are
+            taken to keep a method that does nothing from raising instead once something does.
+        """
 
 
 def _dot_shape(lhs, rhs) -> tuple[int, int, int]:

@@ -1069,7 +1069,64 @@ def build_softmax_packed(tokens: int, heads: int, *,
     return minitpu.asm(softmax_packed)
 
 
-def build_layernorm_rows(rows: int, *, packed: bool = False) -> MinitpuKernel:
+def _norm_geometry(width: int) -> tuple[int, int]:
+    """Returns the VMEM rows and VREGs one hidden row of the given width occupies.
+
+    Args:
+        width: Features in the row.
+
+    Returns:
+        The rows and VREGs pair.
+
+    Raises:
+        ValueError: If the width is not a whole number of VREGs, or a row does not fit in one DMA descriptor.
+    """
+    if width <= 0 or width % _VREG_ELEMENTS:
+        message = (
+            f"Unable to normalise a row of {width} features. `vredsum` reduces exactly one VREG, so a row is a "
+            f"whole number of {_VREG_ELEMENTS}."
+        )
+        raise ValueError(message)
+    width_rows = width // _NUM_LANES
+    if width_rows > _MAX_DESCRIPTOR_ROWS:
+        message = (
+            f"Unable to stream a row of {width} features: {width_rows} VMEM rows past the "
+            f"{_MAX_DESCRIPTOR_ROWS} one descriptor covers. Split the row across descriptors, or widen DMA's row "
+            f"field."
+        )
+        raise ValueError(message)
+    return width_rows, width // _VREG_ELEMENTS
+
+
+def _require_norm_fits(*, name: str, width_rows: int, const_rows: int, out_row: int) -> None:
+    """Rejects a width whose staged row and constants would reach the output block.
+
+    Nothing in hardware checks a VMEM region against its neighbour and a launch boundary does not clear VMEM, so an
+    overlap is a silently wrong answer rather than a fault. The output row is a constant chosen for one model width,
+    and this is what tells a wider one that it no longer holds.
+
+    Args:
+        name: The kernel the regions belong to, which is what the diagnostic names.
+        width_rows: VMEM rows one hidden row occupies.
+        const_rows: VMEM rows the constants block occupies.
+        out_row: The first VMEM row of the output block.
+
+    Raises:
+        ValueError: If the input row plus the constants block reaches the output row, or the output block runs past
+            the rows a lane holds.
+    """
+    end = width_rows + const_rows
+    if end > out_row or out_row + width_rows > _VMEM_ENTRIES_PER_LANE:
+        message = (
+            f"Unable to place the {name} regions: the staged row and constants occupy rows [0:{end}) and the "
+            f"output block is [{out_row}:{out_row + width_rows}) of {_VMEM_ENTRIES_PER_LANE}. Move the output "
+            f"block, or stage the row in pieces."
+        )
+        raise ValueError(message)
+
+
+def build_layernorm_rows(rows: int, *, width: int = _MODEL_WIDTH,
+                         packed: bool = False) -> MinitpuKernel:
     """Assembles LayerNorm over several hidden rows, one per loop iteration.
 
     Notes:
@@ -1083,6 +1140,8 @@ def build_layernorm_rows(rows: int, *, packed: bool = False) -> MinitpuKernel:
 
     Args:
         rows: Hidden rows to normalise in one launch.
+        width: Features in one hidden row, which sets the VMEM rows a row occupies, the VREGs its
+            reductions cover and where the constants block starts.
         packed: Read and write in the layout a GEMM operand uses -- `[tiles, tokens,
             TILE]` -- instead of plain row-major. This is a DMEM LAYOUT choice, and
             it costs nothing but two scalar values: a descriptor computes
@@ -1100,12 +1159,14 @@ def build_layernorm_rows(rows: int, *, packed: bool = False) -> MinitpuKernel:
     Returns:
         The program, taking the input, the constants and the output pointers as its arguments.
     """
-    gamma_row = _LN_ROW_CONST
-    beta_row = gamma_row + _WIDTH_ROWS
-    zero_row = beta_row + _WIDTH_ROWS
+    width_rows, width_vregs = _norm_geometry(width)
+    gamma_row = width_rows                     # the row block ends where x ends
+    beta_row = gamma_row + width_rows
+    zero_row = beta_row + width_rows
     invn_row = zero_row + _NUM_SUBLANES
     eps_row = invn_row + _NUM_SUBLANES
-    const_rows = eps_row + _NUM_SUBLANES - _LN_ROW_CONST
+    const_rows = eps_row + _NUM_SUBLANES - width_rows
+    _require_norm_fits(name="layernorm", width_rows=width_rows, const_rows=const_rows, out_row=_LN_ROW_OUT)
 
     def layernorm_rows_kernel() -> None:
         """Streams one hidden row per iteration through mean, variance and the affine."""
@@ -1124,43 +1185,47 @@ def build_layernorm_rows(rows: int, *, packed: bool = False) -> MinitpuKernel:
         emit(s=minitpu.smov_arg(1, 1))          # sreg1 = constants
         emit(s=minitpu.smov_arg(2, 2))          # sreg2 = output
         emit()                                  # scalar writeback boundary
-        emit(d=minitpu.dma_load(0, _LN_ROW_CONST, const_rows, 1, 3))
+        emit(d=minitpu.dma_load(0, gamma_row, const_rows, 1, 3))
         emit(f=minitpu.flush_slot(1))
 
         stride_bytes = rows * _ROW_BYTES if packed else _ROW_BYTES
-        advance_bytes = _ROW_BYTES if packed else _WIDTH_ROWS * _ROW_BYTES
+        advance_bytes = _ROW_BYTES if packed else width_rows * _ROW_BYTES
         if packed:
             emit(s=minitpu.smovi(3, stride_bytes))
             emit()                              # scalar writeback boundary
 
         emit(f=minitpu.lbegin(rows))
-        emit(d=minitpu.dma_load(0, _LN_ROW_X, _WIDTH_ROWS, 0, 3))
+        emit(d=minitpu.dma_load(0, _LN_ROW_X, width_rows, 0, 3))
         emit(s=minitpu.saddi(0, 0, advance_bytes))
         emit(f=minitpu.flush_slot(1))
 
         emit(x=minitpu.vld(1, zero_row))        # running sum
         emit(x=minitpu.vld(5, invn_row))        # 1/width, broadcast
         emit(x=minitpu.vld(10, eps_row))
-        for tile in range(_WIDTH_VREGS):
+        for tile in range(width_vregs):
             emit(x=minitpu.vld(2, _LN_ROW_X + _NUM_SUBLANES * tile))
             emit(e=minitpu.vredsum(16 + tile, 2))
-        for tile in range(_WIDTH_VREGS):
+        for tile in range(width_vregs):
             emit(e=minitpu.vadd(1, 14, 16 + tile) if tile & 1 else minitpu.vadd(14, 1, 16 + tile))
-        emit(e=minitpu.vmul(4, 1, 5))           # mean, broadcast
+        # The pair alternates between registers 1 and 14, so which one holds the total follows the parity of the
+        # tile count. Naming 1 outright reads the seed back at an odd count.
+        sum_reg = 1 if width_vregs % 2 == 0 else 14
+        emit(e=minitpu.vmul(4, sum_reg, 5))     # mean, broadcast
 
         emit(x=minitpu.vld(6, zero_row))
-        for tile in range(_WIDTH_VREGS):
+        for tile in range(width_vregs):
             emit(x=minitpu.vld(2, _LN_ROW_X + _NUM_SUBLANES * tile))
             emit(e=minitpu.vsub(7, 2, 4))
             emit(e=minitpu.vmul(8, 7, 7))
             emit(e=minitpu.vredsum(16 + tile, 8))
-        for tile in range(_WIDTH_VREGS):
+        for tile in range(width_vregs):
             emit(e=minitpu.vadd(6, 15, 16 + tile) if tile & 1 else minitpu.vadd(15, 6, 16 + tile))
-        emit(e=minitpu.vmul(9, 6, 5))           # variance
+        square_reg = 6 if width_vregs % 2 == 0 else 15
+        emit(e=minitpu.vmul(9, square_reg, 5))  # variance
         emit(e=minitpu.vadd(14, 9, 10))
         emit(e=minitpu.vrsqrt(11, 14))
 
-        for tile in range(_WIDTH_VREGS):
+        for tile in range(width_vregs):
             emit(x=minitpu.vld(2, _LN_ROW_X + _NUM_SUBLANES * tile))
             emit(e=minitpu.vsub(7, 2, 4))
             emit(e=minitpu.vmul(8, 7, 11))

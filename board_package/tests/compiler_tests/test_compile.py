@@ -22,6 +22,7 @@ import triton.language as tl  # noqa: E402
 
 import kernels  # noqa: E402
 from compiler import ProgramError, plan, read_program, signature_of  # noqa: E402
+from compiler_tests.renaming import renaming_onto  # noqa: E402
 from layout import register_map  # noqa: E402
 
 _OPERANDS: dict[str, str] = {"ap": "*bf16", "wp": "*bf16", "op": "*fp32"}
@@ -96,14 +97,17 @@ class PipelineTest(unittest.TestCase):
 
     def test_the_planned_image_matches_the_hand_written_builder(self) -> None:
         """Asserts a compiled kernel emits the bundle stream `build_looped_gemm` assembles for the same launch."""
+        import asm  # noqa: PLC0415  -- imported here so the path insert above has already run
         from sim_triton_kernel import generate_gemm_image  # noqa: PLC0415  -- a tool, not a package module
 
         _, planned = compile_one(gemm)
         launch = planned.launches[0]
         hand = kernels.build_looped_gemm(launch.column_tiles, launch.groups, activate=launch.activate,
                                          fuse_groups=launch.fuse_groups,
-                                         loop_blocks=launch.loop_blocks).image.to_bytes(pad_to=4)
-        self.assertEqual(generate_gemm_image(launch), hand)
+                                         loop_blocks=launch.loop_blocks).image.assemble(pad_to=4)
+        emitted = generate_gemm_image(launch)
+        derived = tuple(int.from_bytes(emitted[at:at + 16], "little") for at in range(0, len(emitted), 16))
+        self.assertIsNotNone(renaming_onto(derived, hand))
 
 
 @triton.jit

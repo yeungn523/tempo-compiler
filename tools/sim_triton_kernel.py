@@ -28,6 +28,7 @@ from bf16 import (  # noqa: E402
     _BLOCK_TOKENS,
     _BLOCK_WEIGHT_BYTES,
     _ELEMENT_BYTES,
+    _TILE,
     build_operands,
     pack_activations,
     pack_weights,
@@ -124,7 +125,7 @@ def main() -> int:
                             "stride_cm": width, "stride_cn": 1})
     launch = planned.launches[0]
     rows = launch.row_blocks * _BLOCK_TOKENS
-    columns = launch.column_tiles * matmul.columns
+    columns = launch.column_tiles * _TILE
 
     image = generate_gemm_image(launch)
     left, right = stage(*build_operands(rows, matmul.reduction, columns, kind="varying", seed=0),

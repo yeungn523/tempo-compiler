@@ -24,6 +24,7 @@ from dataclasses import dataclass  # noqa: E402
 
 import asm as asm_module  # noqa: E402
 from bf16 import (  # noqa: E402
+    _BLOCK_TOKENS,
     _BLOCK_WEIGHT_BYTES,
     _NUM_SUBLANES,
     _ROW_ACTIVATION,
@@ -40,21 +41,13 @@ from bf16 import (  # noqa: E402
     _ZERO_TILE_BYTES,
 )
 from isa_model import MATRIX_OCCUPANCY, RTL_PARAMS  # noqa: E402
+from layout import RegisterMap, register_map  # noqa: E402
 
-_WEIGHT_VREG: int = 24
-"""First of the four vector registers a step stages its weight tile into."""
+_REGISTERS: RegisterMap = register_map(block_m=_BLOCK_TOKENS, block_n=_TILE)
+"""Where a block's operands live in the register file, which `layout.register_map` derives from its shape.
 
-_ACTIVATION_VREG: int = 12
-"""First of the vector registers a step stages its activation tiles into, one token group after another."""
-
-_RESULT_VREG: int = 28
-"""First of the four vector registers a matrix result pops into."""
-
-_ACCUMULATOR_TILES: int = 1
-"""Output tiles the accumulators hold at once, which the register map fixes at V0 through V7.
-
-A nest wanting more of them needs an allocator to widen that map, so the emitter refuses rather than
-overwriting a tile it is still accumulating.
+A block is the one shape the emitter places, so the map is asked once here rather than per step. The accumulators
+it leaves room for bound what a nest may keep resident, since this emitter has no path that accumulates in VMEM.
 """
 
 _MATLOAD_AT: int = (_TILE_VREGS - 1) + RTL_PARAMS["WB_W_VLD"] + 1
@@ -251,17 +244,17 @@ def emit_gemm_step(*, activation_row: int, weight_row: int, close_loop: bool) ->
 
     for vreg in range(_TILE_VREGS):
         put(offset=vreg,
-            x=builder.vld(vreg=_WEIGHT_VREG + vreg, row=weight_row + _NUM_SUBLANES * vreg))
+            x=builder.vld(vreg=_REGISTERS.weight + vreg, row=weight_row + _NUM_SUBLANES * vreg))
     for vreg in range(_TILE_VREGS):
         put(offset=_TILE_VREGS + vreg,
-            x=builder.vld(vreg=_ACTIVATION_VREG + vreg, row=activation_row + _NUM_SUBLANES * vreg))
-    put(offset=_MATLOAD_AT, m=builder.vmatload(vreg=_WEIGHT_VREG))
+            x=builder.vld(vreg=_REGISTERS.activation + vreg, row=activation_row + _NUM_SUBLANES * vreg))
+    put(offset=_MATLOAD_AT, m=builder.vmatload(vreg=_REGISTERS.weight))
 
     def stage_next(*, group: int, vreg: int) -> int | None:
         """Returns the load of the next token group's tile, or None once the last group is staged."""
         if group + 1 >= _TOKEN_GROUPS:
             return None
-        return builder.vld(vreg=_ACTIVATION_VREG + _TILE_VREGS * (group + 1) + vreg,
+        return builder.vld(vreg=_REGISTERS.activation + _TILE_VREGS * (group + 1) + vreg,
                            row=activation_row + _TILE_ROWS * (group + 1) + _NUM_SUBLANES * vreg)
 
     _place_matrix_commands(put=put, builder=builder, stage_next=stage_next, close_loop=close_loop)
@@ -407,10 +400,10 @@ def _innermost_staging(*, nest: tuple[LoopLevel, ...],
             an operand to any loop but the innermost one.
     """
     tiles = resident_tiles(nest=nest)
-    if tiles > _ACCUMULATOR_TILES:
+    if tiles > _REGISTERS.resident:
         message = (
             f"Unable to walk a nest holding {tiles} output tiles resident. The register map carries "
-            f"{_ACCUMULATOR_TILES}, so a column loop inside the contraction needs an allocator to widen it. "
+            f"{_REGISTERS.resident}, so a column loop inside the contraction needs an allocator to widen it. "
             f"Walk the columns outside the contraction, which holds one tile however many the product covers."
         )
         raise ValueError(message)
@@ -565,8 +558,8 @@ def _place_matrix_commands(*, put: Callable[..., None], builder: asm_module.AsmB
             return
         last = pending == _TOKEN_GROUPS - 1
         for vreg in range(_TILE_VREGS):
-            accumulator = _TILE_VREGS * pending + vreg
-            put(offset=at, e=builder.vadd(vd=accumulator, va=accumulator, vb=_RESULT_VREG + vreg))
+            accumulator = _REGISTERS.accumulator + _TILE_VREGS * pending + vreg
+            put(offset=at, e=builder.vadd(vd=accumulator, va=accumulator, vb=_REGISTERS.result + vreg))
             if close_loop and last and vreg == _TILE_VREGS - 1:
                 put(offset=at, f=builder.loop_end())
             at += 1
@@ -581,7 +574,7 @@ def _place_matrix_commands(*, put: Callable[..., None], builder: asm_module.AsmB
         if vreg == 0:
             # The adds read the result registers this pop is about to overwrite.
             flush_accumulate()
-        put(offset=at, m=builder.vmatpop(vreg=_RESULT_VREG + vreg))
+        put(offset=at, m=builder.vmatpop(vreg=_REGISTERS.result + vreg))
         at += _POP_II
         outstanding -= per_pop
         popped += 1
@@ -592,7 +585,7 @@ def _place_matrix_commands(*, put: Callable[..., None], builder: asm_module.AsmB
         for vreg in range(_TILE_VREGS):
             while outstanding + per_push > depth:
                 drain_one()
-            slots = {"m": builder.vmatpush(vreg=_ACTIVATION_VREG + _TILE_VREGS * group + vreg)}
+            slots = {"m": builder.vmatpush(vreg=_REGISTERS.activation + _TILE_VREGS * group + vreg)}
             staged = stage_next(group=group, vreg=vreg)
             if staged is not None:
                 slots["x"] = staged

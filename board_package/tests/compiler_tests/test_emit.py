@@ -22,6 +22,7 @@ import asm  # noqa: E402
 import bf16  # noqa: E402
 import emit  # noqa: E402
 import kernels  # noqa: E402
+from compiler_tests.renaming import renaming_onto  # noqa: E402
 from layout import register_map  # noqa: E402
 
 
@@ -44,7 +45,7 @@ class EmitterConformanceTest(unittest.TestCase):
         The emitter places slots and leaves every delay field zero, so the scheduler deriving the same delays is what
         says the placement carries the same dependence distances the hand-tuned one does.
         """
-        self.assertEqual(tuple(asm.schedule(list(self.derived))), self.hand)
+        self.assertIsNotNone(renaming_onto(tuple(asm.schedule(list(self.derived))), self.hand))
 
 
 class EmitterSerialisationTest(unittest.TestCase):
@@ -60,13 +61,13 @@ class EmitterSerialisationTest(unittest.TestCase):
                                           loop_blocks=loop_blocks):
                             hand = kernels.build_looped_gemm(
                                 column_tiles, groups, activate=False, fuse_groups=fuse_groups,
-                                loop_blocks=loop_blocks).image.to_bytes(pad_to=4)
+                                loop_blocks=loop_blocks).image.assemble(pad_to=4)
                             derived = asm.AsmKernel(
                                 name="looped_gemm",
                                 bundles=emit.looped_gemm_stream(
                                     column_tiles=column_tiles, groups=groups, loop_blocks=loop_blocks,
-                                    fuse_groups=fuse_groups)).to_bytes(pad_to=4)
-                            self.assertEqual(derived, hand)
+                                    fuse_groups=fuse_groups)).assemble(pad_to=4)
+                            self.assertIsNotNone(renaming_onto(derived, hand))
 
 
 class EmitterRegisterBudgetTest(unittest.TestCase):

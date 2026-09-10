@@ -9,24 +9,11 @@ from dataclasses import dataclass, field
 import numpy as np
 from numpy.typing import NDArray
 
-from bf16 import _BLOCK_DEPTH, _BLOCK_TOKENS, _TILE, _TILE_VREGS, _TOKEN_GROUPS, _ZERO_TILE_WORDS
-from isa_model import PROFILE
+from bf16 import _BLOCK_DEPTH, _BLOCK_TOKENS, _TILE, _ZERO_TILE_WORDS
 from layout import LayoutError, register_map
 from triton.runtime import JITFunction
 
 from .frontend import compile_to_ttir
-
-_VREG_ENTRIES: int = PROFILE["vreg_entry_count"]
-"""Vector registers the file holds, read from MiniTpuProfile in compiler/minitpuisa.td rather than restated here."""
-
-_ACCUMULATOR_VREGS: int = _TOKEN_GROUPS * _TILE_VREGS
-"""Registers one output tile's accumulator occupies."""
-
-_STAGING_VREGS: int = _TOKEN_GROUPS * _TILE_VREGS + _TILE_VREGS
-"""Registers a step's staging holds while it runs, which kernels._emit_gemm_step places at 12..19 and 24..27."""
-
-_RESIDENT_TILES: int = (_VREG_ENTRIES - _STAGING_VREGS) // _ACCUMULATOR_VREGS
-"""Output tiles a launch accumulates at once, bounded by the registers the staging leaves free."""
 
 _MINIMUM_LOOP_BLOCKS: int = 2
 """Smallest number of accumulation blocks a group carries, set by the two way unroll of the block loop."""
@@ -505,7 +492,7 @@ def stage(left: NDArray[np.float32], right: NDArray[np.float32], *, matmul: MatM
     """
     rows = launch.row_blocks * _BLOCK_TOKENS
     depth = launch.groups * matmul.depth
-    columns = launch.column_tiles * matmul.columns
+    columns = launch.column_tiles * _TILE
     staged = []
     for operand, shape in ((left, (rows, depth)), (right, (depth, columns))):
         # Slices before measuring, so an operand already larger than its launch covers is cut rather than
@@ -982,14 +969,8 @@ def _machine_tile(*, index: int, matmul: MatMul) -> int:
             f"the token axis is not a loop the image carries, so one launch covers exactly one block of it."
         )
         raise ProgramError(message)
-    if matmul.columns < _TILE or matmul.columns % _TILE:
-        message = (
-            f"Unable to compute a BLOCK_N of {matmul.columns} in matmul {index}. It must be a whole number of "
-            f"{_TILE}, because one column tile is as wide as the systolic array."
-        )
-        raise ProgramError(message)
-    # Wider blocks are bounded by the register file rather than by the array, so the map that lays a block out is
-    # what judges them.
+    # Both the tile width the array fixes and the registers a block needs are the map's to judge, so a block that
+    # is not a whole number of tiles and one that does not fit are refused in the same place.
     try:
         register_map(block_m=matmul.rows, block_n=matmul.columns)
     except LayoutError as error:
@@ -1139,13 +1120,14 @@ def _resident_tiles(*, index: int, matmul: MatMul, covered: dict[str, int]) -> N
         # `read_program` has already refused a nest with more than one loop walking neither axis, so a step here
         # names one of them, and the tiles it walks are the ones the covered extent holds.
         resident *= covered[axis_of[step]] // step
-    if resident > _RESIDENT_TILES:
+    # Asks the map for a block wide enough to hold them, so what a nest may keep resident and what a block may is
+    # the one derivation rather than two.
+    mapped = register_map(block_m=matmul.rows, block_n=resident * _TILE)
+    if mapped.spilled:
         message = (
-            f"Unable to accumulate {resident} output tiles at once in matmul {index}, whose tile loop runs "
-            f"inside its reduction. Each tile's accumulator is {_ACCUMULATOR_VREGS} of the {_VREG_ENTRIES} "
-            f"vector registers and a step's staging holds {_STAGING_VREGS} more while it runs, so {resident} of "
-            f"them want {resident * _ACCUMULATOR_VREGS + _STAGING_VREGS} registers against the "
-            f"{_VREG_ENTRIES} present, and at most {_RESIDENT_TILES} fit. Walk the tiles outside the reduction "
+            f"Unable to accumulate {resident} output tiles at once in matmul {index}, whose tile loop runs inside "
+            f"its reduction. The register file affords {mapped.resident} of them beside a step's staging, and the "
+            f"emitter has no path that accumulates the rest in VMEM. Walk the tiles outside the reduction "
             f"instead, because per accumulator that is the same additions in the same order and it leaves one "
             f"tile resident however many the product covers."
         )

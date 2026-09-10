@@ -97,8 +97,9 @@ def simulate(*, launch: Launch, reduction: int, build_dir: str | None = None) ->
         if "=== TB_KERNEL_IMAGE PASS ===" not in run.stdout:
             rounds = "\n".join(line for line in run.stdout.splitlines() if "KERNEL_IMAGE_ROUND" in line)
             message = (
-                f"Unable to complete the {rows}x{reduction} by {reduction}x{columns} product. The testbench did not "
-                f"report every round halted.\n{rounds or run.stdout[-2000:]}\n{run.stderr[-2000:]}"
+                f"Unable to complete the {staging.rows}x{reduction} by {reduction}x{staging.columns} product. "
+                f"The testbench did not report every round halted.\n{rounds or run.stdout[-2000:]}\n"
+                f"{run.stderr[-2000:]}"
             )
             raise RuntimeError(message)
         dumped = np.frombuffer((stage / "dump.bin").read_bytes(), dtype="<u2")[:drain_words]

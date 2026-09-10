@@ -97,15 +97,14 @@ class PipelineTest(unittest.TestCase):
 
     def test_the_planned_image_matches_the_hand_written_builder(self) -> None:
         """Asserts a compiled kernel emits the bundle stream `build_looped_gemm` assembles for the same launch."""
-        import asm  # noqa: PLC0415  -- imported here so the path insert above has already run
-        from sim_triton_kernel import generate_gemm_image  # noqa: PLC0415  -- a tool, not a package module
+        from sim_triton_kernel import compile_launch  # noqa: PLC0415  -- a tool, not a package module
 
         _, planned = compile_one(gemm)
         launch = planned.launches[0]
         hand = kernels.build_looped_gemm(launch.column_tiles, launch.groups, activate=launch.activate,
                                          fuse_groups=launch.fuse_groups,
                                          loop_blocks=launch.loop_blocks).image.assemble(pad_to=4)
-        emitted = generate_gemm_image(launch)
+        emitted, _ = compile_launch(launch)
         derived = tuple(int.from_bytes(emitted[at:at + 16], "little") for at in range(0, len(emitted), 16))
         self.assertIsNotNone(renaming_onto(derived, hand))
 
@@ -116,34 +115,34 @@ class PipelineTest(unittest.TestCase):
         other check passes over because the image it compares is still self consistent.
         """
         import dataclasses  # noqa: PLC0415  -- used only here
-        from sim_triton_kernel import generate_gemm_image  # noqa: PLC0415  -- a tool, not a package module
+        from sim_triton_kernel import compile_launch  # noqa: PLC0415  -- a tool, not a package module
 
         # Covers a whole number of two tile blocks, so widening the block stays legal.
         base = dataclasses.replace(compile_one(gemm)[1].launches[0], column_tiles=4)
-        reference = generate_gemm_image(base)
+        reference, _ = compile_launch(base)
         for field, value in (("column_tiles", 8), ("groups", 6), ("loop_blocks", 4),
                              ("fuse_groups", True), ("block_m", 16), ("block_n", 32)):
             with self.subTest(field=field):
-                altered = generate_gemm_image(dataclasses.replace(base, **{field: value}))
+                altered, _ = compile_launch(dataclasses.replace(base, **{field: value}))
                 self.assertNotEqual(altered, reference)
 
     def test_the_launch_count_stays_off_the_image(self) -> None:
         """Asserts `row_blocks` leaves the image alone, since it counts the launches a host issues."""
         import dataclasses  # noqa: PLC0415  -- used only here
-        from sim_triton_kernel import generate_gemm_image  # noqa: PLC0415  -- a tool, not a package module
+        from sim_triton_kernel import compile_launch  # noqa: PLC0415  -- a tool, not a package module
 
         base = dataclasses.replace(compile_one(gemm)[1].launches[0], column_tiles=4)
-        self.assertEqual(generate_gemm_image(dataclasses.replace(base, row_blocks=4)),
-                         generate_gemm_image(base))
+        self.assertEqual(compile_launch(dataclasses.replace(base, row_blocks=4))[0],
+                         compile_launch(base)[0])
 
     def test_a_launch_that_activates_is_refused(self) -> None:
         """Asserts a launch carrying an epilogue raises, since the emitter places the plain product only."""
         import dataclasses  # noqa: PLC0415  -- used only here
-        from sim_triton_kernel import generate_gemm_image  # noqa: PLC0415  -- a tool, not a package module
+        from sim_triton_kernel import compile_launch  # noqa: PLC0415  -- a tool, not a package module
 
         base = compile_one(gemm)[1].launches[0]
         with self.assertRaises(NotImplementedError):
-            generate_gemm_image(dataclasses.replace(base, activate=True))
+            compile_launch(dataclasses.replace(base, activate=True))
 
     def test_a_wide_block_reaches_the_emitter(self) -> None:
         """Asserts the block a kernel names changes the image, rather than being dropped on the way to the emitter.
@@ -153,7 +152,7 @@ class PipelineTest(unittest.TestCase):
         """
         import asm  # noqa: PLC0415  -- imported here so the path insert above has already run
         import emit  # noqa: PLC0415
-        from sim_triton_kernel import generate_gemm_image  # noqa: PLC0415  -- a tool, not a package module
+        from sim_triton_kernel import compile_launch  # noqa: PLC0415  -- a tool, not a package module
 
         launch = compile_one(gemm_wide_columns, dims=({"m": 32},))[1].launches[0]
         self.assertEqual(launch.block_n, 32)
@@ -161,7 +160,7 @@ class PipelineTest(unittest.TestCase):
         narrow = asm.AsmKernel(name="looped_gemm", bundles=emit.looped_gemm_stream(
             column_tiles=launch.column_tiles, groups=launch.groups, loop_blocks=launch.loop_blocks,
             fuse_groups=launch.fuse_groups)[0]).to_bytes(pad_to=4)
-        self.assertNotEqual(generate_gemm_image(launch), narrow)
+        self.assertNotEqual(compile_launch(launch)[0], narrow)
 
     def test_a_wide_block_keeps_an_accumulator_set_per_tile(self) -> None:
         """Asserts a wide block's image names the registers the map lays out for it, which is one set per tile."""

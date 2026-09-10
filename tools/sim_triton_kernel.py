@@ -27,7 +27,6 @@ from bf16 import (  # noqa: E402
     _BLOCK_ACTIVATION_BYTES,
     _BLOCK_WEIGHT_BYTES,
     _ELEMENT_BYTES,
-    _TILE,
     build_operands,
     pack_activations,
     pack_weights,
@@ -35,7 +34,7 @@ from bf16 import (  # noqa: E402
 from compiler import plan, read_program, signature_of, stage  # noqa: E402
 from compiler.compile import Launch  # noqa: E402
 from asm import AsmKernel  # noqa: E402
-from emit import looped_gemm_stream  # noqa: E402
+from emit import Staging, looped_gemm_stream  # noqa: E402
 
 
 @triton.jit
@@ -74,27 +73,27 @@ def matmul_kernel(
             tl.store(output_pointers, accumulator)
 
 
-def generate_gemm_image(launch: Launch) -> bytes:
-    """Returns the GEMM image the emitter generates for one launch, as against the hand-written builder's.
+def compile_launch(launch: Launch) -> tuple[bytes, Staging]:
+    """Returns the image one launch compiles to and what a host stages for it.
 
     Args:
         launch: The launch the planner produced.
 
     Returns:
-        The image bytes, padded to the loader's boundary.
+        The image bytes padded to the loader's boundary, and the staging the emitter placed them from.
 
     Raises:
         NotImplementedError: If the launch activates its staged tiles, which the emitter does not place yet.
     """
     if launch.activate:
         message = (
-            "Unable to generate a launch that activates its staged tiles. The emitter places the staging, the "
+            "Unable to compile a launch that activates its staged tiles. The emitter places the staging, the "
             "matrix commands and the drain only, so such a launch must come from `kernels.build_looped_gemm` "
             "until the activation is placed here too."
         )
         raise NotImplementedError(message)
-    bundles, _ = looped_gemm_stream(**_counts(launch))
-    return AsmKernel(name="looped_gemm", bundles=bundles).to_bytes(pad_to=4)
+    bundles, staging = looped_gemm_stream(**_counts(launch))
+    return AsmKernel(name="looped_gemm", bundles=bundles).to_bytes(pad_to=4), staging
 
 
 def _counts(launch: Launch) -> dict[str, int | bool]:
@@ -135,12 +134,10 @@ def main() -> int:
                    strides={"stride_am": matmul.reduction, "stride_ak": 1, "stride_bk": width, "stride_bn": 1,
                             "stride_cm": width, "stride_cn": 1})
     launch = planned.launches[0]
-    # Takes each shape from the emitter, which settled them placing the image, rather than deriving a second set.
-    _, staging = looped_gemm_stream(**_counts(launch))
+    # Takes each shape from the emitter, which settled them placing this very image.
+    image, staging = compile_launch(launch)
     rows = launch.row_blocks * staging.rows
     columns = staging.columns
-
-    image = generate_gemm_image(launch)
     left, right = stage(*build_operands(rows, matmul.reduction, columns, kind="varying", seed=0),
                         matmul=matmul, launch=launch)
 
@@ -156,7 +153,7 @@ def main() -> int:
     out = _HERE.parent / "build" / "compiled_kernel"
     out.mkdir(parents=True, exist_ok=True)
     (out / "triton_kernel.bin").write_bytes(image)
-    
+
     # Derives every size the launch needs, so the board allocates and reshapes without deriving anything of its
     # own. The slack on each operand is the block the kernel prefetches past the last one.
     np.savez(

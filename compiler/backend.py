@@ -44,7 +44,7 @@ class MinitpuBackend(BaseBackend):
     """Compiles Triton kernels for this machine, stopping at the tt dialect.
 
     Triton declares six abstract methods. Four are empty because this machine adds no dialects, supplies no device
-    specific modules, and runs no stage past the tt dialect. `get_codegen_implementation` is a seventh that BaseBackend 
+    specific modules, and runs no stage past the tt dialect. `get_codegen_implementation` is a seventh that BaseBackend
     does not declare and every backend must still carry: `make_ir` takes its return value as an argument.
     """
 

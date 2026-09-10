@@ -122,13 +122,16 @@ class TileLoop:
 
     Attributes:
         trips: Iterations the loop runs.
-        step: Positions along the output axis one iteration advances, which names the axis it walks.
+        step: Positions along the output axis one iteration advances.
         bound: Position the loop stops at, which is the extent the kernel states.
+        axis: Output axis the loop walks, read from the operand its induction variable addresses, or None when
+            neither operand's address depends on it.
     """
 
     trips: int
     step: int
     bound: int
+    axis: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,9 +368,14 @@ def read_program(kernel: JITFunction, *, signature: dict[str, str],
         epilogue = frozenset() if consumer is None else graph.trace(
             consumer.get_operand(1 if consumer.get_name() == "tt.store" else 0), among=dots)[1]
 
+        pointers = {role: (None if operation is None else operation.get_operand(0))
+                    for role, (operation, _) in (("activation", graph._load_behind(dot.get_operand(0))),
+                                                 ("weight", graph._load_behind(dot.get_operand(1))))}
+
         def walked(among) -> tuple[TileLoop, ...]:
             """Reads each of the given loops as a tile loop, dropping any whose bounds are runtime values."""
-            return tuple(loop for loop in (graph.tile_loop(other) for other in among) if loop is not None)
+            read = (graph.tile_loop(other, axis=graph.axis_of_loop(other, pointers=pointers)) for other in among)
+            return tuple(loop for loop in read if loop is not None)
 
         matmuls.append(MatMul(
             rows=rows, columns=columns, depth=steps[at],
@@ -454,7 +462,7 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
                     raise ProgramError(message)
 
         covered, asked = {}, {}
-        for axis, unit in (("m", _BLOCK_TOKENS), ("n", _TILE), ("k", blocks * _BLOCK_DEPTH)):
+        for axis, unit in (("m", matmul.rows), ("n", _TILE), ("k", blocks * _BLOCK_DEPTH)):
             asked[axis] = _stated_extent(index=index, axis=axis, unit=unit, sources=stated.get(axis, {}))
             covered[axis] = unit * -(-asked[axis] // unit)
             if covered[axis] != asked[axis]:
@@ -463,7 +471,7 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
         _resident_tiles(index=index, matmul=matmul, covered=covered)
 
         launch = Launch(
-            row_blocks=covered["m"] // _BLOCK_TOKENS,
+            row_blocks=covered["m"] // matmul.rows,
             column_tiles=covered["n"] // _TILE,
             groups=covered["k"] // (blocks * _BLOCK_DEPTH),
             loop_blocks=blocks,
@@ -540,6 +548,7 @@ class _Graph:
         _definitions: Defining operation per value.
         _named: Operations grouped by name, in walk order.
         _loop_of_block: Loop owning each body block.
+        _body_of_loop: Body block each loop owns.
         _yield_of_loop: Terminator of each loop body.
         _carried: Value each loop body argument entered the loop holding.
         _resolvers: Expression reader per operation name.
@@ -565,6 +574,7 @@ class _Graph:
                 blocks.setdefault(block.get_parent().id(), block)
 
         self._loop_of_block: dict[int, object] = {}
+        self._body_of_loop: dict[int, object] = {}
         self._yield_of_loop: dict[int, object] = {}
         self._carried: dict[int, object] = {}
         for loop in self.by_name("scf.for"):
@@ -572,6 +582,7 @@ class _Graph:
             if body is None:
                 continue
             self._loop_of_block[body.id()] = loop
+            self._body_of_loop[id(loop)] = body
             for index in range(1, body.get_num_arguments()):
                 # Body argument zero is the induction variable, and argument index carries loop operand two plus
                 # index, which is the value it entered the loop holding.
@@ -610,12 +621,12 @@ class _Graph:
             chain.append(current)
         return chain[::-1]
 
-    def tile_loop(self, loop) -> TileLoop | None:
-        """Returns the trips and step of a loop, or None when any of its three bounds is a runtime value."""
+    def tile_loop(self, loop, *, axis: str | None = None) -> TileLoop | None:
+        """Returns the trips, step and axis of a loop, or None when any of its three bounds is a runtime value."""
         lower, upper, step = (self.constant(loop.get_operand(index)) for index in range(3))
         if lower is None or upper is None or step is None or step <= 0 or upper <= lower:
             return None
-        return TileLoop(trips=-(-(upper - lower) // step), step=step, bound=upper)
+        return TileLoop(trips=-(-(upper - lower) // step), step=step, bound=upper, axis=axis)
 
     def constant(self, value) -> int | None:
         """Returns the value of a constant, or None when it is computed at runtime."""
@@ -626,6 +637,60 @@ class _Graph:
             return defining.get_constant_value()
         except (RuntimeError, ValueError, TypeError):
             return None
+
+    def addresses_with(self, pointer, *, variable) -> bool:
+        """Returns whether one pointer expression depends on the given induction variable.
+
+        A loop walks the axis of whichever operand its variable addresses, which two loops sharing a step still
+        answer differently.
+
+        Args:
+            pointer: The pointer value to walk back from.
+            variable: The loop's induction variable.
+
+        Returns:
+            True when the variable is reached.
+        """
+        wanted = variable.id()
+        seen: set[int] = set()
+        pending = [pointer]
+        while pending:
+            current = pending.pop()
+            key = current.id()
+            if key == wanted:
+                return True
+            if key in seen:
+                continue
+            seen.add(key)
+            if key in self._carried:
+                pending.append(self._carried[key])
+            operation = self._definitions.get(key)
+            if operation is not None:
+                pending.extend(operation.get_operand(index) for index in range(operation.get_num_operands()))
+        return False
+
+    def axis_of_loop(self, loop, *, pointers: dict[str, object]) -> str | None:
+        """Returns the output axis one loop walks, read from which operand's address its variable reaches.
+
+        Args:
+            loop: The loop to name.
+            pointers: The activation's and the weight's pointer values, keyed by role.
+
+        Returns:
+            "m" when the variable addresses the activation, "n" when it addresses the weight, or None when it
+            reaches neither or both.
+        """
+        body = self._body_of_loop.get(id(loop))
+        if body is None or not body.get_num_arguments():
+            return None
+        variable = body.get_argument(0)
+        reached = {role for role, pointer in pointers.items()
+                   if pointer is not None and self.addresses_with(pointer, variable=variable)}
+        if reached == {"activation"}:
+            return "m"
+        if reached == {"weight"}:
+            return "n"
+        return None
 
     def trace(self, value, *, among: list) -> tuple[object | None, frozenset[str]]:
         """Traces a value back to whichever of the given operations produced it.
@@ -970,10 +1035,10 @@ def _machine_tile(*, index: int, matmul: MatMul) -> int:
         ProgramError: If any tile extent is one the array does not compute.
     """
     quantum = _BLOCK_DEPTH * _MINIMUM_LOOP_BLOCKS
-    if matmul.rows != _BLOCK_TOKENS:
+    if matmul.rows < _TILE or matmul.rows % _TILE:
         message = (
-            f"Unable to compute a BLOCK_M of {matmul.rows} in matmul {index}. It must be {_BLOCK_TOKENS}, because "
-            f"the token axis is not a loop the image carries, so one launch covers exactly one block of it."
+            f"Unable to compute a BLOCK_M of {matmul.rows} in matmul {index}. It must be a whole number of "
+            f"{_TILE}, because a token group is as deep as the systolic array."
         )
         raise ProgramError(message)
     # Both the tile width the array fixes and the registers a block needs are the map's to judge, so a block that
@@ -1073,7 +1138,7 @@ def _stated_extent(*, index: int, axis: str, unit: int, sources: dict[str, int])
 
 
 def _tiles_walked(*, index: int, matmul: MatMul) -> dict[str, int]:
-    """Returns the extent each of a matmul's tile loops covers, keyed by the axis its step names.
+    """Returns the extent each of a matmul's tile loops covers, keyed by the axis it walks.
 
     Args:
         index: Position of the matmul in the kernel.
@@ -1085,27 +1150,25 @@ def _tiles_walked(*, index: int, matmul: MatMul) -> dict[str, int]:
         the number the kernel wrote and is padded from there.
 
     Raises:
-        ProgramError: If a loop steps by neither the tile's rows nor its columns, or if two loops walk one axis.
+        ProgramError: If a loop addresses neither operand, or if two loops walk one axis.
     """
-    axis_of = {matmul.rows: "m", matmul.columns: "n"}
     walked: dict[str, int] = {}
     for loop in matmul.tile_loops:
-        axis = axis_of.get(loop.step)
-        if axis is None:
+        if loop.axis is None:
             message = (
-                f"Unable to read the output axis matmul {index} covers from a loop stepping by {loop.step}. It "
-                f"must step by the tile's {matmul.rows} rows or its {matmul.columns} columns, because that is "
-                f"what names the axis it walks."
+                f"Unable to read the output axis matmul {index} covers from a loop stepping by {loop.step}. Its "
+                f"induction variable addresses neither the activation nor the weight alone, and which operand a "
+                f"loop addresses is what names the axis it walks."
             )
             raise ProgramError(message)
-        if axis in walked:
+        if loop.axis in walked:
             message = (
-                f"Unable to read the {axis} extent matmul {index} covers from two loops stepping by {loop.step}. "
-                f"One loop may walk each output axis, because a reader that cannot tell two apart would report "
-                f"one of them as the whole extent."
+                f"Unable to read the {loop.axis} extent matmul {index} covers from two loops walking it. One loop "
+                f"may walk each output axis, because a reader that cannot tell two apart would report one of them "
+                f"as the whole extent."
             )
             raise ProgramError(message)
-        walked[axis] = loop.bound
+        walked[loop.axis] = loop.bound
     return walked
 
 
@@ -1121,12 +1184,13 @@ def _resident_tiles(*, index: int, matmul: MatMul, covered: dict[str, int]) -> N
     Raises:
         ProgramError: If the kernel holds more tiles than the register file has accumulators for.
     """
-    axis_of = {matmul.rows: "m", matmul.columns: "n"}
+    inner = {loop.step: loop.axis for loop in matmul.tile_loops if loop.axis is not None}
     resident = 1
     for step in matmul.steps_inside_reduction:
-        # `read_program` has already refused a nest with more than one loop walking neither axis, so a step here
-        # names one of them, and the tiles it walks are the ones the covered extent holds.
-        resident *= covered[axis_of[step]] // step
+        # Names the step by the loop walking it, which `read_program` read from the operand it addresses.
+        axis = inner.get(step)
+        if axis is not None:
+            resident *= covered[axis] // step
     # Asks the map for a block wide enough to hold them, so what a nest may keep resident and what a block may is
     # the one derivation rather than two.
     mapped = register_map(block_m=matmul.rows, block_n=resident * _TILE)

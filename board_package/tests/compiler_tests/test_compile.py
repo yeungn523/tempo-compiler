@@ -109,6 +109,44 @@ class PipelineTest(unittest.TestCase):
         derived = tuple(int.from_bytes(emitted[at:at + 16], "little") for at in range(0, len(emitted), 16))
         self.assertIsNotNone(renaming_onto(derived, hand))
 
+    def test_a_wide_block_reaches_the_emitter(self) -> None:
+        """Asserts the block a kernel names changes the image, rather than being dropped on the way to the emitter.
+
+        A block covering several tiles emits a body holding all of them, so an image matching the one tile wide
+        block's is the width going missing somewhere between the plan and the emitter.
+        """
+        import asm  # noqa: PLC0415  -- imported here so the path insert above has already run
+        import emit  # noqa: PLC0415
+        from sim_triton_kernel import generate_gemm_image  # noqa: PLC0415  -- a tool, not a package module
+
+        launch = compile_one(gemm_wide_columns, dims=({"m": 32},))[1].launches[0]
+        self.assertEqual(launch.block_n, 32)
+        # Serialised the same way the tool does, so padding cannot make the two differ on its own.
+        narrow = asm.AsmKernel(name="looped_gemm", bundles=emit.looped_gemm_stream(
+            column_tiles=launch.column_tiles, groups=launch.groups, loop_blocks=launch.loop_blocks,
+            fuse_groups=launch.fuse_groups)).to_bytes(pad_to=4)
+        self.assertNotEqual(generate_gemm_image(launch), narrow)
+
+    def test_a_wide_block_keeps_an_accumulator_set_per_tile(self) -> None:
+        """Asserts a wide block's image names the registers the map lays out for it, which is one set per tile."""
+        import asm  # noqa: PLC0415  -- imported here so the path insert above has already run
+        import bf16  # noqa: PLC0415
+        import emit  # noqa: PLC0415
+
+        launch = compile_one(gemm_wide_columns, dims=({"m": 32},))[1].launches[0]
+        words = emit.looped_gemm_stream(column_tiles=launch.column_tiles, groups=launch.groups,
+                                        loop_blocks=launch.loop_blocks, fuse_groups=launch.fuse_groups,
+                                        block_n=launch.block_n)
+        touched: set[int] = set()
+        for word in words:
+            decoded = asm._decode(word)
+            touched |= set(decoded["reads"]) | {register for register, _ in decoded["writes"]}
+        mapped = register_map(block_m=launch.block_m, block_n=launch.block_n)
+        per_tile = mapped.token_groups * bf16._TILE_VREGS
+        self.assertEqual(mapped.resident, 2)
+        self.assertEqual(touched, set(range(mapped.accumulator, mapped.result + bf16._TILE_VREGS)))
+        self.assertEqual(len(touched), mapped.resident * per_tile + per_tile + 2 * bf16._TILE_VREGS)
+
 
 @triton.jit
 def gemm(ap, wp, op, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,

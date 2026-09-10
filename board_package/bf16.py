@@ -320,10 +320,10 @@ def pack_activations(activations: NDArray[np.float32]) -> NDArray[np.uint16]:
         ValueError: If a dimension is not a whole number of blocks.
     """
     tokens, depth = activations.shape
-    if tokens % _BLOCK_TOKENS or depth % _BLOCK_DEPTH:
+    if tokens % _TILE or depth % _BLOCK_DEPTH:
         message = (
             f"Unable to pack an activation array of shape [{tokens},{depth}]. Its rows must be a whole number "
-            f"of {_BLOCK_TOKENS} and its columns a whole number of {_BLOCK_DEPTH}."
+            f"of the {_TILE} a token group holds and its columns a whole number of {_BLOCK_DEPTH}."
         )
         raise ValueError(message)
     words = as_bf16_words(values=activations)

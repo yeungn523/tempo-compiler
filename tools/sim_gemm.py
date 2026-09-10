@@ -70,11 +70,12 @@ def simulate(*, launch: Launch, reduction: int, build_dir: str | None = None) ->
     """
     image = asm.AsmKernel(name="looped_gemm", bundles=emit.looped_gemm_stream(
         column_tiles=launch.column_tiles, groups=launch.groups, loop_blocks=launch.loop_blocks,
-        fuse_groups=launch.fuse_groups, block_n=launch.block_n)).to_bytes(pad_to=4)
-    rows, columns = _BLOCK_TOKENS, launch.column_tiles * _TILE
+        fuse_groups=launch.fuse_groups, block_m=launch.block_m,
+        block_n=launch.block_n)).to_bytes(pad_to=4)
+    rows, columns = launch.block_m, launch.column_tiles * _TILE
     left, right = build_operands(rows, reduction, columns, kind="varying", seed=0)
     partials = 1 if launch.fuse_groups else launch.groups
-    drain_words = _ZERO_TILE_WORDS + launch.column_tiles * partials * _BLOCK_TOKENS * _TILE
+    drain_words = _ZERO_TILE_WORDS + launch.column_tiles * partials * launch.block_m * _TILE
 
     with tempfile.TemporaryDirectory() as staging:
         stage = pathlib.Path(staging)
@@ -103,13 +104,13 @@ def simulate(*, launch: Launch, reduction: int, build_dir: str | None = None) ->
             raise RuntimeError(message)
         dumped = np.frombuffer((stage / "dump.bin").read_bytes(), dtype="<u2")[:drain_words]
 
-    # A block drains its tiles together, so the buffer is blocks by partials by the tiles one block covers, and a
-    # block of one tile is the same buffer with that axis flat.
+    # Reshapes by the blocks a launch covers, since a block drains its tiles together.
     tiles = launch.block_n // _TILE
     drained = from_bf16_words(words=dumped[_ZERO_TILE_WORDS:drain_words])
-    shaped = drained.reshape(launch.column_tiles // tiles, partials, tiles, _BLOCK_TOKENS, _TILE)
-    summed = shaped.sum(axis=1, dtype=np.float32).reshape(launch.column_tiles, _BLOCK_TOKENS, _TILE)
-    product: NDArray[np.float32] = summed.transpose(1, 0, 2).reshape(_BLOCK_TOKENS, launch.column_tiles * _TILE)
+    shaped = drained.reshape(launch.column_tiles // tiles, partials, tiles, launch.block_m, _TILE)
+    summed = shaped.sum(axis=1, dtype=np.float32).reshape(launch.column_tiles, launch.block_m, _TILE)
+    product: NDArray[np.float32] = summed.transpose(1, 0, 2).reshape(launch.block_m,
+                                                                    launch.column_tiles * _TILE)
     expected = (left.astype(np.float64) @ right.astype(np.float64)).astype(np.float32)
     return float(np.abs(product - expected).max() / np.abs(expected).max())
 
@@ -126,16 +127,16 @@ def main() -> int:
     parser.add_argument("--columns", type=int, default=48, help="output columns, a multiple of the tile")
     parser.add_argument("--fuse-groups", action="store_true", help="accumulate the groups on the device")
     parser.add_argument("--loop-blocks", type=int, default=2, help="blocks one group carries")
+    parser.add_argument("--block-m", type=int, default=_BLOCK_TOKENS, help="token rows one block covers")
     parser.add_argument("--block-n", type=int, default=_TILE, help="output columns one block covers")
     parser.add_argument("--build-dir", default=None, help="keep the Verilator build here across runs")
     arguments = parser.parse_args()
 
-    # States the launch outright rather than deriving it, because the dimensions came from a person here. A compiled
-    # kernel passes the launch `plan` settled on instead.
-    launch = Launch(row_blocks=arguments.rows // _BLOCK_TOKENS, column_tiles=arguments.columns // _TILE,
+    # States the launch, since these dimensions came from a person rather than from a plan.
+    launch = Launch(row_blocks=arguments.rows // arguments.block_m, column_tiles=arguments.columns // _TILE,
                     groups=arguments.depth // (arguments.loop_blocks * _BLOCK_DEPTH),
                     loop_blocks=arguments.loop_blocks, activate=False, fuse_groups=arguments.fuse_groups,
-                    block_m=_BLOCK_TOKENS, block_n=arguments.block_n)
+                    block_m=arguments.block_m, block_n=arguments.block_n)
     error = simulate(launch=launch, reduction=arguments.depth, build_dir=arguments.build_dir)
     verdict = "PASS" if error <= _TOLERANCE else "FAIL"
     print(f"{arguments.rows}x{arguments.depth} @ {arguments.depth}x{arguments.columns} "

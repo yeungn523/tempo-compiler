@@ -36,6 +36,7 @@ from bf16 import (  # noqa: E402
     _TOKEN_GROUPS,
     _VMEM_SLOT_STRIDE,
     _ZERO_TILE_BYTES,
+    _ZERO_TILE_WORDS,
 )
 from isa_model import MATRIX_OCCUPANCY, RTL_PARAMS  # noqa: E402
 from layout import RegisterMap, VmemAllocator, register_map  # noqa: E402
@@ -103,6 +104,40 @@ class LoopLevel:
 
     axis: str
     trips: int
+
+
+@dataclass(frozen=True)
+class Staging:
+    """Describes what a host stages for one emitted image and what it reads back.
+
+    The emitter settles these while placing the image, so a host taking them from here states them once rather
+    than deriving a second set that can disagree with the one the bundles were built from.
+
+    Attributes:
+        rows: Token rows one launch covers.
+        columns: Output columns the product covers.
+        output_tiles: Output tiles one block covers, being how the drain groups what it holds.
+        blocks: Blocks the column loop walks, being the output tiles over the tiles one block covers.
+        partials: Partial products each column tile leaves for the host to sum.
+        drain_rows: VMEM rows one drain writes, being the resident tiles the accumulators hold.
+    """
+
+    rows: int
+    columns: int
+    output_tiles: int
+    blocks: int
+    partials: int
+    drain_rows: int
+
+    @property
+    def column_tiles(self) -> int:
+        """Returns the tiles the product covers, being the blocks it walks by the tiles each holds."""
+        return self.blocks * self.output_tiles
+
+    @property
+    def drain_words(self) -> int:
+        """Returns the words a launch drains, including the clearing tile the image leaves at the front."""
+        return _ZERO_TILE_WORDS + self.blocks * self.partials * self.output_tiles * self.rows * _TILE
 
 
 @dataclass(frozen=True)
@@ -242,7 +277,7 @@ def resident_tiles(*, nest: tuple[LoopLevel, ...]) -> int:
     return tiles
 
 
-def emit_gemm_step(*, activation_row: int, weight_row: int, close_loop: bool,
+def gemm_step(*, activation_row: int, weight_row: int, close_loop: bool,
                    registers: RegisterMap | None = None, tile: int = 0) -> dict[int, dict[str, int]]:
     """Returns one accumulation step's bundles, keyed by their offset from the step's first bundle.
 
@@ -291,7 +326,7 @@ def emit_gemm_step(*, activation_row: int, weight_row: int, close_loop: bool,
     return bundles
 
 
-def step_stream(*, activation_row: int, weight_row: int, close_loop: bool) -> tuple[int, ...]:
+def gemm_step_stream(*, activation_row: int, weight_row: int, close_loop: bool) -> tuple[int, ...]:
     """Returns one accumulation step as the contiguous bundle words it places, zero filling the offsets it leaves.
 
     Args:
@@ -302,12 +337,15 @@ def step_stream(*, activation_row: int, weight_row: int, close_loop: bool) -> tu
     Returns:
         The bundle words, in placement order.
     """
-    return _flatten(emit_gemm_step(activation_row=activation_row, weight_row=weight_row, close_loop=close_loop))
+    return _flatten(gemm_step(activation_row=activation_row, weight_row=weight_row, close_loop=close_loop))
 
 
-def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups: bool = False,
-                     block_m: int = _BLOCK_TOKENS, block_n: int = _TILE) -> dict[int, dict[str, int]]:
-    """Returns the tiled GEMM's bundles, keyed by their offset from the image's first bundle.
+def looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups: bool = False,
+                block_m: int = _BLOCK_TOKENS, block_n: int = _TILE) -> tuple[dict[int, dict[str, int]], Staging]:
+    """Returns the tiled GEMM's bundles and what a host stages for them, both from one derivation.
+
+    The staging comes out of the same register map and block width the bundles are placed from, so the two
+    cannot describe different launches.
 
     Notes:
         Staging is overlapped onto compute by double buffering. A block computes out of one VMEM slot while the
@@ -325,7 +363,7 @@ def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, fuse_g
             activations are staged once for the group rather than once for each tile.
 
     Returns:
-        The image's bundles, keyed by offset, each holding the slot words that bundle issues.
+        The image's bundles, keyed by offset, and the staging a host reads them back with.
 
     Raises:
         ValueError: If a group carries an odd number of blocks, which the two way unroll cannot halve, if the block
@@ -425,11 +463,15 @@ def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, fuse_g
     put(offset=at, f=builder.loop_end())
     at += 1
     put(offset=at, f=builder.halt())
-    return bundles
+    staging = Staging(rows=block_m, columns=column_tiles * _TILE, output_tiles=tiles,
+                      blocks=nest[0].trips, partials=1 if fuse_groups else groups,
+                      drain_rows=registers.resident * registers.token_groups * _TILE)
+    return bundles, staging
 
 
 def looped_gemm_stream(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups: bool = False,
-                       block_m: int = _BLOCK_TOKENS, block_n: int = _TILE) -> tuple[int, ...]:
+                       block_m: int = _BLOCK_TOKENS,
+                       block_n: int = _TILE) -> tuple[tuple[int, ...], Staging]:
     """Returns the tiled GEMM as the contiguous bundle words it places, zero filling the offsets it leaves.
 
     Args:
@@ -441,10 +483,11 @@ def looped_gemm_stream(*, column_tiles: int, groups: int, loop_blocks: int, fuse
         block_n: Output columns one block covers.
 
     Returns:
-        The bundle words, in placement order.
+        The bundle words in placement order, and the staging a host reads them back with.
     """
-    return _flatten(emit_looped_gemm(column_tiles=column_tiles, groups=groups, loop_blocks=loop_blocks,
-                                     fuse_groups=fuse_groups, block_m=block_m, block_n=block_n))
+    bundles, staging = looped_gemm(column_tiles=column_tiles, groups=groups, loop_blocks=loop_blocks,
+                                   fuse_groups=fuse_groups, block_m=block_m, block_n=block_n)
+    return _flatten(bundles), staging
 
 
 def _innermost_staging(*, nest: tuple[LoopLevel, ...], operands: tuple[StagedOperand, ...],
@@ -610,7 +653,7 @@ def _emit_block(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at:
                          operands=operands)
         # Emits one step per output tile, each folding into its own accumulator set.
         for tile in range(registers.output_tiles):
-            step_bundles = emit_gemm_step(activation_row=rows["activation"][step],
+            step_bundles = gemm_step(activation_row=rows["activation"][step],
                                           weight_row=rows["weight"][step] + _TILE * tile,
                                           close_loop=False, registers=registers, tile=tile)
             for offset, slots in step_bundles.items():

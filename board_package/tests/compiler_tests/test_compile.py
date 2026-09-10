@@ -109,6 +109,42 @@ class PipelineTest(unittest.TestCase):
         derived = tuple(int.from_bytes(emitted[at:at + 16], "little") for at in range(0, len(emitted), 16))
         self.assertIsNotNone(renaming_onto(derived, hand))
 
+    def test_every_field_the_image_carries_reaches_it(self) -> None:
+        """Asserts each launch field describing the image changes it, so none is dropped before the emitter.
+
+        A field the emitter never reads leaves the image the plan's own value would have produced, which every
+        other check passes over because the image it compares is still self consistent.
+        """
+        import dataclasses  # noqa: PLC0415  -- used only here
+        from sim_triton_kernel import generate_gemm_image  # noqa: PLC0415  -- a tool, not a package module
+
+        # Covers a whole number of two tile blocks, so widening the block stays legal.
+        base = dataclasses.replace(compile_one(gemm)[1].launches[0], column_tiles=4)
+        reference = generate_gemm_image(base)
+        for field, value in (("column_tiles", 8), ("groups", 6), ("loop_blocks", 4),
+                             ("fuse_groups", True), ("block_m", 16), ("block_n", 32)):
+            with self.subTest(field=field):
+                altered = generate_gemm_image(dataclasses.replace(base, **{field: value}))
+                self.assertNotEqual(altered, reference)
+
+    def test_the_launch_count_stays_off_the_image(self) -> None:
+        """Asserts `row_blocks` leaves the image alone, since it counts the launches a host issues."""
+        import dataclasses  # noqa: PLC0415  -- used only here
+        from sim_triton_kernel import generate_gemm_image  # noqa: PLC0415  -- a tool, not a package module
+
+        base = dataclasses.replace(compile_one(gemm)[1].launches[0], column_tiles=4)
+        self.assertEqual(generate_gemm_image(dataclasses.replace(base, row_blocks=4)),
+                         generate_gemm_image(base))
+
+    def test_a_launch_that_activates_is_refused(self) -> None:
+        """Asserts a launch carrying an epilogue raises, since the emitter places the plain product only."""
+        import dataclasses  # noqa: PLC0415  -- used only here
+        from sim_triton_kernel import generate_gemm_image  # noqa: PLC0415  -- a tool, not a package module
+
+        base = compile_one(gemm)[1].launches[0]
+        with self.assertRaises(NotImplementedError):
+            generate_gemm_image(dataclasses.replace(base, activate=True))
+
     def test_a_wide_block_reaches_the_emitter(self) -> None:
         """Asserts the block a kernel names changes the image, rather than being dropped on the way to the emitter.
 
@@ -124,7 +160,7 @@ class PipelineTest(unittest.TestCase):
         # Serialised the same way the tool does, so padding cannot make the two differ on its own.
         narrow = asm.AsmKernel(name="looped_gemm", bundles=emit.looped_gemm_stream(
             column_tiles=launch.column_tiles, groups=launch.groups, loop_blocks=launch.loop_blocks,
-            fuse_groups=launch.fuse_groups)).to_bytes(pad_to=4)
+            fuse_groups=launch.fuse_groups)[0]).to_bytes(pad_to=4)
         self.assertNotEqual(generate_gemm_image(launch), narrow)
 
     def test_a_wide_block_keeps_an_accumulator_set_per_tile(self) -> None:
@@ -134,9 +170,9 @@ class PipelineTest(unittest.TestCase):
         import emit  # noqa: PLC0415
 
         launch = compile_one(gemm_wide_columns, dims=({"m": 32},))[1].launches[0]
-        words = emit.looped_gemm_stream(column_tiles=launch.column_tiles, groups=launch.groups,
-                                        loop_blocks=launch.loop_blocks, fuse_groups=launch.fuse_groups,
-                                        block_n=launch.block_n)
+        words, _ = emit.looped_gemm_stream(column_tiles=launch.column_tiles, groups=launch.groups,
+                                           loop_blocks=launch.loop_blocks, fuse_groups=launch.fuse_groups,
+                                           block_n=launch.block_n)
         touched: set[int] = set()
         for word in words:
             decoded = asm._decode(word)

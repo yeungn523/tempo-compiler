@@ -68,17 +68,16 @@ def simulate(*, launch: Launch, reduction: int, build_dir: str | None = None) ->
     Raises:
         RuntimeError: If the testbench does not report every round halted.
     """
-    image = asm.AsmKernel(name="looped_gemm", bundles=emit.looped_gemm_stream(
-        column_tiles=launch.column_tiles, groups=launch.groups, loop_blocks=launch.loop_blocks,
-        fuse_groups=launch.fuse_groups, block_m=launch.block_m,
-        block_n=launch.block_n)).to_bytes(pad_to=4)
-    rows, columns = launch.block_m, launch.column_tiles * _TILE
-    left, right = build_operands(rows, reduction, columns, kind="varying", seed=0)
-    partials = 1 if launch.fuse_groups else launch.groups
-    drain_words = _ZERO_TILE_WORDS + launch.column_tiles * partials * launch.block_m * _TILE
+    counts = dict(column_tiles=launch.column_tiles, groups=launch.groups, loop_blocks=launch.loop_blocks,
+                  fuse_groups=launch.fuse_groups, block_m=launch.block_m, block_n=launch.block_n)
+    # Takes every shape from the emitter, which settled them placing the bundles, so this states none of its own.
+    bundles, staging = emit.looped_gemm_stream(**counts)
+    image = asm.AsmKernel(name="looped_gemm", bundles=bundles).to_bytes(pad_to=4)
+    left, right = build_operands(staging.rows, reduction, staging.columns, kind="varying", seed=0)
+    drain_words = staging.drain_words
 
-    with tempfile.TemporaryDirectory() as staging:
-        stage = pathlib.Path(staging)
+    with tempfile.TemporaryDirectory() as scratch:
+        stage = pathlib.Path(scratch)
         (stage / "kernel.bin").write_bytes(image)
         (stage / "arg0.bin").write_bytes(pack_activations(activations=left).tobytes())
         slack = np.zeros(_BLOCK_WEIGHT_BYTES // _ELEMENT_BYTES, dtype="<u2")
@@ -104,13 +103,11 @@ def simulate(*, launch: Launch, reduction: int, build_dir: str | None = None) ->
             raise RuntimeError(message)
         dumped = np.frombuffer((stage / "dump.bin").read_bytes(), dtype="<u2")[:drain_words]
 
-    # Reshapes by the blocks a launch covers, since a block drains its tiles together.
-    tiles = launch.block_n // _TILE
+    # Reshapes by the blocks the emitter walked, since a block drains its tiles together.
     drained = from_bf16_words(words=dumped[_ZERO_TILE_WORDS:drain_words])
-    shaped = drained.reshape(launch.column_tiles // tiles, partials, tiles, launch.block_m, _TILE)
-    summed = shaped.sum(axis=1, dtype=np.float32).reshape(launch.column_tiles, launch.block_m, _TILE)
-    product: NDArray[np.float32] = summed.transpose(1, 0, 2).reshape(launch.block_m,
-                                                                    launch.column_tiles * _TILE)
+    shaped = drained.reshape(staging.blocks, staging.partials, staging.output_tiles, staging.rows, _TILE)
+    summed = shaped.sum(axis=1, dtype=np.float32).reshape(staging.column_tiles, staging.rows, _TILE)
+    product: NDArray[np.float32] = summed.transpose(1, 0, 2).reshape(staging.rows, staging.columns)
     expected = (left.astype(np.float64) @ right.astype(np.float64)).astype(np.float32)
     return float(np.abs(product - expected).max() / np.abs(expected).max())
 

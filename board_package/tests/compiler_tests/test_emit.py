@@ -32,7 +32,7 @@ class EmitterConformanceTest(unittest.TestCase):
     def setUp(self) -> None:
         self.hand = tuple(
             kernels.build_looped_gemm(bf16._STEP_TILES, bf16._TOKEN_GROUPS, activate=False).image.assemble())
-        self.derived = emit.looped_gemm_stream(
+        self.derived, _ = emit.looped_gemm_stream(
             column_tiles=bf16._STEP_TILES, groups=bf16._TOKEN_GROUPS, loop_blocks=bf16._LOOP_BLOCKS)
 
     def test_placement_matches_the_hand_written_image(self) -> None:
@@ -66,7 +66,7 @@ class EmitterSerialisationTest(unittest.TestCase):
                                 name="looped_gemm",
                                 bundles=emit.looped_gemm_stream(
                                     column_tiles=column_tiles, groups=groups, loop_blocks=loop_blocks,
-                                    fuse_groups=fuse_groups)).assemble(pad_to=4)
+                                    fuse_groups=fuse_groups)[0]).assemble(pad_to=4)
                             self.assertIsNotNone(renaming_onto(derived, hand))
 
 
@@ -79,8 +79,8 @@ class EmitterRegisterBudgetTest(unittest.TestCase):
         The emitter takes its bases from the map, so the two agree on which registers a block uses rather than only
         on how many. A base drifting from the map would leave a register named outside its region.
         """
-        words = emit.looped_gemm_stream(column_tiles=bf16._STEP_TILES, groups=bf16._TOKEN_GROUPS,
-                                        loop_blocks=bf16._LOOP_BLOCKS)
+        words, _ = emit.looped_gemm_stream(column_tiles=bf16._STEP_TILES, groups=bf16._TOKEN_GROUPS,
+                                           loop_blocks=bf16._LOOP_BLOCKS)
         touched: set[int] = set()
         for word in words:
             decoded = asm._decode(word)
@@ -94,14 +94,43 @@ class EmitterRegisterBudgetTest(unittest.TestCase):
         self.assertEqual(touched, laid_out)
 
 
+class EmitterHandoverTest(unittest.TestCase):
+    """Holds what the emitter tells a host to stage against what the image it placed actually moves."""
+
+    def test_the_staging_drains_the_rows_the_image_stores(self) -> None:
+        """Asserts the drain rows a host is told to expect are the rows the image's store descriptors move.
+
+        A host stages and reduces from these figures, so one that drifts from the image leaves the two halves
+        describing different launches with nothing between them to disagree.
+        """
+        for counts in (dict(column_tiles=3, groups=3, loop_blocks=2),
+                       dict(column_tiles=4, groups=3, loop_blocks=2, block_n=32),
+                       dict(column_tiles=3, groups=3, loop_blocks=2, block_m=16),
+                       dict(column_tiles=3, groups=3, loop_blocks=2, fuse_groups=True)):
+            with self.subTest(**counts):
+                words, staging = emit.looped_gemm_stream(**counts)
+                stored = {_descriptor_rows(word) for word in words if _stores(word)}
+                self.assertEqual(stored, {staging.drain_rows})
+
+
 class EmitterStagingTest(unittest.TestCase):
     """Covers the staging analysis the emitter places its loads from."""
 
     def test_a_step_places_one_bundle_per_offset(self) -> None:
         """Asserts one GEMM step names no offset twice, since two slots of a kind cannot share a bundle."""
-        step = emit.emit_gemm_step(activation_row=0, weight_row=0, close_loop=False)
+        step = emit.gemm_step(activation_row=0, weight_row=0, close_loop=False)
         for offset, slots in step.items():
             self.assertEqual(len(slots), len(set(slots)), f"offset {offset} names a slot twice")
+
+
+def _stores(word: int) -> bool:
+    """Returns whether one bundle carries a descriptor writing host memory."""
+    return bool(asm._decode(word)["dma"]) and bool((word >> asm._D_SHIFT) >> 35 & 1)
+
+
+def _descriptor_rows(word: int) -> int:
+    """Returns the rows one descriptor moves, which it holds one less than."""
+    return ((word >> asm._D_SHIFT) >> 4 & 0x7F) + 1
 
 
 if __name__ == "__main__":

@@ -25,7 +25,6 @@ import triton.language as tl  # noqa: E402
 
 from bf16 import (  # noqa: E402
     _BLOCK_ACTIVATION_BYTES,
-    _BLOCK_TOKENS,
     _BLOCK_WEIGHT_BYTES,
     _ELEMENT_BYTES,
     _TILE,
@@ -94,10 +93,21 @@ def generate_gemm_image(launch: Launch) -> bytes:
             "until the activation is placed here too."
         )
         raise NotImplementedError(message)
-    bundles = looped_gemm_stream(column_tiles=launch.column_tiles, groups=launch.groups,
-                                 loop_blocks=launch.loop_blocks, fuse_groups=launch.fuse_groups,
-                                 block_m=launch.block_m, block_n=launch.block_n)
+    bundles, _ = looped_gemm_stream(**_counts(launch))
     return AsmKernel(name="looped_gemm", bundles=bundles).to_bytes(pad_to=4)
+
+
+def _counts(launch: Launch) -> dict[str, int | bool]:
+    """Returns the counts the emitter places an image and states its staging from.
+
+    Args:
+        launch: The launch the planner produced.
+
+    Returns:
+        The counts, as the keywords both emitter entry points take.
+    """
+    return dict(column_tiles=launch.column_tiles, groups=launch.groups, loop_blocks=launch.loop_blocks,
+                fuse_groups=launch.fuse_groups, block_m=launch.block_m, block_n=launch.block_n)
 
 
 def main() -> int:
@@ -125,8 +135,10 @@ def main() -> int:
                    strides={"stride_am": matmul.reduction, "stride_ak": 1, "stride_bk": width, "stride_bn": 1,
                             "stride_cm": width, "stride_cn": 1})
     launch = planned.launches[0]
-    rows = launch.row_blocks * _BLOCK_TOKENS
-    columns = launch.column_tiles * _TILE
+    # Takes each shape from the emitter, which settled them placing the image, rather than deriving a second set.
+    _, staging = looped_gemm_stream(**_counts(launch))
+    rows = launch.row_blocks * staging.rows
+    columns = staging.columns
 
     image = generate_gemm_image(launch)
     left, right = stage(*build_operands(rows, matmul.reduction, columns, kind="varying", seed=0),
@@ -137,8 +149,8 @@ def main() -> int:
     # The drain is described by the plan, not derived here: the board reads the same numbers back out of the
     # npz, so a second derivation on this side is a second statement of one fact.
     drain = planned.drains[0]
-    packed_activations = np.stack([pack_activations(activations=left[token : token + _BLOCK_TOKENS])
-                                   for token in range(0, left.shape[0], _BLOCK_TOKENS)])
+    packed_activations = np.stack([pack_activations(activations=left[token : token + staging.rows])
+                                   for token in range(0, left.shape[0], staging.rows)])
     packed_weights = pack_weights(weights=right)
 
     out = _HERE.parent / "build" / "compiled_kernel"

@@ -13,13 +13,11 @@ from dataclasses import dataclass, field
 
 from bf16 import (_BLOCK_DEPTH, _ELEMENT_BYTES, _LOOP_BLOCKS,
                   _MAX_DESCRIPTOR_ROWS, _NUM_LANES, _NUM_SUBLANES, _ROW_BYTES,
-                  _TILE, _VMEM_ENTRIES_PER_LANE)
+                  _TILE, _TILE_VREGS, _VMEM_ENTRIES_PER_LANE)
+from isa_model import PROFILE
 from asm import AGU_SHIFT_W
 
-#: Axes a VREG's four sublanes can walk. The same DMEM layout costs differently
-#: depending on which one an access uses, and that is the whole banking story:
-#: a GEMM walks tokens (stride 1 when packed, conflict-free) while a softmax walks
-#: feature tiles, `tile_stride` rows apart.
+
 TOKEN = "token"
 FEATURE_TILE = "feature_tile"
 
@@ -193,72 +191,42 @@ class Tiled:
                 f"tile_stride={self.tile_stride}{tag})")
 
 
-def choose_loop_blocks(depth: int, *, limit: int = _LOOP_BLOCKS) -> int:
-    """Returns the blocks one accumulation group covers, for a contraction of `depth`.
+@dataclass(frozen=True)
+class RegisterMap:
+    """Holds where each of a GEMM step's operands lives in the vector register file.
 
-    The drain is emitted in pairs, so the count must be even, and a group must tile the contraction exactly, so it
-    must divide the block count.
+    The regions are laid end to end from register zero, so the registers a tiling leaves free are contiguous and the
+    next tiling can claim them. A step stages one output tile's weights and pops one output tile's results at a
+    time, so only the accumulators scale with the block's width.
 
-    Args:
-        depth: The contraction, a whole number of `_BLOCK_DEPTH`.
-        limit: The largest group to consider. A larger group amortises the group loop's prologue over more blocks,
-            so the largest legal one is taken.
-
-    Returns:
-        The blocks per group.
-
-    Raises:
-        LayoutError: If the depth is not a whole number of blocks, or no even count at or below `limit` divides it.
+    Attributes:
+        accumulator: First register of the accumulators, which hold `resident` output tiles.
+        activation: First register of the activation tiles, one per token group.
+        weight: First register of the weight tile the array is loaded from.
+        result: First register a matrix result pops into.
+        token_groups: Token groups one block covers, being its rows over the tile.
+        output_tiles: Output tiles one block covers, being its columns over the tile.
+        resident: Output tiles the accumulators hold in registers. The rest accumulate in VMEM, and zero means every
+            one of them does.
     """
-    if depth <= 0 or depth % _BLOCK_DEPTH:
-        message = (
-            f"Unable to contract over {depth}. One accumulation block is "
-            f"{_BLOCK_DEPTH} deep, so the contraction must be a whole number of "
-            f"them."
-        )
-        raise LayoutError(message)
-    blocks = depth // _BLOCK_DEPTH
-    for candidate in range(limit - limit % 2, 1, -2):
-        if blocks % candidate == 0:
-            return candidate
-    message = (
-        f"Unable to cover a contraction of {depth} -- {blocks} blocks of "
-        f"{_BLOCK_DEPTH} -- in even groups of at most {limit}. The drain is "
-        f"emitted in pairs, so the group must be even, and it must divide the "
-        f"block count. Pad the contraction to a multiple of "
-        f"{2 * _BLOCK_DEPTH}."
-    )
-    raise LayoutError(message)
 
+    accumulator: int
+    activation: int
+    weight: int
+    result: int
+    token_groups: int
+    output_tiles: int
+    resident: int
 
-def rows_per_token(tiles: int) -> int:
-    """Returns the VMEM rows one token owns when its feature tiles land consecutively.
+    @property
+    def used(self) -> int:
+        """Returns the registers the map hands out."""
+        return self.result + _TILE_VREGS
 
-    Rounded up to a power of two, because the AGU reaches a token by shifting the loop index rather than multiplying
-    it. The padding never exceeds `tiles` rows a token and costs nothing to walk.
-
-    Args:
-        tiles: Feature tiles one token's row covers.
-
-    Returns:
-        Rows per token, a power of two at or above `tiles`.
-
-    Raises:
-        LayoutError: If the stride needs a shift wider than the AGU's field.
-    """
-    if tiles < 1:
-        message = f"Unable to lay out {tiles} feature tiles. At least one is needed."
-        raise LayoutError(message)
-    per_token = 1 << (tiles - 1).bit_length()
-    max_shift = (1 << AGU_SHIFT_W) - 1
-    if per_token.bit_length() - 1 > max_shift:
-        message = (
-            f"Unable to walk {per_token} rows per token. The AGU shift field is "
-            f"{AGU_SHIFT_W} bits, so the shift reaches {max_shift} and the stride "
-            f"{1 << max_shift}."
-        )
-        raise LayoutError(message)
-    return per_token
+    @property
+    def spilled(self) -> int:
+        """Returns the output tiles that accumulate in VMEM rather than in registers."""
+        return self.output_tiles - self.resident
 
 
 @dataclass(frozen=True)
@@ -422,3 +390,117 @@ class VmemAllocator:
                     f"boundary does not clear VMEM, so the collision is silent."
                 )
                 raise LayoutError(message)
+
+
+def choose_loop_blocks(depth: int, *, limit: int = _LOOP_BLOCKS) -> int:
+    """Returns the blocks one accumulation group covers, for a contraction of `depth`.
+
+    The drain is emitted in pairs, so the count must be even, and a group must tile the contraction exactly, so it
+    must divide the block count.
+
+    Args:
+        depth: The contraction, a whole number of `_BLOCK_DEPTH`.
+        limit: The largest group to consider. A larger group amortises the group loop's prologue over more blocks,
+            so the largest legal one is taken.
+
+    Returns:
+        The blocks per group.
+
+    Raises:
+        LayoutError: If the depth is not a whole number of blocks, or no even count at or below `limit` divides it.
+    """
+    if depth <= 0 or depth % _BLOCK_DEPTH:
+        message = (
+            f"Unable to contract over {depth}. One accumulation block is "
+            f"{_BLOCK_DEPTH} deep, so the contraction must be a whole number of "
+            f"them."
+        )
+        raise LayoutError(message)
+    blocks = depth // _BLOCK_DEPTH
+    for candidate in range(limit - limit % 2, 1, -2):
+        if blocks % candidate == 0:
+            return candidate
+    message = (
+        f"Unable to cover a contraction of {depth} -- {blocks} blocks of "
+        f"{_BLOCK_DEPTH} -- in even groups of at most {limit}. The drain is "
+        f"emitted in pairs, so the group must be even, and it must divide the "
+        f"block count. Pad the contraction to a multiple of "
+        f"{2 * _BLOCK_DEPTH}."
+    )
+    raise LayoutError(message)
+
+
+def register_map(*, block_m: int, block_n: int) -> RegisterMap:
+    """Returns where a block's operands live in the register file, and how much of it accumulates in registers.
+
+    A step stages one activation set per token group, one weight tile and one result tile, so those are placed first
+    and the registers left over decide how many output tiles accumulate in registers. The rest accumulate in VMEM,
+    which is what a tile larger than the register file costs.
+
+    Args:
+        block_m: Rows one block covers, a whole number of the tile.
+        block_n: Columns one block covers, a whole number of the tile.
+
+    Returns:
+        The map.
+
+    Raises:
+        LayoutError: If either extent is not a positive whole number of tiles, or a step's own staging does not fit
+            in the register file.
+    """
+    for name, extent in (("block_m", block_m), ("block_n", block_n)):
+        if extent < _TILE or extent % _TILE:
+            message = (
+                f"Unable to map a {name} of {extent}. A block covers a whole number of {_TILE} wide tiles, because "
+                f"the systolic array is that wide."
+            )
+            raise LayoutError(message)
+
+    token_groups, output_tiles = block_m // _TILE, block_n // _TILE
+    accumulator = 0
+    per_tile = token_groups * _TILE_VREGS
+    staging = per_tile + _TILE_VREGS + _TILE_VREGS
+    entries = PROFILE["vreg_entry_count"]
+    if staging > entries:
+        message = (
+            f"Unable to stage a block of {block_m} rows: its {token_groups} activation tiles, weight tile and "
+            f"result tile want {staging} of the {entries} registers present. Narrow the block's rows."
+        )
+        raise LayoutError(message)
+    resident = min(output_tiles, (entries - staging) // per_tile)
+
+    activation = accumulator + resident * per_tile
+    weight = activation + per_tile
+    return RegisterMap(accumulator=accumulator, activation=activation, weight=weight,
+                       result=weight + _TILE_VREGS, token_groups=token_groups,
+                       output_tiles=output_tiles, resident=resident)
+
+
+def rows_per_token(tiles: int) -> int:
+    """Returns the VMEM rows one token owns when its feature tiles land consecutively.
+
+    Rounded up to a power of two, because the AGU reaches a token by shifting the loop index rather than multiplying
+    it. The padding never exceeds `tiles` rows a token and costs nothing to walk.
+
+    Args:
+        tiles: Feature tiles one token's row covers.
+
+    Returns:
+        Rows per token, a power of two at or above `tiles`.
+
+    Raises:
+        LayoutError: If the stride needs a shift wider than the AGU's field.
+    """
+    if tiles < 1:
+        message = f"Unable to lay out {tiles} feature tiles. At least one is needed."
+        raise LayoutError(message)
+    per_token = 1 << (tiles - 1).bit_length()
+    max_shift = (1 << AGU_SHIFT_W) - 1
+    if per_token.bit_length() - 1 > max_shift:
+        message = (
+            f"Unable to walk {per_token} rows per token. The AGU shift field is "
+            f"{AGU_SHIFT_W} bits, so the shift reaches {max_shift} and the stride "
+            f"{1 << max_shift}."
+        )
+        raise LayoutError(message)
+    return per_token

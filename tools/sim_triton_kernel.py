@@ -57,16 +57,6 @@ def matmul_kernel(
     BLOCK_K: tl.constexpr = 64,
 ):
     """Multiplies an M by K activation by a K by N weight, one BLOCK_M by BLOCK_N output tile at a time.
-
-    Notes:
-        Walking the output in loops is what puts M and N in the compiled module. Reading either tile from
-        tl.program_id would leave that axis to the launch instead, because a grid dimension is an argument rather
-        than module content. The step of each loop is what names the axis it walks, so the token loop must step by
-        BLOCK_M and the feature loop by BLOCK_N for the reader to tell them apart.
-
-        The vector register file holds 32 registers, of which one block's accumulator, activation and weight tiles
-        claim 24 at BLOCK_M 32 and BLOCK_N 16. A 16 by 16 block claims 16 and a 16 by 32 block claims 28, while a 32
-        by 32 block claims 40, so the shape above is among the largest the file holds.
     """
     offs_k = tl.arange(0, BLOCK_K)
     for block in range(0, M, BLOCK_M):
@@ -84,7 +74,7 @@ def matmul_kernel(
             tl.store(output_pointers, accumulator)
 
 
-def generated_gemm_image(launch: Launch) -> bytes:
+def generate_gemm_image(launch: Launch) -> bytes:
     """Returns the GEMM image the emitter generates for one launch, as against the hand-written builder's.
 
     Args:
@@ -136,7 +126,7 @@ def main() -> int:
     rows = launch.row_blocks * _BLOCK_TOKENS
     columns = launch.column_tiles * matmul.columns
 
-    image = generated_gemm_image(launch)
+    image = generate_gemm_image(launch)
     left, right = stage(*build_operands(rows, matmul.reduction, columns, kind="varying", seed=0),
                         matmul=matmul, launch=launch)
 

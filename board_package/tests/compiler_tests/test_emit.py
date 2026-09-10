@@ -12,7 +12,7 @@ import unittest
 
 # Extends the import path before the imports below resolve, as the package ships its modules beside the tests rather
 # than installing them.
-_HERE: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
+_HERE: pathlib.Path = pathlib.Path(__file__).resolve().parents[2]
 """The root directory of the deployed board package."""
 
 sys.path.insert(0, str(_HERE))
@@ -22,6 +22,7 @@ import asm  # noqa: E402
 import bf16  # noqa: E402
 import emit  # noqa: E402
 import kernels  # noqa: E402
+from layout import register_map  # noqa: E402
 
 
 class EmitterConformanceTest(unittest.TestCase):
@@ -66,6 +67,26 @@ class EmitterSerialisationTest(unittest.TestCase):
                                     column_tiles=column_tiles, groups=groups, loop_blocks=loop_blocks,
                                     fuse_groups=fuse_groups)).to_bytes(pad_to=4)
                             self.assertEqual(derived, hand)
+
+
+class EmitterRegisterBudgetTest(unittest.TestCase):
+    """Holds the emitter's register use to the budget `layout.register_map` derives for the same block."""
+
+    def test_the_emitted_image_touches_the_registers_the_map_budgets(self) -> None:
+        """Asserts the emitted GEMM occupies as many registers as the map allots one block of its shape.
+
+        The map lays its regions end to end while the emitter still names three base constants, so the two agree on
+        how many registers a block needs rather than on which ones it uses. Wiring the emitter to the map is what
+        would let this compare the bases too.
+        """
+        words = emit.looped_gemm_stream(column_tiles=bf16._STEP_TILES, groups=bf16._TOKEN_GROUPS,
+                                        loop_blocks=bf16._LOOP_BLOCKS)
+        touched: set[int] = set()
+        for word in words:
+            decoded = asm._decode(word)
+            touched |= set(decoded["reads"]) | {register for register, _ in decoded["writes"]}
+        mapped = register_map(block_m=bf16._BLOCK_TOKENS, block_n=bf16._TILE)
+        self.assertEqual(len(touched), mapped.used)
 
 
 class EmitterStagingTest(unittest.TestCase):

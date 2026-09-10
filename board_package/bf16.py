@@ -378,6 +378,28 @@ def pack_weights(weights: NDArray[np.float32]) -> NDArray[np.uint16]:
     return np.ascontiguousarray(ordered).reshape(-1)
 
 
+def _reordered(rng: np.random.Generator, count: int) -> NDArray[np.intp] | None:
+    """Returns a permutation of the given positions that moves at least one of them.
+
+    A draw that happens to be the identity would leave the operand unchanged, so the check it feeds would read its
+    own no-op as evidence the operands cannot observe a reordering. Two positions make that a coin flip.
+
+    Args:
+        rng: The generator the permutation is drawn from.
+        count: Positions to permute.
+
+    Returns:
+        The permutation, or None when one position cannot be reordered at all.
+    """
+    if count < 2:
+        return None
+    identity = np.arange(count)
+    order = rng.permutation(count)
+    while np.array_equal(order, identity):
+        order = rng.permutation(count)
+    return order
+
+
 def assert_operands_discriminating(activations: NDArray[np.float32], weights: NDArray[np.float32]) -> None:
     """Rejects an operand pair whose product cannot observe the confusions a tiled GEMM can make.
 
@@ -394,14 +416,19 @@ def assert_operands_discriminating(activations: NDArray[np.float32], weights: ND
     rng = np.random.default_rng(0)
 
     blocks = left.shape[1] // _BLOCK_DEPTH
-    shuffled_blocks = rng.permutation(blocks)
-    by_block = left.reshape(left.shape[0], blocks, _BLOCK_DEPTH)[:, shuffled_blocks, :]
+    candidates = []
+    tokens = _reordered(rng, left.shape[0])
+    if tokens is not None:
+        candidates.append(("tokens", left[tokens] @ right))
+    shuffled_blocks = _reordered(rng, blocks)
+    if shuffled_blocks is not None:
+        by_block = left.reshape(left.shape[0], blocks, _BLOCK_DEPTH)[:, shuffled_blocks, :]
+        candidates.append(("contraction blocks", by_block.reshape(left.shape) @ right))
+    columns = _reordered(rng, right.shape[1])
+    if columns is not None:
+        candidates.append(("output columns", left @ right[:, columns]))
 
-    for axis, product in (
-        ("tokens", left[rng.permutation(left.shape[0])] @ right),
-        ("contraction blocks", by_block.reshape(left.shape) @ right),
-        ("output columns", left @ right[:, rng.permutation(right.shape[1])]),
-    ):
+    for axis, product in candidates:
         if np.array_equal(product, reference):
             message = (
                 f"Unable to use these operands as evidence. Permuting their {axis} leaves the product "

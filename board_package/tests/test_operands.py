@@ -68,17 +68,30 @@ class OperandDiscriminationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "output columns"):
             assert_operands_discriminating(activations=activations, weights=weights)
 
+    def test_two_contraction_blocks_are_accepted(self) -> None:
+        """Verifies that operands are judged on their own content when only two contraction blocks exist.
+
+        Two blocks admit two orderings, so a permutation drawn at random is the identity half the time. The guard
+        then compares an operand against itself, which says nothing about whether a reordering would show.
+        """
+        activations, weights = _varying_operands(depth=2 * _BLOCK_DEPTH)
+        assert_operands_discriminating(activations=activations, weights=weights)
+
     def test_a_whole_number_of_blocks_is_assumed(self) -> None:
         """Verifies that the test depth divides evenly into contraction blocks."""
         self.assertEqual(_DEPTH % _BLOCK_DEPTH, 0)
 
 
-def _varying_operands() -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-    """Returns an activation and weight pair that varies along every axis the guard inspects."""
+def _varying_operands(depth: int = _DEPTH) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    """Returns an activation and weight pair that varies along every axis the guard inspects.
+
+    Args:
+        depth: The contraction the pair shares.
+    """
     generator = np.random.default_rng(0)
     return (
-        _on_bf16_grid(values=generator.standard_normal((_TOKENS, _DEPTH)).astype(np.float32)),
-        _on_bf16_grid(values=generator.standard_normal((_DEPTH, _COLUMNS)).astype(np.float32)),
+        _on_bf16_grid(values=generator.standard_normal((_TOKENS, depth)).astype(np.float32)),
+        _on_bf16_grid(values=generator.standard_normal((depth, _COLUMNS)).astype(np.float32)),
     )
 
 

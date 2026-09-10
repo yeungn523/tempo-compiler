@@ -11,6 +11,7 @@ from numpy.typing import NDArray
 
 from bf16 import _BLOCK_DEPTH, _BLOCK_TOKENS, _TILE, _TILE_VREGS, _TOKEN_GROUPS, _ZERO_TILE_WORDS
 from isa_model import PROFILE
+from layout import LayoutError, register_map
 from triton.runtime import JITFunction
 
 from .frontend import compile_to_ttir
@@ -975,14 +976,25 @@ def _machine_tile(*, index: int, matmul: MatMul) -> int:
         ProgramError: If any tile extent is one the array does not compute.
     """
     quantum = _BLOCK_DEPTH * _MINIMUM_LOOP_BLOCKS
-    for name, asked, wanted, reason in (
-        ("BLOCK_M", matmul.rows, _BLOCK_TOKENS,
-         "a launch block's accumulator holds 8 VREGs, and twice the rows would need 36 of the 32 present"),
-        ("BLOCK_N", matmul.columns, _TILE, "one column tile is as wide as the systolic array"),
-    ):
-        if asked != wanted:
-            message = f"Unable to compute a {name} of {asked} in matmul {index}. It must be {wanted}, because {reason}."
-            raise ProgramError(message)
+    if matmul.rows != _BLOCK_TOKENS:
+        message = (
+            f"Unable to compute a BLOCK_M of {matmul.rows} in matmul {index}. It must be {_BLOCK_TOKENS}, because "
+            f"the token axis is not a loop the image carries, so one launch covers exactly one block of it."
+        )
+        raise ProgramError(message)
+    if matmul.columns < _TILE or matmul.columns % _TILE:
+        message = (
+            f"Unable to compute a BLOCK_N of {matmul.columns} in matmul {index}. It must be a whole number of "
+            f"{_TILE}, because one column tile is as wide as the systolic array."
+        )
+        raise ProgramError(message)
+    # Wider blocks are bounded by the register file rather than by the array, so the map that lays a block out is
+    # what judges them.
+    try:
+        register_map(block_m=matmul.rows, block_n=matmul.columns)
+    except LayoutError as error:
+        message = f"Unable to place matmul {index}'s block of {matmul.rows} by {matmul.columns}. {error}"
+        raise ProgramError(message) from error
 
     if matmul.depth % quantum:
         message = (

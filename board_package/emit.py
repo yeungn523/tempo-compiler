@@ -27,11 +27,7 @@ from bf16 import (  # noqa: E402
     _BLOCK_TOKENS,
     _BLOCK_WEIGHT_BYTES,
     _NUM_SUBLANES,
-    _ROW_ACTIVATION,
     _ROW_BYTES,
-    _ROW_OUTPUT,
-    _ROW_WEIGHT,
-    _ROW_ZERO,
     _STEPS,
     _TILE,
     _TILE_ROWS,
@@ -41,7 +37,7 @@ from bf16 import (  # noqa: E402
     _ZERO_TILE_BYTES,
 )
 from isa_model import MATRIX_OCCUPANCY, RTL_PARAMS  # noqa: E402
-from layout import RegisterMap, register_map  # noqa: E402
+from layout import RegisterMap, VmemAllocator, register_map  # noqa: E402
 
 _REGISTERS: RegisterMap = register_map(block_m=_BLOCK_TOKENS, block_n=_TILE)
 """Where a block's operands live in the register file, which `layout.register_map` derives from its shape.
@@ -82,6 +78,7 @@ The adds hold the result registers the following pop overwrites, so the gap keep
 
 _ZERO_ROWS: int = _TILE
 """Rows the clearing tile occupies, which one descriptor fills before any column tile runs."""
+
 
 _OUTPUT_ROWS: int = _TOKEN_GROUPS * _TILE
 """Rows the resident output tiles occupy, which one descriptor drains."""
@@ -144,18 +141,44 @@ class StagedOperand:
         return self.rows * _ROW_BYTES
 
 
-_ACTIVATION: StagedOperand = StagedOperand(
-    name="activation", axes=frozenset({_REDUCTION_AXIS}), argument=0, dma_slot=0, vmem_rows=_ROW_ACTIVATION,
-    rows=_TOKEN_GROUPS * _TILE, pointer=0)
-"""The left operand, whose address walks the reduction alone because one launch covers one token block."""
+def vmem_map(*, output_tiles: int = 1) -> dict[str, tuple[int, ...]]:
+    """Returns the first VMEM row of every region a launch stages, laid out end to end from row zero.
 
-_WEIGHT: StagedOperand = StagedOperand(
-    name="weight", axes=frozenset({_REDUCTION_AXIS, _COLUMN_AXIS}), argument=1, dma_slot=1, vmem_rows=_ROW_WEIGHT,
-    rows=_TILE, pointer=2)
-"""The right operand, whose address walks both the reduction and the output columns."""
+    Args:
+        output_tiles: Output tiles one block covers, being the weight tiles a step stages and the tiles it drains.
 
-_GEMM_OPERANDS: tuple[StagedOperand, ...] = (_ACTIVATION, _WEIGHT)
-"""Every operand a launch stages, in the order their descriptors issue."""
+    Returns:
+        The clearing tile's row, each step's activation and weight rows, and the output's row.
+    """
+    vmem = VmemAllocator()
+    rows = {"zero": (vmem.region("zero", _ZERO_ROWS).base,)}
+    activation, weight = [], []
+    for step in range(_STEPS):
+        activation.append(vmem.region(f"activation {step}", _TOKEN_GROUPS * _TILE).base)
+        weight.append(vmem.region(f"weight {step}", _TILE * output_tiles).base)
+    rows["activation"] = tuple(activation)
+    rows["weight"] = tuple(weight)
+    rows["output"] = (vmem.region("output", _TOKEN_GROUPS * _TILE * output_tiles).base,)
+    vmem.check_disjoint()
+    return rows
+
+
+def gemm_operands(*, rows: dict[str, tuple[int, ...]]) -> tuple[StagedOperand, ...]:
+    """Returns every operand a launch stages, in the order their descriptors issue.
+
+    Args:
+        rows: Where each region sits, as `vmem_map` laid it out.
+
+    Returns:
+        The activation and the weight.
+    """
+    activation = StagedOperand(
+        name="activation", axes=frozenset({_REDUCTION_AXIS}), argument=0, dma_slot=0,
+        vmem_rows=rows["activation"], rows=_TOKEN_GROUPS * _TILE, pointer=0)
+    weight = StagedOperand(
+        name="weight", axes=frozenset({_REDUCTION_AXIS, _COLUMN_AXIS}), argument=1, dma_slot=1,
+        vmem_rows=rows["weight"], rows=_TILE, pointer=2)
+    return activation, weight
 
 
 def staging_levels(*, nest: tuple[LoopLevel, ...],
@@ -309,7 +332,8 @@ def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int,
     nest = (LoopLevel(axis=_COLUMN_AXIS, trips=column_tiles),
             LoopLevel(axis=_REDUCTION_AXIS, trips=groups),
             LoopLevel(axis=_REDUCTION_AXIS, trips=loop_blocks // 2))
-    staged = _innermost_staging(nest=nest, operands=_GEMM_OPERANDS)
+    rows = vmem_map()
+    staged = _innermost_staging(nest=nest, operands=gemm_operands(rows=rows))
 
     builder = asm_module.AsmBuilder()
     bundles: dict[int, dict[str, int]] = {}
@@ -318,7 +342,7 @@ def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int,
         """Merges slot words into one bundle, so co-issue reads at the call site."""
         bundles.setdefault(offset, {}).update(slots)
 
-    at = _emit_prologue(put=put, builder=builder, at=0)
+    at = _emit_prologue(put=put, builder=builder, at=0, rows=rows, weight=staged[-1])
 
     put(offset=at, f=builder.lbegin(nest[0].trips))
     at += 1
@@ -327,7 +351,7 @@ def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int,
     # Clears the accumulators once per column tile, so they carry every group and the contraction sums in BF16 on
     # the device.
     if fuse_groups:
-        at = _emit_clear(put=put, builder=builder, at=at)
+        at = _emit_clear(put=put, builder=builder, at=at, rows=rows)
 
     put(offset=at, f=builder.lbegin(nest[1].trips))
     at += 1
@@ -343,12 +367,13 @@ def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int,
             put(offset=at, f=builder.flush_slot(mask=3))
             at += 1
     if not fuse_groups:
-        at = _emit_clear(put=put, builder=builder, at=at)
+        at = _emit_clear(put=put, builder=builder, at=at, rows=rows)
 
     put(offset=at, f=builder.lbegin(nest[2].trips))
     at += 1
     for compute_slot in range(2):
-        at = _emit_block(put=put, builder=builder, at=at, compute_slot=compute_slot, operands=staged)
+        at = _emit_block(put=put, builder=builder, at=at, compute_slot=compute_slot, operands=staged,
+                         rows=rows)
     put(offset=at, f=builder.loop_end())
     at += 1
 
@@ -356,11 +381,11 @@ def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int,
     put(offset=at, f=builder.flush_slot(mask=3))
     at += 1
     if not fuse_groups:
-        at = _emit_drain(put=put, builder=builder, at=at)
+        at = _emit_drain(put=put, builder=builder, at=at, rows=rows)
     put(offset=at, f=builder.loop_end())
     at += 1
     if fuse_groups:
-        at = _emit_drain(put=put, builder=builder, at=at)
+        at = _emit_drain(put=put, builder=builder, at=at, rows=rows)
     put(offset=at, f=builder.loop_end())
     at += 1
     put(offset=at, f=builder.halt())
@@ -421,23 +446,24 @@ def _innermost_staging(*, nest: tuple[LoopLevel, ...],
     return levels[len(nest) - 1]
 
 
-def _emit_prologue(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int) -> int:
+def _emit_prologue(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int,
+                   rows: dict[str, tuple[int, ...]], weight: StagedOperand) -> int:
     """Binds the launch arguments and fills the clearing tile, returning the next free offset."""
     put(offset=at, s=builder.smovi(rd=_STRIDE_REGISTER, value=_ROW_BYTES))
     at += 1
     put(offset=at, s=builder.smov_arg(rd=_DRAIN_POINTER, arg=2))
     at += _SCALAR_GAP
-    put(offset=at, d=builder.dma_load(slot=0, vmem_address=_ROW_ZERO, rows=_ZERO_ROWS,
+    put(offset=at, d=builder.dma_load(slot=0, vmem_address=rows["zero"][0], rows=_ZERO_ROWS,
                                       base_sreg=_DRAIN_POINTER, stride_sreg=_STRIDE_REGISTER))
     at += 1
     put(offset=at, f=builder.flush_slot(mask=1))
     at += 1
-    put(offset=at, s=builder.smov_arg(rd=_WEIGHT.pointer, arg=1))
+    put(offset=at, s=builder.smov_arg(rd=weight.pointer, arg=1))
     at += 1
     # Steps the drain pointer past the clearing tile, which is read once and never written.
     put(offset=at, s=builder.saddi(rd=_DRAIN_POINTER, rs=_DRAIN_POINTER, value=_ZERO_TILE_BYTES))
     at += _SCALAR_GAP
-    put(offset=at, s=builder.saddi(rd=_WEIGHT.pointer, rs=_WEIGHT.pointer, value=_BLOCK_WEIGHT_BYTES))
+    put(offset=at, s=builder.saddi(rd=weight.pointer, rs=weight.pointer, value=_BLOCK_WEIGHT_BYTES))
     return at + _SCALAR_GAP
 
 
@@ -489,24 +515,26 @@ def _emit_stage(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at:
     return at
 
 
-def _emit_clear(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int) -> int:
+def _emit_clear(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int,
+                rows: dict[str, tuple[int, ...]]) -> int:
     """Clears the resident output tiles from the clearing tile, returning the next free offset."""
     for group in range(_TOKEN_GROUPS):
         for vreg in range(_TILE_VREGS):
             put(offset=at + _TILE_VREGS * group + vreg,
-                x=builder.vld(vreg=_TILE_VREGS * group + vreg, row=_ROW_ZERO + _NUM_SUBLANES * vreg))
+                x=builder.vld(vreg=_TILE_VREGS * group + vreg, row=rows["zero"][0] + _NUM_SUBLANES * vreg))
     return at + _TOKEN_GROUPS * _TILE_VREGS
 
 
-def _emit_drain(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int) -> int:
+def _emit_drain(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int,
+                rows: dict[str, tuple[int, ...]]) -> int:
     """Stores the resident output tiles and advances the drain pointer past them."""
     for group in range(_TOKEN_GROUPS):
         for vreg in range(_TILE_VREGS):
             put(offset=at + _TILE_VREGS * group + vreg,
                 x=builder.vst(vreg=_TILE_VREGS * group + vreg,
-                              row=_ROW_OUTPUT + _TILE_ROWS * group + _NUM_SUBLANES * vreg))
+                              row=rows["output"][0] + _TILE_ROWS * group + _NUM_SUBLANES * vreg))
     at += _TOKEN_GROUPS * _TILE_VREGS
-    put(offset=at, d=builder.dma_store(slot=0, vmem_address=_ROW_OUTPUT, rows=_OUTPUT_ROWS,
+    put(offset=at, d=builder.dma_store(slot=0, vmem_address=rows["output"][0], rows=_OUTPUT_ROWS,
                                        base_sreg=_DRAIN_POINTER, stride_sreg=_STRIDE_REGISTER))
     at += 1
     put(offset=at, f=builder.flush_slot(mask=1))
@@ -516,7 +544,7 @@ def _emit_drain(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at:
 
 
 def _emit_block(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int, compute_slot: int,
-                operands: tuple[StagedOperand, ...]) -> int:
+                operands: tuple[StagedOperand, ...], rows: dict[str, tuple[int, ...]]) -> int:
     """Emits one block, which accumulates out of `compute_slot` while the next block lands in the other.
 
     Each step's leading flush collects the descriptors issued one step earlier.
@@ -526,7 +554,7 @@ def _emit_block(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at:
         at += 1
         at = _emit_stage(put=put, builder=builder, at=at, step=step, vmem_slot=1 - compute_slot,
                          operands=operands)
-        step_bundles = emit_gemm_step(activation_row=_ROW_ACTIVATION[step], weight_row=_ROW_WEIGHT[step],
+        step_bundles = emit_gemm_step(activation_row=rows["activation"][step], weight_row=rows["weight"][step],
                                       close_loop=False)
         for offset, slots in step_bundles.items():
             put(offset=at + offset, **slots)

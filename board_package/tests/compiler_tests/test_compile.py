@@ -22,7 +22,7 @@ import triton.language as tl  # noqa: E402
 
 import kernels  # noqa: E402
 from compiler import ProgramError, plan, read_program, signature_of  # noqa: E402
-from compiler_tests.renaming import renaming_onto  # noqa: E402
+from compiler_tests.test_layout import renaming_onto  # noqa: E402
 from layout import register_map  # noqa: E402
 
 _OPERANDS: dict[str, str] = {"ap": "*bf16", "wp": "*bf16", "op": "*fp32"}

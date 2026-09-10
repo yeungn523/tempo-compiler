@@ -22,7 +22,7 @@ import asm  # noqa: E402
 import bf16  # noqa: E402
 import emit  # noqa: E402
 import kernels  # noqa: E402
-from compiler_tests.renaming import renaming_onto  # noqa: E402
+from compiler_tests.test_layout import renaming_onto  # noqa: E402
 from layout import register_map  # noqa: E402
 
 
@@ -73,12 +73,11 @@ class EmitterSerialisationTest(unittest.TestCase):
 class EmitterRegisterBudgetTest(unittest.TestCase):
     """Holds the emitter's register use to the budget `layout.register_map` derives for the same block."""
 
-    def test_the_emitted_image_touches_the_registers_the_map_budgets(self) -> None:
-        """Asserts the emitted GEMM occupies as many registers as the map allots one block of its shape.
+    def test_the_emitted_image_touches_the_registers_the_map_lays_out(self) -> None:
+        """Asserts the emitted GEMM names every register the map lays out for its block, and no other.
 
-        The map lays its regions end to end while the emitter still names three base constants, so the two agree on
-        how many registers a block needs rather than on which ones it uses. Wiring the emitter to the map is what
-        would let this compare the bases too.
+        The emitter takes its bases from the map, so the two agree on which registers a block uses rather than only
+        on how many. A base drifting from the map would leave a register named outside its region.
         """
         words = emit.looped_gemm_stream(column_tiles=bf16._STEP_TILES, groups=bf16._TOKEN_GROUPS,
                                         loop_blocks=bf16._LOOP_BLOCKS)
@@ -87,7 +86,12 @@ class EmitterRegisterBudgetTest(unittest.TestCase):
             decoded = asm._decode(word)
             touched |= set(decoded["reads"]) | {register for register, _ in decoded["writes"]}
         mapped = register_map(block_m=bf16._BLOCK_TOKENS, block_n=bf16._TILE)
-        self.assertEqual(len(touched), mapped.used)
+        per_tile = mapped.token_groups * bf16._TILE_VREGS
+        laid_out: set[int] = set()
+        for base, width in ((mapped.accumulator, mapped.resident * per_tile), (mapped.activation, per_tile),
+                            (mapped.weight, bf16._TILE_VREGS), (mapped.result, bf16._TILE_VREGS)):
+            laid_out |= set(range(base, base + width))
+        self.assertEqual(touched, laid_out)
 
 
 class EmitterStagingTest(unittest.TestCase):

@@ -228,6 +228,9 @@ class Launch:
         loop_blocks: Accumulation blocks one group carries.
         activate: Determines whether each staged tile is activated entering the array.
         fuse_groups: Determines whether groups accumulate on the device rather than draining a partial each.
+        block_m: Token rows one block covers, which the emitter lays its registers out for.
+        block_n: Output columns one block covers. A block wider than one tile keeps that many accumulators at
+            once, which `column_tiles` alone cannot say because it counts tiles rather than the blocks holding them.
     """
 
     row_blocks: int
@@ -236,6 +239,8 @@ class Launch:
     loop_blocks: int
     activate: bool
     fuse_groups: bool
+    block_m: int
+    block_n: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -465,6 +470,8 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
             activate=_EPILOGUES[matmul.epilogue] == "gelu",
             # The device sums in BF16, so honouring a float32 accumulator means draining a partial per group.
             fuse_groups=matmul.accumulator != _FUSED_ACCUMULATOR_ELEMENT,
+            block_m=matmul.rows,
+            block_n=matmul.columns,
         )
         partials = 1 if launch.fuse_groups else launch.groups
         launches.append(launch)

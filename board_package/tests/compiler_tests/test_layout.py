@@ -1,4 +1,4 @@
-"""Contains tests for the register file map a block's tiling derives.
+"""Contains tests for the register file map a block's tiling derives, and the renaming check it implies.
 
 The map exists so a tile size larger than the register file costs VMEM traffic rather than a refusal, so the tests
 cover what stays resident as the block grows and what the file cannot stage at all.
@@ -16,6 +16,7 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE / "minitpu_runtime"))
 
+import asm  # noqa: E402
 from isa_model import PROFILE  # noqa: E402
 from layout import LayoutError, register_map  # noqa: E402
 
@@ -59,6 +60,60 @@ class RegisterMapTest(unittest.TestCase):
             with self.subTest(block_m=block_m, block_n=block_n):
                 with self.assertRaises(LayoutError):
                     register_map(block_m=block_m, block_n=block_n)
+
+
+def vmem_row(word: int) -> int | None:
+    """Returns the VMEM row one bundle addresses, or None when it addresses none.
+
+    Args:
+        word: The bundle word to read.
+
+    Returns:
+        The row, taken from the descriptor's address field for a DMA bundle and from the X slot's otherwise.
+    """
+    if (word >> (asm.BUNDLE_BITS - 1)) & 1:
+        return ((word >> asm._D_SHIFT) >> 20) & ((1 << 14) - 1)
+    slot = (word >> asm._X_SHIFT) & ((1 << asm.X_SLOT_W) - 1)
+    return None if not slot else (slot >> 13) & ((1 << 13) - 1)
+
+
+def renaming_onto(derived: tuple[int, ...], hand: tuple[int, ...]) -> dict[int, int] | None:
+    """Returns the register renaming carrying one bundle stream onto another, or None when none does.
+
+    The emitter lays its registers and its VMEM out from `layout` while the hand-written builder names both
+    itself, so the two agree on every slot a bundle occupies and on what it names together, but not on the numbers.
+    One consistent renaming of the registers and one of the rows is what says the difference is only those names.
+
+    Args:
+        derived: The emitted stream.
+        hand: The stream it is held to.
+
+    Returns:
+        The renaming, or None when the streams differ in anything a renaming cannot account for.
+    """
+    if len(derived) != len(hand):
+        return None
+    renaming: dict[int, int] = {}
+    taken: dict[int, int] = {}
+    rows: dict[int, int] = {}
+    for left, right in zip(derived, hand):
+        left_row, right_row = vmem_row(left), vmem_row(right)
+        if (left_row is None) != (right_row is None):
+            return None
+        if left_row is not None and rows.setdefault(left_row, right_row) != right_row:
+            return None
+        first, second = asm._decode(left), asm._decode(right)
+        for field in ("m_op", "f_op", "dma", "port_a", "vmem_cycles", "dma_slot", "flush_mask"):
+            if first[field] != second[field]:
+                return None
+        if len(first["reads"]) != len(second["reads"]) or len(first["writes"]) != len(second["writes"]):
+            return None
+        pairs = list(zip(sorted(first["reads"]), sorted(second["reads"])))
+        pairs += [(a, b) for (a, _), (b, _) in zip(first["writes"], second["writes"])]
+        for source, target in pairs:
+            if renaming.setdefault(source, target) != target or taken.setdefault(target, source) != source:
+                return None
+    return renaming
 
 
 if __name__ == "__main__":

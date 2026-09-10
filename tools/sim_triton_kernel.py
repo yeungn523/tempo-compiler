@@ -95,7 +95,8 @@ def generate_gemm_image(launch: Launch) -> bytes:
         )
         raise NotImplementedError(message)
     bundles = looped_gemm_stream(column_tiles=launch.column_tiles, groups=launch.groups,
-                                 loop_blocks=launch.loop_blocks, fuse_groups=launch.fuse_groups)
+                                 loop_blocks=launch.loop_blocks, fuse_groups=launch.fuse_groups,
+                                 block_n=launch.block_n)
     return AsmKernel(name="looped_gemm", bundles=bundles).to_bytes(pad_to=4)
 
 

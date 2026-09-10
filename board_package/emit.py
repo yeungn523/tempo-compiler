@@ -24,6 +24,7 @@ from dataclasses import dataclass  # noqa: E402
 
 import asm as asm_module  # noqa: E402
 from bf16 import (  # noqa: E402
+    _BLOCK_DEPTH,
     _BLOCK_TOKENS,
     _BLOCK_WEIGHT_BYTES,
     _NUM_SUBLANES,
@@ -39,12 +40,6 @@ from bf16 import (  # noqa: E402
 from isa_model import MATRIX_OCCUPANCY, RTL_PARAMS  # noqa: E402
 from layout import RegisterMap, VmemAllocator, register_map  # noqa: E402
 
-_REGISTERS: RegisterMap = register_map(block_m=_BLOCK_TOKENS, block_n=_TILE)
-"""Where a block's operands live in the register file, which `layout.register_map` derives from its shape.
-
-A block is the one shape the emitter places, so the map is asked once here rather than per step. The accumulators
-it leaves room for bound what a nest may keep resident, since this emitter has no path that accumulates in VMEM.
-"""
 
 _MATLOAD_AT: int = (_TILE_VREGS - 1) + RTL_PARAMS["WB_W_VLD"] + 1
 """Offset the weight load issues at, being the first cycle every weight register has landed.
@@ -125,6 +120,8 @@ class StagedOperand:
         vmem_rows: First VMEM row of the operand's tile, one per step of a block.
         rows: Rows one descriptor moves.
         pointer: Scalar register holding the operand's host address.
+        tiles: Tiles a step stages, each taking its own descriptor because DMEM does not hold them side by side.
+        tile_stride: Bytes between one tile's region in DMEM and the next, which is nothing at a single tile.
     """
 
     name: str
@@ -134,6 +131,8 @@ class StagedOperand:
     vmem_rows: tuple[int, ...]
     rows: int
     pointer: int
+    tiles: int = 1
+    tile_stride: int = 0
 
     @property
     def advance(self) -> int:
@@ -163,11 +162,14 @@ def vmem_map(*, output_tiles: int = 1) -> dict[str, tuple[int, ...]]:
     return rows
 
 
-def gemm_operands(*, rows: dict[str, tuple[int, ...]]) -> tuple[StagedOperand, ...]:
+def gemm_operands(*, rows: dict[str, tuple[int, ...]], output_tiles: int = 1,
+                  tile_stride: int = 0) -> tuple[StagedOperand, ...]:
     """Returns every operand a launch stages, in the order their descriptors issue.
 
     Args:
         rows: Where each region sits, as `vmem_map` laid it out.
+        output_tiles: Output tiles one block covers, being the weight tiles a step stages for it.
+        tile_stride: Bytes between one weight tile's region in DMEM and the next.
 
     Returns:
         The activation and the weight.
@@ -177,7 +179,7 @@ def gemm_operands(*, rows: dict[str, tuple[int, ...]]) -> tuple[StagedOperand, .
         vmem_rows=rows["activation"], rows=_TOKEN_GROUPS * _TILE, pointer=0)
     weight = StagedOperand(
         name="weight", axes=frozenset({_REDUCTION_AXIS, _COLUMN_AXIS}), argument=1, dma_slot=1,
-        vmem_rows=rows["weight"], rows=_TILE, pointer=2)
+        vmem_rows=rows["weight"], rows=_TILE, pointer=2, tiles=output_tiles, tile_stride=tile_stride)
     return activation, weight
 
 
@@ -241,7 +243,8 @@ def resident_tiles(*, nest: tuple[LoopLevel, ...]) -> int:
     return tiles
 
 
-def emit_gemm_step(*, activation_row: int, weight_row: int, close_loop: bool) -> dict[int, dict[str, int]]:
+def emit_gemm_step(*, activation_row: int, weight_row: int, close_loop: bool,
+                   registers: RegisterMap | None = None, tile: int = 0) -> dict[int, dict[str, int]]:
     """Returns one accumulation step's bundles, keyed by their offset from the step's first bundle.
 
     Notes:
@@ -254,10 +257,14 @@ def emit_gemm_step(*, activation_row: int, weight_row: int, close_loop: bool) ->
         activation_row: First VMEM row of this step's activation pair, spanning both token groups.
         weight_row: First VMEM row of this step's weight tile.
         close_loop: Determines whether the step's final accumulate carries the enclosing loop's closing bundle.
+        registers: Where the block's operands live, or None for the one tile wide block.
+        tile: Which of the block's output tiles this step accumulates into, which names its accumulator set.
 
     Returns:
         The step's bundles, keyed by offset, each holding the slot words that bundle issues.
     """
+    if registers is None:
+        registers = register_map(block_m=_BLOCK_TOKENS, block_n=_TILE)
     builder = asm_module.AsmBuilder()
     bundles: dict[int, dict[str, int]] = {}
 
@@ -267,20 +274,21 @@ def emit_gemm_step(*, activation_row: int, weight_row: int, close_loop: bool) ->
 
     for vreg in range(_TILE_VREGS):
         put(offset=vreg,
-            x=builder.vld(vreg=_REGISTERS.weight + vreg, row=weight_row + _NUM_SUBLANES * vreg))
+            x=builder.vld(vreg=registers.weight + vreg, row=weight_row + _NUM_SUBLANES * vreg))
     for vreg in range(_TILE_VREGS):
         put(offset=_TILE_VREGS + vreg,
-            x=builder.vld(vreg=_REGISTERS.activation + vreg, row=activation_row + _NUM_SUBLANES * vreg))
-    put(offset=_MATLOAD_AT, m=builder.vmatload(vreg=_REGISTERS.weight))
+            x=builder.vld(vreg=registers.activation + vreg, row=activation_row + _NUM_SUBLANES * vreg))
+    put(offset=_MATLOAD_AT, m=builder.vmatload(vreg=registers.weight))
 
     def stage_next(*, group: int, vreg: int) -> int | None:
         """Returns the load of the next token group's tile, or None once the last group is staged."""
         if group + 1 >= _TOKEN_GROUPS:
             return None
-        return builder.vld(vreg=_REGISTERS.activation + _TILE_VREGS * (group + 1) + vreg,
+        return builder.vld(vreg=registers.activation + _TILE_VREGS * (group + 1) + vreg,
                            row=activation_row + _TILE_ROWS * (group + 1) + _NUM_SUBLANES * vreg)
 
-    _place_matrix_commands(put=put, builder=builder, stage_next=stage_next, close_loop=close_loop)
+    _place_matrix_commands(put=put, builder=builder, stage_next=stage_next, close_loop=close_loop,
+                           registers=registers, tile=tile)
     return bundles
 
 
@@ -298,8 +306,8 @@ def step_stream(*, activation_row: int, weight_row: int, close_loop: bool) -> tu
     return _flatten(emit_gemm_step(activation_row=activation_row, weight_row=weight_row, close_loop=close_loop))
 
 
-def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int,
-                     fuse_groups: bool = False) -> dict[int, dict[str, int]]:
+def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups: bool = False,
+                     block_n: int = _TILE) -> dict[int, dict[str, int]]:
     """Returns the tiled GEMM's bundles, keyed by their offset from the image's first bundle.
 
     Notes:
@@ -313,14 +321,16 @@ def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int,
         fuse_groups: Determines whether the accumulators stay resident across every group and drain once per
             column tile, summing the contraction on the device in BF16, rather than draining a partial per
             group for the host to sum in float32.
+        block_n: Output columns one block covers. A block spanning several tiles accumulates them together, so its
+            activations are staged once for the group rather than once for each tile.
 
     Returns:
         The image's bundles, keyed by offset, each holding the slot words that bundle issues.
 
     Raises:
-        ValueError: If a group carries an odd number of blocks, which the two way unroll cannot halve, or if the
-            nest holds more output tiles resident than the register map carries, or if it stages an operand
-            anywhere but the innermost loop.
+        ValueError: If a group carries an odd number of blocks, which the two way unroll cannot halve, if the block
+            does not divide the columns the product covers, if the register file does not hold its accumulators, or
+            if the nest stages an operand anywhere but the innermost loop.
     """
     if loop_blocks % 2:
         message = (
@@ -329,11 +339,31 @@ def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int,
         )
         raise ValueError(message)
 
-    nest = (LoopLevel(axis=_COLUMN_AXIS, trips=column_tiles),
+    tiles = block_n // _TILE
+    if block_n < _TILE or block_n % _TILE or column_tiles % tiles:
+        message = (
+            f"Unable to cover {column_tiles} column tiles in blocks of {block_n}. A block is a whole number of "
+            f"{_TILE} wide tiles and the product is a whole number of blocks."
+        )
+        raise ValueError(message)
+    registers = register_map(block_m=_BLOCK_TOKENS, block_n=block_n)
+    if registers.spilled:
+        message = (
+            f"Unable to accumulate a block of {block_n} in registers. The file holds {registers.resident} of its "
+            f"{registers.output_tiles} output tiles, and this emitter has no path that accumulates the rest in VMEM."
+        )
+        raise ValueError(message)
+
+    # The column loop walks blocks rather than tiles, because a block's tiles share the activations staged for it.
+    nest = (LoopLevel(axis=_COLUMN_AXIS, trips=column_tiles // tiles),
             LoopLevel(axis=_REDUCTION_AXIS, trips=groups),
             LoopLevel(axis=_REDUCTION_AXIS, trips=loop_blocks // 2))
-    rows = vmem_map()
-    staged = _innermost_staging(nest=nest, operands=gemm_operands(rows=rows))
+    rows = vmem_map(output_tiles=tiles)
+    # `pack_weights` orders DMEM output tile outermost, so one tile's whole contraction separates it from the
+    # next, and a block reaching several of them walks that far between descriptors.
+    tile_stride = groups * loop_blocks * _BLOCK_DEPTH * _ROW_BYTES
+    staged = _innermost_staging(nest=nest, operands=gemm_operands(rows=rows, output_tiles=tiles,
+                                                                  tile_stride=tile_stride), registers=registers)
 
     builder = asm_module.AsmBuilder()
     bundles: dict[int, dict[str, int]] = {}
@@ -351,7 +381,7 @@ def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int,
     # Clears the accumulators once per column tile, so they carry every group and the contraction sums in BF16 on
     # the device.
     if fuse_groups:
-        at = _emit_clear(put=put, builder=builder, at=at, rows=rows)
+        at = _emit_clear(put=put, builder=builder, at=at, rows=rows, registers=registers)
 
     put(offset=at, f=builder.lbegin(nest[1].trips))
     at += 1
@@ -367,13 +397,13 @@ def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int,
             put(offset=at, f=builder.flush_slot(mask=3))
             at += 1
     if not fuse_groups:
-        at = _emit_clear(put=put, builder=builder, at=at, rows=rows)
+        at = _emit_clear(put=put, builder=builder, at=at, rows=rows, registers=registers)
 
     put(offset=at, f=builder.lbegin(nest[2].trips))
     at += 1
     for compute_slot in range(2):
         at = _emit_block(put=put, builder=builder, at=at, compute_slot=compute_slot, operands=staged,
-                         rows=rows)
+                         rows=rows, registers=registers)
     put(offset=at, f=builder.loop_end())
     at += 1
 
@@ -381,19 +411,26 @@ def emit_looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int,
     put(offset=at, f=builder.flush_slot(mask=3))
     at += 1
     if not fuse_groups:
-        at = _emit_drain(put=put, builder=builder, at=at, rows=rows)
+        at = _emit_drain(put=put, builder=builder, at=at, rows=rows, registers=registers)
     put(offset=at, f=builder.loop_end())
     at += 1
     if fuse_groups:
-        at = _emit_drain(put=put, builder=builder, at=at, rows=rows)
+        at = _emit_drain(put=put, builder=builder, at=at, rows=rows, registers=registers)
+    # One iteration walks the weight pointer through a single tile's contraction, because that is what a step
+    # advances it by. A block covering several tiles consumed all of them, so the rest are stepped over here.
+    for operand in staged:
+        if operand.tiles > 1:
+            skipped = operand.tile_stride * (operand.tiles - 1)
+            put(offset=at, s=builder.saddi(rd=operand.pointer, rs=operand.pointer, value=skipped))
+            at += _SCALAR_GAP
     put(offset=at, f=builder.loop_end())
     at += 1
     put(offset=at, f=builder.halt())
     return bundles
 
 
-def looped_gemm_stream(*, column_tiles: int, groups: int, loop_blocks: int,
-                       fuse_groups: bool = False) -> tuple[int, ...]:
+def looped_gemm_stream(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups: bool = False,
+                       block_n: int = _TILE) -> tuple[int, ...]:
     """Returns the tiled GEMM as the contiguous bundle words it places, zero filling the offsets it leaves.
 
     Args:
@@ -401,16 +438,17 @@ def looped_gemm_stream(*, column_tiles: int, groups: int, loop_blocks: int,
         groups: Reduction groups each column tile accumulates.
         loop_blocks: Accumulation blocks one group carries.
         fuse_groups: Determines whether the accumulators drain once per column tile rather than once per group.
+        block_n: Output columns one block covers.
 
     Returns:
         The bundle words, in placement order.
     """
     return _flatten(emit_looped_gemm(column_tiles=column_tiles, groups=groups, loop_blocks=loop_blocks,
-                                     fuse_groups=fuse_groups))
+                                     fuse_groups=fuse_groups, block_n=block_n))
 
 
-def _innermost_staging(*, nest: tuple[LoopLevel, ...],
-                       operands: tuple[StagedOperand, ...]) -> tuple[StagedOperand, ...]:
+def _innermost_staging(*, nest: tuple[LoopLevel, ...], operands: tuple[StagedOperand, ...],
+                       registers: RegisterMap) -> tuple[StagedOperand, ...]:
     """Returns the operands staged at the innermost loop, refusing a nest this emitter cannot place.
 
     Args:
@@ -424,11 +462,12 @@ def _innermost_staging(*, nest: tuple[LoopLevel, ...],
         ValueError: If the nest holds more output tiles resident than the register map carries, or if it assigns
             an operand to any loop but the innermost one.
     """
+    registers_held = registers.resident
     tiles = resident_tiles(nest=nest)
-    if tiles > _REGISTERS.resident:
+    if tiles > registers_held:
         message = (
             f"Unable to walk a nest holding {tiles} output tiles resident. The register map carries "
-            f"{_REGISTERS.resident}, so a column loop inside the contraction needs an allocator to widen it. "
+            f"{registers_held}, so a column loop inside the contraction needs an allocator to widen it. "
             f"Walk the columns outside the contraction, which holds one tile however many the product covers."
         )
         raise ValueError(message)
@@ -506,45 +545,61 @@ def _emit_stage(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at:
     """
     row = vmem_slot * _VMEM_SLOT_STRIDE
     for operand in operands:
-        put(offset=at, d=builder.dma_load(slot=operand.dma_slot, vmem_address=operand.vmem_rows[step] + row,
-                                          rows=operand.rows, base_sreg=operand.pointer,
-                                          stride_sreg=_STRIDE_REGISTER))
-        at += 1
-        put(offset=at, s=builder.saddi(rd=operand.pointer, rs=operand.pointer, value=operand.advance))
-        at += 1
+        # `pack_weights` lays DMEM out output tile outermost, so a block's tiles sit a whole contraction apart
+        # rather than side by side. Each takes its own descriptor, with the pointer walked to it and back.
+        for tile in range(operand.tiles):
+            if tile:
+                # A slot carries one descriptor, so the previous tile's must land before this one reuses it. Only
+                # this operand's slot is waited on, which leaves the other operand's transfer in flight.
+                put(offset=at, f=builder.flush_slot(mask=1 << operand.dma_slot))
+                at += 1
+            put(offset=at, d=builder.dma_load(slot=operand.dma_slot,
+                                              vmem_address=operand.vmem_rows[step] + row + _TILE * tile,
+                                              rows=operand.rows, base_sreg=operand.pointer,
+                                              stride_sreg=_STRIDE_REGISTER))
+            at += 1
+            walked = operand.tile_stride * (operand.tiles - 1)
+            step_bytes = operand.tile_stride if tile + 1 < operand.tiles else operand.advance - walked
+            put(offset=at, s=builder.saddi(rd=operand.pointer, rs=operand.pointer, value=step_bytes))
+            at += 1
     return at
 
 
 def _emit_clear(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int,
-                rows: dict[str, tuple[int, ...]]) -> int:
+                rows: dict[str, tuple[int, ...]], registers: RegisterMap) -> int:
     """Clears the resident output tiles from the clearing tile, returning the next free offset."""
-    for group in range(_TOKEN_GROUPS):
+    held = registers.resident * _TOKEN_GROUPS
+    for group in range(held):
         for vreg in range(_TILE_VREGS):
             put(offset=at + _TILE_VREGS * group + vreg,
-                x=builder.vld(vreg=_TILE_VREGS * group + vreg, row=rows["zero"][0] + _NUM_SUBLANES * vreg))
-    return at + _TOKEN_GROUPS * _TILE_VREGS
+                x=builder.vld(vreg=registers.accumulator + _TILE_VREGS * group + vreg,
+                              row=rows["zero"][0] + _NUM_SUBLANES * vreg))
+    return at + held * _TILE_VREGS
 
 
 def _emit_drain(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int,
-                rows: dict[str, tuple[int, ...]]) -> int:
+                rows: dict[str, tuple[int, ...]], registers: RegisterMap) -> int:
     """Stores the resident output tiles and advances the drain pointer past them."""
-    for group in range(_TOKEN_GROUPS):
+    held = registers.resident * _TOKEN_GROUPS
+    for group in range(held):
         for vreg in range(_TILE_VREGS):
             put(offset=at + _TILE_VREGS * group + vreg,
-                x=builder.vst(vreg=_TILE_VREGS * group + vreg,
+                x=builder.vst(vreg=registers.accumulator + _TILE_VREGS * group + vreg,
                               row=rows["output"][0] + _TILE_ROWS * group + _NUM_SUBLANES * vreg))
-    at += _TOKEN_GROUPS * _TILE_VREGS
-    put(offset=at, d=builder.dma_store(slot=0, vmem_address=rows["output"][0], rows=_OUTPUT_ROWS,
+    at += held * _TILE_VREGS
+    drained = held * _TILE
+    put(offset=at, d=builder.dma_store(slot=0, vmem_address=rows["output"][0], rows=drained,
                                        base_sreg=_DRAIN_POINTER, stride_sreg=_STRIDE_REGISTER))
     at += 1
     put(offset=at, f=builder.flush_slot(mask=1))
     at += 1
-    put(offset=at, s=builder.saddi(rd=_DRAIN_POINTER, rs=_DRAIN_POINTER, value=_OUTPUT_ROWS * _ROW_BYTES))
+    put(offset=at, s=builder.saddi(rd=_DRAIN_POINTER, rs=_DRAIN_POINTER, value=drained * _ROW_BYTES))
     return at + 1
 
 
 def _emit_block(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int, compute_slot: int,
-                operands: tuple[StagedOperand, ...], rows: dict[str, tuple[int, ...]]) -> int:
+                operands: tuple[StagedOperand, ...], rows: dict[str, tuple[int, ...]],
+                registers: RegisterMap) -> int:
     """Emits one block, which accumulates out of `compute_slot` while the next block lands in the other.
 
     Each step's leading flush collects the descriptors issued one step earlier.
@@ -554,17 +609,22 @@ def _emit_block(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at:
         at += 1
         at = _emit_stage(put=put, builder=builder, at=at, step=step, vmem_slot=1 - compute_slot,
                          operands=operands)
-        step_bundles = emit_gemm_step(activation_row=rows["activation"][step], weight_row=rows["weight"][step],
-                                      close_loop=False)
-        for offset, slots in step_bundles.items():
-            put(offset=at + offset, **slots)
-        at += max(step_bundles) + 1
+        # One step per output tile the block covers, each reading its own weight tile out of the bank staged for
+        # this step and folding into its own accumulator set.
+        for tile in range(registers.output_tiles):
+            step_bundles = emit_gemm_step(activation_row=rows["activation"][step],
+                                          weight_row=rows["weight"][step] + _TILE * tile,
+                                          close_loop=False, registers=registers, tile=tile)
+            for offset, slots in step_bundles.items():
+                put(offset=at + offset, **slots)
+            at += max(step_bundles) + 1
     put(offset=at, f=builder.vmemswap())
     return at + 1
 
 
 def _place_matrix_commands(*, put: Callable[..., None], builder: asm_module.AsmBuilder,
-                           stage_next: Callable[..., int | None], close_loop: bool) -> None:
+                           stage_next: Callable[..., int | None], close_loop: bool,
+                           registers: RegisterMap, tile: int) -> None:
     """Places every push, pop and accumulate of one step, greedily against the matrix output FIFO's depth.
 
     Args:
@@ -572,7 +632,10 @@ def _place_matrix_commands(*, put: Callable[..., None], builder: asm_module.AsmB
         builder: Encodes each slot word.
         stage_next: Returns the load riding under one push, or None where there is nothing left to stage.
         close_loop: Determines whether the final accumulate carries the enclosing loop's closing bundle.
+        registers: Where the block's operands live.
+        tile: Which of the block's output tiles the accumulates fold into.
     """
+    accumulator_base = registers.accumulator + tile * registers.token_groups * _TILE_VREGS
     depth, per_push, per_pop = asm_module.mxu_output_fifo()
     at = _PUSH_AT
     outstanding = 0
@@ -586,8 +649,8 @@ def _place_matrix_commands(*, put: Callable[..., None], builder: asm_module.AsmB
             return
         last = pending == _TOKEN_GROUPS - 1
         for vreg in range(_TILE_VREGS):
-            accumulator = _REGISTERS.accumulator + _TILE_VREGS * pending + vreg
-            put(offset=at, e=builder.vadd(vd=accumulator, va=accumulator, vb=_REGISTERS.result + vreg))
+            accumulator = accumulator_base + _TILE_VREGS * pending + vreg
+            put(offset=at, e=builder.vadd(vd=accumulator, va=accumulator, vb=registers.result + vreg))
             if close_loop and last and vreg == _TILE_VREGS - 1:
                 put(offset=at, f=builder.loop_end())
             at += 1
@@ -602,7 +665,7 @@ def _place_matrix_commands(*, put: Callable[..., None], builder: asm_module.AsmB
         if vreg == 0:
             # The adds read the result registers this pop is about to overwrite.
             flush_accumulate()
-        put(offset=at, m=builder.vmatpop(vreg=_REGISTERS.result + vreg))
+        put(offset=at, m=builder.vmatpop(vreg=registers.result + vreg))
         at += _POP_II
         outstanding -= per_pop
         popped += 1
@@ -613,7 +676,7 @@ def _place_matrix_commands(*, put: Callable[..., None], builder: asm_module.AsmB
         for vreg in range(_TILE_VREGS):
             while outstanding + per_push > depth:
                 drain_one()
-            slots = {"m": builder.vmatpush(vreg=_REGISTERS.activation + _TILE_VREGS * group + vreg)}
+            slots = {"m": builder.vmatpush(vreg=registers.activation + _TILE_VREGS * group + vreg)}
             staged = stage_next(group=group, vreg=vreg)
             if staged is not None:
                 slots["x"] = staged

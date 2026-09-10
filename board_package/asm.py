@@ -684,12 +684,13 @@ def schedule(words: list[int]) -> list[int]:
         The stream carrying legal delays, which is longer than the input where fillers were needed.
 
     Raises:
-        ValueError: If a bundle co-issues two port-A consumers, a vmatpush overflows the MXU output FIFO, or the
-            delay fixpoint fails to converge.
+        ValueError: If a bundle co-issues two port-A consumers, a vmatpush overflows the MXU output FIFO, a
+            descriptor reuses a slot another still holds, or the delay fixpoint fails to converge.
     """
     _check_port_a_exclusive(words=words)
     _check_matrix_fifo(words=words)
     _check_flush_slots(words=words)
+    _check_slot_reuse(words=words)
     out = list(words)
     for _ in range(256):
         ready: dict[int, int] = {}
@@ -1314,6 +1315,40 @@ def _check_flush_slots(words: list[int]) -> None:
                 f"wedged until the PL is reprogrammed. Flush the mask the kernel actually issued."
             )
             raise ValueError(message)
+
+
+def _check_slot_reuse(words: list[int]) -> None:
+    """Raises when a descriptor reuses a slot the previous one has not been flushed from.
+
+    Notes:
+        A slot carries one descriptor. Issuing a second before a flush covers the first leaves the device waiting on
+        a done bit that never settles, which is the same wedge a flush on an unused slot causes and is just as
+        silent.
+
+    Args:
+        words: The bundle stream to check, in program order.
+
+    Raises:
+        ValueError: If a descriptor issues on a slot another still occupies.
+    """
+    occupied: dict[int, int] = {}
+    for index, word in enumerate(words):
+        decoded = _decode(word)
+        for slot in range(DMA_SLOT_COUNT):
+            if decoded["flush_mask"] >> slot & 1:
+                occupied.pop(slot, None)
+        if not decoded["dma"]:
+            continue
+        slot = decoded["dma_slot"]
+        if slot in occupied:
+            message = (
+                f"Unable to schedule bundle {index}, whose descriptor issues on DMA slot {slot} while the one "
+                f"bundle {occupied[slot]} issued still holds it. A slot carries one descriptor, so the device "
+                f"waits on a done bit that never settles and stays wedged until the PL is reprogrammed. Flush "
+                f"the slot between them."
+            )
+            raise ValueError(message)
+        occupied[slot] = index
 
 
 def _check_port_a_exclusive(words: list[int]) -> None:

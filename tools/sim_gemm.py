@@ -70,7 +70,7 @@ def simulate(*, launch: Launch, reduction: int, build_dir: str | None = None) ->
     """
     image = asm.AsmKernel(name="looped_gemm", bundles=emit.looped_gemm_stream(
         column_tiles=launch.column_tiles, groups=launch.groups, loop_blocks=launch.loop_blocks,
-        fuse_groups=launch.fuse_groups)).to_bytes(pad_to=4)
+        fuse_groups=launch.fuse_groups, block_n=launch.block_n)).to_bytes(pad_to=4)
     rows, columns = _BLOCK_TOKENS, launch.column_tiles * _TILE
     left, right = build_operands(rows, reduction, columns, kind="varying", seed=0)
     partials = 1 if launch.fuse_groups else launch.groups
@@ -103,8 +103,12 @@ def simulate(*, launch: Launch, reduction: int, build_dir: str | None = None) ->
             raise RuntimeError(message)
         dumped = np.frombuffer((stage / "dump.bin").read_bytes(), dtype="<u2")[:drain_words]
 
+    # A block drains its tiles together, so the buffer is blocks by partials by the tiles one block covers, and a
+    # block of one tile is the same buffer with that axis flat.
+    tiles = launch.block_n // _TILE
     drained = from_bf16_words(words=dumped[_ZERO_TILE_WORDS:drain_words])
-    summed = drained.reshape(launch.column_tiles, partials, _BLOCK_TOKENS, _TILE).sum(axis=1, dtype=np.float32)
+    shaped = drained.reshape(launch.column_tiles // tiles, partials, tiles, _BLOCK_TOKENS, _TILE)
+    summed = shaped.sum(axis=1, dtype=np.float32).reshape(launch.column_tiles, _BLOCK_TOKENS, _TILE)
     product: NDArray[np.float32] = summed.transpose(1, 0, 2).reshape(_BLOCK_TOKENS, launch.column_tiles * _TILE)
     expected = (left.astype(np.float64) @ right.astype(np.float64)).astype(np.float32)
     return float(np.abs(product - expected).max() / np.abs(expected).max())

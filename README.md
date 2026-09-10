@@ -1,10 +1,6 @@
 # minitpu-compiler
 
 Compiler stack for GPT-2 small
-
-![Triton](https://img.shields.io/badge/Triton-3.8.0-orange)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-
 ___
 
 ## Detailed Description
@@ -41,7 +37,7 @@ ___
 This repository runs from a checkout rather than from an installed distribution, so each dependency below is installed
 by hand. Only the first is needed to compile a kernel.
 
-- [Triton](https://triton-lang.org/) 3.8 
+- [Triton](https://triton-lang.org/) 3.8.0 
 - [LLVM](https://llvm.org/) 17 through 20, supplying the `llvm-tblgen` that `tools/gen_isa_doc.py` reads
   `compiler/minitpuisa.td` through.
 - A checkout carrying the RTL and its testbench, which `tools/sim_gemm.py` drives.

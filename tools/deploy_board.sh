@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Deploy the board package and program the PL, with the copies gated on md5.
 #
-#   tools/deploy_board.sh 187 [--program]
+#   tools/deploy_board.sh <account> 187 [--program]
+#
+# The account is the caller's own login on the board, which the board authorises
+# a key for. It is not baked in, because each board carries its own accounts.
 #
 # The md5 gate is not ceremony: `tar | ssh` once reported success while writing
 # zero-byte files, and every board check passed against the stale copies that were
@@ -9,9 +12,10 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IP="132.236.59.${1:?usage: deploy_board.sh <last-octet> [--program]}"
-PROGRAM="${2:-}"
-REMOTE=/home/petalinux/board_package
+ACCOUNT="${1:?usage: deploy_board.sh <account> <last-octet> [--program]}"
+IP="132.236.59.${2:?usage: deploy_board.sh <account> <last-octet> [--program]}"
+PROGRAM="${3:-}"
+REMOTE=/home/$ACCOUNT/board_package
 
 # Where a repository path lands on the board. Package files keep their tree so
 # `minitpu_runtime/runtime/launch.py` stays importable; a tool is a flat script.
@@ -49,14 +53,14 @@ while IFS= read -r f; do FILES+=("$f"); done < <(
 
 echo "deploying $((${#FILES[@]})) files to $IP"
 for f in "${FILES[@]}"; do
-  scp -q -o BatchMode=yes "$HERE/$f" "petalinux@$IP:$REMOTE/$(remote_of "$f")"
+  scp -q -o BatchMode=yes "$HERE/$f" "$ACCOUNT@$IP:$REMOTE/$(remote_of "$f")"
 done
 
 echo "verifying"
 FAIL=0
 for f in "${FILES[@]}"; do
   want=$(md5sum "$HERE/$f" | cut -d' ' -f1)
-  got=$(ssh -o BatchMode=yes "petalinux@$IP" "md5sum $REMOTE/$(remote_of "$f") 2>/dev/null | cut -d' ' -f1")
+  got=$(ssh -o BatchMode=yes "$ACCOUNT@$IP" "md5sum $REMOTE/$(remote_of "$f") 2>/dev/null | cut -d' ' -f1")
   if [ "$want" != "$got" ]; then echo "  MISMATCH $(remote_of "$f")"; FAIL=1; fi
 done
 [ "$FAIL" -eq 0 ] || { echo "deploy FAILED"; exit 1; }
@@ -71,6 +75,6 @@ if [ "$PROGRAM" = "--program" ]; then
   PW="$(awk 'NR==2 {print $NF}' "$HERE/board.cred" | tr -d '`"'"'")"
 
   echo "programming the PL"
-  printf '%s\n' "$PW" | ssh -o BatchMode=yes "petalinux@$IP" \
+  printf '%s\n' "$PW" | ssh -o BatchMode=yes "$ACCOUNT@$IP" \
     "cd $REMOTE && sudo -S -p '' ./minitpu/scripts/program_pl.sh" 2>&1 | tail -4
 fi

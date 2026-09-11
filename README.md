@@ -7,10 +7,10 @@ ___
 
 This repository lowers Triton kernels onto the MINITPU, a 16 by 16 BF16 systolic array synthesized on a ZCU104. The
 frontend runs Triton's own pipeline down to the tt dialect, the planner reads that printed module back into a launch
-description, and the emitter turns the description into the 128 bit VLIW bundles the board fetches. Every generated
-artifact derives from `compiler/minitpuisa.td`, which states the implemented scheduling contract, and `board_package/`
-carries the assembler, the kernels, and the runtime that launches them on hardware. Nothing registers the backend with
-Triton, because `compiler/frontend.py` constructs it directly and drives `make_ir` itself.
+description, and the emitter turns it into the 128 bit VLIW bundles the board fetches. Every generated artifact derives
+from `compiler/minitpuisa.td`, which states the implemented scheduling contract, and `board_package/` carries the
+assembler, the kernels, and the runtime that launches them. Nothing registers the backend with Triton:
+`compiler/frontend.py` constructs it directly and drives `make_ir` itself.
 
 ## Table of Contents
 
@@ -21,12 +21,10 @@ Triton, because `compiler/frontend.py` constructs it directly and drives `make_i
   - [The RTL Checkout](#the-rtl-checkout)
 - [Usage](#usage)
   - [Entry Points](#entry-points)
-  - [Compiling a Kernel](#compiling-a-kernel)
-  - [Simulating Against the RTL](#simulating-against-the-rtl)
+  - [Compiling and Checking a Kernel](#compiling-and-checking-a-kernel)
   - [Regenerating the ISA Artifacts](#regenerating-the-isa-artifacts)
   - [Deploying to the Board](#deploying-to-the-board)
   - [Running the Tests](#running-the-tests)
-- [API Documentation](#api-documentation)
 - [Authors](#authors)
 - [License](#license)
 
@@ -95,51 +93,36 @@ ___
 Every tool extends `sys.path` to reach `compiler/`, `board_package/`, and `board_package/minitpu_runtime/` on its own,
 so each one runs from the repository root with no `PYTHONPATH` export.
 
-| Entry point                            | Runs on | Purpose                                                          |
-|----------------------------------------|---------|------------------------------------------------------------------|
-| `kernel_entry_point.py`                | Host    | Reads any Triton kernel into the compiler and prints its plan    |
-| `tools/sim_triton_kernel.py`           | Host    | Compiles the Triton matmul and copies it to a board              |
-| `tools/sim_gemm.py`                    | Host    | Runs an emitted GEMM image against the RTL and reports its error |
-| `tools/gen_isa_doc.py`                 | Host    | Regenerates or checks every artifact derived from the ISA source |
-| `tools/deploy_board.sh`                | Host    | Copies the board package over an md5 gate and programs the PL    |
-| `board_package/Makefile`               | Board   | The documented board interface, listed by `make help`            |
-| `board_package/run_compiled_kernel.py` | Board   | Launches the compiled image and checks its product               |
-| `board_package/run_example_kernel.py`  | Board   | Assembles and runs the editable hand-written example program     |
-| `board_package/gpt2_kernels.py`        | Board   | The sixteen board checks, also reachable as `make kernels`       |
+| Entry point             | Purpose                                                                          |
+|-------------------------|----------------------------------------------------------------------------------|
+| `kernel_entry_point.py` | Reads any Triton kernel into the compiler and emits its image                    |
+| `sample_gemm.py`        | Holds the GEMM kernel the compiler is exercised against, and writes its operands |
+| `tools/sim_gemm.py`     | Runs an emitted GEMM image against the RTL and reports its error                 |
+| `tools/gen_isa_doc.py`  | Regenerates or checks every artifact derived from the ISA source                 |
 
-### Compiling a Kernel
+### Compiling and Checking a Kernel
 
 ```sh
-python3 tools/sim_triton_kernel.py
-```
-
-This compiles the `matmul_kernel` defined at the top of that file, writes `triton_kernel.bin` and
-`triton_operands.npz` into `build/compiled_kernel/`, and copies both to the board over `scp`. It prints the bundle
-count, the shape the module states, and the launch the planner settled on, then names the command that runs the image.
-The copy step needs a key the board has authorized, and the image stays in `build/compiled_kernel/` when that copy
-fails.
-
-```sh
-python3 kernel_entry_point.py --kernel my_kernels.py:matmul_kernel \
+python3 sample_gemm.py build/e2e
+python3 kernel_entry_point.py --kernel sample_gemm.py:matmul_kernel \
     --operands activation_pointer=*bf16,weight_pointer=*bf16,output_pointer=*fp32 \
-    --strides stride_am=192,stride_ak=1,stride_bk=48,stride_bn=1,stride_cm=48,stride_cn=1
+    --output build/e2e --activations build/e2e/activations.npy --weights build/e2e/weights.npy
+python3 tools/sim_gemm.py --image build/e2e/matmul_0.bin --operands build/e2e/matmul_0_operands.npz
 ```
 
-This hands a kernel declared in any file to the frontend and the planner, printing the matmuls the reader recovered,
-the launch each one becomes, and every axis the plan pads or operand it repacks. `--operands` says which parameters a
-buffer is passed for and `--strides` says what each stride is worth, both being facts a call site holds rather than the
-module. The constexpr parameters hold the defaults the kernel declares until `--constexprs` states otherwise, and
-`--dims` states an axis the module leaves open, such as one the grid carries.
+These three carry one kernel from its Triton declaration through the reader, the planner and the emitter, run the
+image they produce against the RTL, and compare the drained product against a float64 reference. The last line reports
+the relative error and exits non-zero past the tolerance the BF16 accumulate chain allows, so the sequence stands as a
+check rather than a demonstration.
 
-### Simulating Against the RTL
+The middle line writes `matmul_0.bin` and `matmul_0_operands.npz`, one pair per matmul the reader recovered, and
+prints every axis the plan pads and every operand it repacks. `--operands` says which parameters a buffer is passed
+for, which Triton has no syntax for a kernel to state. A kernel declaring its extents and strides as `tl.constexpr`
+states the rest itself, and `--dims`, `--constexprs` and `--strides` bind whichever of them it leaves open.
 
-```sh
-python3 tools/sim_gemm.py --rows 32 --depth 192 --columns 48
-```
-
-This emits the image one launch describes, runs it through the RTL testbench, and compares the drained product against
-a float64 reference. `--fuse-groups` accumulates the groups on the device, `--loop-blocks` and `--block-n` change the
-shape one block covers, and `--build-dir` keeps the simulation build across runs, which is what makes a sweep cheap.
+`tools/sim_gemm.py` also emits an image from dimensions alone, through `--rows`, `--depth` and `--columns`, which
+checks the emitter without a kernel in front of it. `--build-dir` keeps the simulation build across runs, which is
+what makes a sweep cheap.
 
 ### Regenerating the ISA Artifacts
 
@@ -157,13 +140,14 @@ artifact, and run `--write` after a fresh clone, because `docs/` is untracked.
 ### Deploying to the Board
 
 ```sh
-tools/deploy_board.sh 187
-tools/deploy_board.sh 187 --program
+tools/deploy_board.sh <netid> 187
+tools/deploy_board.sh <netid> 187 --program
 ```
 
-The argument is the last octet of the board's address. Every file is copied and then verified by md5, because a
-`tar | ssh` deploy once reported success while writing zero byte files and every board check passed against the stale
-copies already there. `--program` additionally programs the PL and reads its password from `board.cred`.
+The first argument is your own login on the board and the second is the last octet of the board's address. Every file
+is copied and then verified by md5, because a `tar | ssh` deploy once reported success while writing zero byte files
+and every board check passed against the stale copies already there. `--program` additionally programs the PL and
+reads its password from `board.cred`.
 
 Once the package is on the board, run its own targets there:
 
@@ -179,24 +163,23 @@ sets the PL clock, and a board that programs the PL without that step runs the f
 still passes and every time is about 1.8 times too slow. See [board_package/README.md](board_package/README.md) for
 what each target proves and what it costs.
 
+A compiled kernel is launched there under the names the board reads, being `triton_kernel.bin` for its image and
+`triton_operands.npz` for its operands:
+
+```sh
+scp build/e2e/matmul_0.bin <account>@<board>:board_package/triton_kernel.bin
+scp build/e2e/matmul_0_operands.npz <account>@<board>:board_package/triton_operands.npz
+```
+
 ### Running the Tests
 
 ```sh
 python3 -m unittest discover -s board_package/tests -t board_package/tests -q
 ```
 
-This runs 63 host tests covering the assembler encodings, the scheduling distances, the operand rule, the address
+This runs 82 host tests covering the assembler encodings, the scheduling distances, the operand rule, the address
 space, the drain, and the compiler path from a decorated Triton kernel through to the image its plan emits. The
 compiler tests import Triton, so they run on the host rather than on the board.
-
-___
-
-## API Documentation
-
-`docs/ISA_AND_INTERFACES.md` carries the scheduling contract for the synthesized profile, covering the per-operation
-VREG requirements, the matrix command latencies, and the capacities a schedule is able to exceed. It is generated, so
-produce it with `python3 tools/gen_isa_doc.py --write`. [board_package/README.md](board_package/README.md) documents
-the board side, covering what runs on the PL, what each check proves, and how to write a kernel.
 
 ___
 

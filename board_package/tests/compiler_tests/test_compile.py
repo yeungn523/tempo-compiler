@@ -22,7 +22,7 @@ import triton.language as tl  # noqa: E402
 
 import kernels  # noqa: E402
 from bf16 import _TILE  # noqa: E402
-from compiler import ProgramError, plan, read_program, signature_of  # noqa: E402
+from compiler import ProgramError, compile_launch, plan, read_program, signature_of  # noqa: E402
 from compiler_tests.test_layout import renaming_onto  # noqa: E402
 from layout import register_map  # noqa: E402
 
@@ -99,8 +99,6 @@ class PipelineTest(unittest.TestCase):
 
     def test_the_planned_image_matches_the_hand_written_builder(self) -> None:
         """Asserts a compiled kernel emits the bundle stream `build_looped_gemm` assembles for the same launch."""
-        from sim_triton_kernel import compile_launch  # noqa: PLC0415  -- a tool, not a package module
-
         _, planned = compile_one(gemm)
         launch = planned.launches[0]
         hand = kernels.build_looped_gemm(launch.column_tiles, launch.groups, activate=launch.activate,
@@ -117,7 +115,6 @@ class PipelineTest(unittest.TestCase):
         other check passes over because the image it compares is still self consistent.
         """
         import dataclasses  # noqa: PLC0415  -- used only here
-        from sim_triton_kernel import compile_launch  # noqa: PLC0415  -- a tool, not a package module
 
         # Covers a whole number of two tile blocks, so widening the block stays legal.
         base = dataclasses.replace(compile_one(gemm)[1].launches[0], column_tiles=4)
@@ -131,7 +128,6 @@ class PipelineTest(unittest.TestCase):
     def test_the_launch_count_stays_off_the_image(self) -> None:
         """Asserts `row_blocks` leaves the image alone, since it counts the launches a host issues."""
         import dataclasses  # noqa: PLC0415  -- used only here
-        from sim_triton_kernel import compile_launch  # noqa: PLC0415  -- a tool, not a package module
 
         base = dataclasses.replace(compile_one(gemm)[1].launches[0], column_tiles=4)
         self.assertEqual(compile_launch(dataclasses.replace(base, row_blocks=4))[0],
@@ -143,8 +139,6 @@ class PipelineTest(unittest.TestCase):
         The board sizes its buffer and reshapes its partials from the plan's copy while the emitter settles its own,
         so a drift between the two reads a product out of the wrong rows rather than raising.
         """
-        from sim_triton_kernel import compile_launch  # noqa: PLC0415  -- a tool, not a package module
-
         for kernel, dims in ((gemm, ()), (gemm_wide_columns, ({"m": 32},)), (gemm_short_rows, ())):
             with self.subTest(kernel=kernel.fn.__name__):
                 _, planned = compile_one(kernel, dims=dims)
@@ -161,7 +155,6 @@ class PipelineTest(unittest.TestCase):
         missing that doubling sizes the buffer at half what the image writes.
         """
         import dataclasses  # noqa: PLC0415  -- used only here
-        from sim_triton_kernel import compile_launch  # noqa: PLC0415  -- a tool, not a package module
 
         base = compile_one(gemm)[1].launches[0]
         launch = dataclasses.replace(base, column_tiles=4, block_n=4 * _TILE)
@@ -174,7 +167,6 @@ class PipelineTest(unittest.TestCase):
     def test_a_launch_that_activates_is_refused(self) -> None:
         """Asserts a launch carrying an epilogue raises, since the emitter places the plain product only."""
         import dataclasses  # noqa: PLC0415  -- used only here
-        from sim_triton_kernel import compile_launch  # noqa: PLC0415  -- a tool, not a package module
 
         base = compile_one(gemm)[1].launches[0]
         with self.assertRaises(NotImplementedError):
@@ -188,7 +180,6 @@ class PipelineTest(unittest.TestCase):
         """
         import asm  # noqa: PLC0415  -- imported here so the path insert above has already run
         import emit  # noqa: PLC0415
-        from sim_triton_kernel import compile_launch  # noqa: PLC0415  -- a tool, not a package module
 
         launch = compile_one(gemm_wide_columns, dims=({"m": 32},))[1].launches[0]
         self.assertEqual(launch.block_n, 32)

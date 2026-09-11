@@ -140,7 +140,7 @@ The package is three layers. Each one only knows about the one below it.
 | `minitpu_runtime/minitpu/` | Hardware ABI, register map, launch limits. |
 | | **Examples and tests** |
 | `run_example_kernel.py` | A hand-written example program, meant to be opened and changed. `make run`. |
-| `run_compiled_kernel.py` | Launches the image the compiler produced. `tools/sim_triton_kernel.py` compiles it and copies it here. |
+| `run_compiled_kernel.py` | Launches the image the compiler produced. `kernel_entry_point.py` emits it, and it is copied here as `triton_kernel.bin`. |
 | `tests/` | Host-only tests: assembler encodings, scheduling distances, the operand rule. `make check` runs them. |
 
 The two example runners are not variants of each other: `run_example_kernel.py`

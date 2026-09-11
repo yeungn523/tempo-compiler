@@ -55,6 +55,42 @@ class NeverIdleMmio(MockMmio):
         return super().read32(offset)
 
 
+_DEVICE_ADDRESS: int = 0x8000_0000
+"""Aligned device address inside the shipped board's kernel aperture, which the copy translates from."""
+
+
+class AsyncCopyTest(unittest.TestCase):
+    """Verifies the asynchronous copy entry point against a device that runs one command at a time."""
+
+    def setUp(self) -> None:
+        """Installs a mock backend and clears the in-flight marker."""
+        memcpy._IN_FLIGHT = None
+        self.mmio = MockMmio()
+        self.previous, memcpy._BACKEND = memcpy._BACKEND, self.mmio
+
+    def tearDown(self) -> None:
+        """Restores the backend the process had and clears the in-flight marker."""
+        memcpy._BACKEND = self.previous
+        memcpy._IN_FLIGHT = None
+
+    def test_the_copy_retires_before_the_call_returns(self) -> None:
+        """Asserts the asynchronous copy leaves nothing in flight, since the command window is one deep."""
+        memcpy.minitpuMemcpyAsync(dst=_DEVICE_ADDRESS, src=0, nbytes=32, kind=memcpy.MemcpyKind.HostToDevice)
+        self.assertIsNone(memcpy._IN_FLIGHT, "the copy returned with a command still outstanding")
+        self.assertTrue(memcpy.minitpuDrain())
+
+    def test_a_named_stream_is_refused(self) -> None:
+        """Asserts a stream raises, since the device exposes none to order a copy on."""
+        with self.assertRaises(ValueError):
+            memcpy.minitpuMemcpyAsync(dst=_DEVICE_ADDRESS, src=0, nbytes=32, kind=memcpy.MemcpyKind.HostToDevice,
+                                      stream=object())
+
+    def test_a_misaligned_copy_is_refused(self) -> None:
+        """Asserts the alignment the copy engine requires is checked on this entry point too."""
+        with self.assertRaises(ValueError):
+            memcpy.minitpuMemcpyAsync(dst=_DEVICE_ADDRESS + 8, src=0, nbytes=32, kind=memcpy.MemcpyKind.HostToDevice)
+
+
 class DrainTest(unittest.TestCase):
     """Verifies the in-flight marker, the drain, and the exit handler that reports a stuck device."""
 

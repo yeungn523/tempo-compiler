@@ -95,10 +95,8 @@ _VMEM_SLOT_STRIDE: int = _VMEM_ENTRIES_PER_LANE
 """The VMEM row distance between consecutive staging slots, which is a whole lane so no two slots share a row."""
 
 _BLOCK_ACTIVATION_BYTES: int = _STEPS * _TOKEN_GROUPS * _TILE * _ROW_BYTES
-"""The byte size of one block's activation tiles, at the token block the hand-written kernels cover.
-
-A block narrower or wider than `_BLOCK_TOKENS` stages a different size, so an emitted image takes this from
-`emit.Staging.activation_slack` instead, which reads the rows its own block covers."""
+"""The byte size of one block's activation tiles, at the token block the hand-written kernels cover. An emitted
+image takes this from `emit.Staging.activation_slack` instead, which reads the rows its own block covers."""
 
 _BLOCK_WEIGHT_BYTES: int = _STEPS * _TILE * _ROW_BYTES
 """The byte size of one block's weight tiles."""
@@ -120,9 +118,6 @@ _VREG_ELEMENTS: int = _NUM_LANES * _NUM_SUBLANES
 
 def _max_attention_rows() -> int:
     """Returns the rows one attention launch covers, bounded by the VMEM the scores are staged in.
-
-    A token's feature tiles land consecutively, so the rows one token owns is a power of two and the gap between
-    `_ROW_SCORES` and `_ROW_SOFTMAX_OUT` is what bounds the span.
 
     Returns:
         The rows, a whole number of VREG spans.
@@ -195,9 +190,8 @@ def layernorm_constants(gamma: NDArray[np.float32], beta: NDArray[np.float32], *
     Args:
         gamma: The per-feature scale, `width` long.
         beta: The per-feature shift, `width` long.
-        width: The model width the mean divides by, defaulting to GPT-2's. A caller with another width must say
-            so, because the reciprocal is baked in here and nothing downstream can tell it disagrees with the row
-            it is applied to.
+        width: The model width the mean divides by, defaulting to GPT-2's. Its reciprocal is baked in here, which
+            nothing downstream can tell disagrees with the row it is applied to.
 
     Returns:
         The container words the launch stages in VMEM.
@@ -264,8 +258,7 @@ def from_bf16_words(words: NDArray[np.uint16]) -> NDArray[np.float32]:
 def reduce_drain(partials: NDArray[np.float32], *, shape: tuple[int, int, int, int, int]) -> NDArray[np.float32]:
     """Sums one launch's drained partials into the token block's product.
 
-    The drain lies in the order the image walked its loops, so a block's output tiles sit inside its partials and
-    the groups are summed in float32 because the array rounds each partial to BF16 as it leaves.
+    The drain lies in the order the image walked its loops, so a block's output tiles sit inside its partials.
 
     Args:
         partials: The drained partials, with the clearing tile already skipped.
@@ -355,9 +348,6 @@ def pack_activations(activations: NDArray[np.float32]) -> NDArray[np.uint16]:
 def pack_bias(bias: NDArray[np.float32]) -> NDArray[np.uint16]:
     """Lays a bias row out in the order a stride-one broadcast read visits it.
 
-    A VREG holds `_NUM_SUBLANES` token rows of one feature tile, and each of them wants the same tile of the bias,
-    so repeating every tile that many times makes the read contiguous.
-
     Args:
         bias: One value per feature, a whole number of `_NUM_LANES`-wide tiles.
 
@@ -403,8 +393,7 @@ def pack_weights(weights: NDArray[np.float32]) -> NDArray[np.uint16]:
 def _reordered(rng: np.random.Generator, count: int) -> NDArray[np.intp] | None:
     """Returns a permutation of the given positions that moves at least one of them.
 
-    A draw that happens to be the identity would leave the operand unchanged, so the check it feeds would read its
-    own no-op as evidence the operands cannot observe a reordering. Two positions make that a coin flip.
+    An identity draw would leave the operand unchanged, so the check it feeds would read its own no-op as evidence.
 
     Args:
         rng: The generator the permutation is drawn from.

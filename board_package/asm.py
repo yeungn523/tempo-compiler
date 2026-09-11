@@ -1,7 +1,7 @@
 """Packages the MINITPU's 128-bit VLIW bundles and spaces a stream of them into a legal schedule.
 
-The machine carries no hazard interlocks, and the delay field is its only fetch-head hold, so every image
-is spaced here before it reaches a board. The latencies come from compiler/minitpuisa.td.
+The machine carries no hazard interlocks and the delay field is its only fetch-head hold, so every image is
+spaced here before it reaches a board. The latencies come from compiler/minitpuisa.td.
 """
 from __future__ import annotations
 
@@ -42,14 +42,12 @@ BUNDLE_BYTES: int = 16
 BUNDLE_BITS: int = 128
 """Width of one physical VLIW bundle in bits."""
 
-# Mirrors sequencer_pkg::compute_payload_t ({is_dma, e, m, x, s, f, delay, reserved}, MSB first) at NUM_LANES=16
-# and NUM_SUBLANES=4:
+# Mirrors sequencer_pkg::compute_payload_t at NUM_LANES=16 and NUM_SUBLANES=4:
 #
 #   is_dma [127]   e [126:108]   m [107:101]   x [100:68]
 #   s [67:41]      f [40:14]      delay [13:8]  reserved [7:0]
 #
-# Derives every position below from these widths, so a width change in sequencer_pkg moves every position that
-# follows it.
+# Derives every position below from these widths, so a width change in sequencer_pkg moves them all.
 
 E_SLOT_W: int = 19
 """Width of the E slot in bits."""
@@ -82,10 +80,8 @@ NUM_SUBLANES: int = 4
 AGU_SHIFT_W: int = 3
 """Width of the X-slot AGU shift in bits, mirroring sequencer_pkg's X_SHIFT_W."""
 
-# Overlays one DMA descriptor on the storage the compute format spends on its E/M/X/S/F fields, with bit 127
-# selecting between the two. A co-issued slot therefore reaches no execution unit: it rewrites the descriptor bits
-# it overlaps, or it lands in the DMA format's reserved field and vanishes. Hardware does both silently, so
-# assembly time is where they are caught.
+# Overlays one DMA descriptor on the storage the compute format spends on its E/M/X/S/F fields, so a co-issued
+# slot reaches no execution unit: it rewrites the descriptor bits it overlaps or vanishes, both silently.
 DMA_EXCLUSIVE_SLOTS: frozenset[str] = frozenset({"e", "v", "m", "x", "s", "f"})
 """Compute slots a DMA bundle is unable to carry alongside its descriptor."""
 
@@ -255,8 +251,7 @@ rejected rather than misread."""
 class AsmBuilder:
     """Records explicit physical VLIW bundles as a kernel emits them.
 
-    Every slot word returned here is already shifted into its bundle field, and every E-slot word reads its first
-    source through VREG port A.
+    Every slot word returned here is already shifted into its bundle field.
 
     Attributes:
         bundles: The bundle words recorded so far, in emission order.
@@ -618,8 +613,8 @@ class AsmKernel:
     def assemble(self, *, pad_to: int | None = None) -> tuple[int, ...]:
         """Returns the kernel's scheduled image, padded by repeating its final bundle.
 
-        Re-placement comes from `placement`, or from `MINITPU_PACK` when the kernel names none. It forms part of the
-        memo key because it changes the image.
+        Re-placement comes from `placement`, or from `MINITPU_PACK` when the kernel names none, and forms part of
+        the memo key because it changes the image.
 
         Args:
             pad_to: The bundle count the image is padded to a multiple of, or None to leave it unpadded.
@@ -658,8 +653,8 @@ def mxu_output_fifo() -> tuple[int, int, int]:
 def pack(words: list[int]) -> list[int]:
     """Re-places a hand-written bundle stream as densely as the machine allows.
 
-    The builders place every op at an explicit index and pad the gaps with empty bundles, which is legal but leaves
-    most of the five compute slots idle. This pass runs ahead of `schedule`, which still derives the exact delays.
+    The builders pad the gaps with empty bundles, which leaves most of the five compute slots idle. This pass
+    runs ahead of `schedule`, which still derives the exact delays.
 
     Args:
         words: The emitted bundle stream, before scheduling.
@@ -673,9 +668,8 @@ def pack(words: list[int]) -> list[int]:
 def place(words: list[int]) -> list[int]:
     """Re-places a hand-written bundle stream in program order, one operation per bundle.
 
-    The hand-placed padding inside each region is dropped and `schedule` re-derives the exact delay. Each region is
-    then emitted in the order it was written, so the S and M slot placement the machine leaves to the compiler
-    survives by construction, at the cost of the co-issue `pack` reaches.
+    Each region is emitted in the order it was written, so the S and M slot placement survives by construction,
+    at the cost of the co-issue `pack` reaches.
 
     Args:
         words: The emitted bundle stream, before scheduling.
@@ -689,8 +683,8 @@ def place(words: list[int]) -> list[int]:
 def schedule(words: list[int]) -> list[int]:
     """Returns one bundle stream with its delay fields filled in, so the schedule is legal.
 
-    Delays are filled in place and filler bundles are inserted where a wait exceeds `MAX_DELAY`. This pass keeps
-    the stream in order, so it leaves SREG WAW and WAR and VMEM ownership to the caller.
+    Filler bundles are inserted where a wait exceeds `MAX_DELAY`. This pass keeps the stream in order, so it
+    leaves SREG WAW and WAR and VMEM ownership to the caller.
 
     Args:
         words: The bundle stream to space, in program order.
@@ -718,8 +712,8 @@ def schedule(words: list[int]) -> list[int]:
         for i, word in enumerate(out):
             d = _decode(word)
             t = 0 if i == 0 else t_prev + 1 + _delay_of(out[i - 1])
-            # Prices SREG RAW for every bundle, DMA descriptors included, since a descriptor reads its base and
-            # stride from scalar registers. WAW and WAR come free from the in-order advance of t.
+            # Prices SREG RAW for every bundle, descriptors included, since one reads its base and stride from
+            # scalar registers. WAW and WAR come free from the in-order advance of t.
             for register in d["s_reads"]:
                 t = max(t, s_ready.get(register, 0))
             if not d["dma"]:
@@ -831,9 +825,8 @@ def analyze_stalls(words: list[int]) -> dict:
 def asm(function: Callable[[], None], *, namespace: str = "asm", placement: str | None = None) -> AsmKernel:
     """Captures the bundles an explicit VLIW construction function emits.
 
-    A fresh builder is bound into the function's own globals under `namespace` for the call and the previous
-    binding is restored afterwards, so a kernel body names the builder without taking it as a parameter. The
-    kernel is assembled once here, so a malformed one fails where it is written.
+    A fresh builder is bound into the function's own globals under `namespace` for the call, so a kernel body
+    names the builder without taking it as a parameter. The kernel is assembled once here.
 
     Args:
         function: The kernel body, which emits its bundles through the bound builder.
@@ -919,10 +912,8 @@ def check_dma_exclusive(slots: dict[str, int]) -> None:
 def _compute_s(rd: int, rs: int, *, op: int, imm: int = 0) -> int:
     """Returns the S-slot word for one scalar operation, shifted into its field.
 
-    sequencer_scalar_agu.sv sign-extends the immediate field for SADDI and zero-extends it for SMOVI, so the
-    accepted range
-    spans both. Masking the immediate is what lets SADDI encode a negative addend. Without it, a negative immediate
-    corrupts the word and an immediate above 0xFFFF overflows into the rs field, silently in both cases.
+    sequencer_scalar_agu.sv sign-extends the immediate for SADDI and zero-extends it for SMOVI, so the accepted
+    range spans both. Masking it is what lets SADDI encode a negative addend without corrupting the rs field.
 
     Args:
         rd: Destination scalar register.
@@ -987,8 +978,8 @@ def _compute_x(store: bool, vreg: int, row: int, *, agu: bool, shift: int,
             onward, one row each.
         agu: Determines whether the loop induction variable is added to the row.
         shift: Left shift applied to that induction variable.
-        level: Which loop's induction variable the access reads, counting 0 as the outermost loop. A kernel naming
-            the wrong loop reads a plausible row and returns wrong numbers rather than faulting.
+        level: Which loop's induction variable the access reads, counting 0 as the outermost loop. Naming the
+            wrong loop reads a plausible row rather than faulting.
         mask: Which sublanes take part.
 
     Returns:
@@ -1004,8 +995,8 @@ def _compute_x(store: bool, vreg: int, row: int, *, agu: bool, shift: int,
             f"sublanes, but got 0x{mask:x}."
         )
         raise ValueError(message)
-    # The VREG field sits directly below the store bit and the row field directly below the VREG, so a register
-    # past the file encodes a vst and a row past the slot corrupts the register the access names.
+    # Guards the abutting fields: a register past the file encodes a vst, and a row past the slot corrupts
+    # the register the access names.
     if not 0 <= vreg < (1 << _VREG_SELECT_W):
         message = (
             f"Unable to encode the given VREG. The field is {_VREG_SELECT_W} bits, so it names registers 0 through "
@@ -1047,10 +1038,9 @@ def _dma(store: bool, slot: int, vmem_address: int, rows: int, base_sreg: int, s
     """Returns a complete DMA bundle carrying one descriptor.
 
     Notes:
-        The 36-bit d_wire_t at ADDRESS_W=13, where vmem_address is the 14-bit concatenation of the slot bit and
-        the row, is laid out as is_store[35], slot_sel[34], vmem_address[33:20], src_mode[19], pool_idx[18:11],
-        rows[10:4], base_sreg[3:2] and stride_sreg[1:0]. src_mode is held at D_SRC_SREG, so the base and stride are 
-        read from scalar registers.
+        The 36-bit d_wire_t is laid out as is_store[35], slot_sel[34], vmem_address[33:20], src_mode[19],
+        pool_idx[18:11], rows[10:4], base_sreg[3:2] and stride_sreg[1:0]. src_mode is held at D_SRC_SREG, so the
+        base and stride are read from scalar registers.
 
     Args:
         store: Determines whether the descriptor writes host memory rather than reading it.
@@ -1066,9 +1056,8 @@ def _dma(store: bool, slot: int, vmem_address: int, rows: int, base_sreg: int, s
     Raises:
         ValueError: If any operand reaches outside the field that carries it.
     """
-    # The descriptor's fields abut, so an operand past one runs into the next: a row count of zero sets every bit
-    # of the count and turns a load into a store, a slot of two lands on the store bit, and an address past the
-    # 14 bits selects the other descriptor slot. Nothing in hardware rejects the word, so it is rejected here.
+    # Guards the abutting fields: a row count of zero turns a load into a store, a slot of two lands on the
+    # store bit, and an address past 14 bits selects the other slot. Nothing in hardware rejects the word.
     for name, value, low, high in (("slot", slot, 0, DMA_SLOT_COUNT - 1),
                                    ("vmem_address", vmem_address, 0, (1 << _D_ADDRESS_W) - 1),
                                    ("rows", rows, 1, 1 << _D_ROWS_W),
@@ -1100,8 +1089,8 @@ def _flush(mask: int) -> int:
 def _decode(word: int) -> dict:
     """Unpacks the physical fields a scheduler needs from one 128-bit bundle.
 
-    Only VREG and SREG hazards are modelled here, so a DMA descriptor reports the scalar registers it reads and no
-    VREG traffic.
+    Only VREG and SREG hazards are modelled, so a DMA descriptor reports its scalar registers and no VREG
+    traffic.
 
     Args:
         word: The bundle word to decode.
@@ -1151,7 +1140,7 @@ def _decode(word: int) -> dict:
             d["writes"].append((rd, W_TRANSPOSE))
     if x:
         store, vreg = (x >> 31) & 1, (x >> 26) & 0x1F
-        # The sublanes read consecutive rows, so their banks are a permutation and no access splits.
+        # Prices one cycle, since the sublanes read consecutive rows and no access splits across banks.
         d["vmem_cycles"] = 1
         if store:
             d["reads"].add(vreg)
@@ -1175,9 +1164,8 @@ def _port_a_readers(word: int) -> list[str]:
     """Returns every VREG read-port-A consumer one bundle issues, empty for a DMA bundle.
 
     Notes:
-        vpu.sv's `effective_raddr_a` is one physical port behind a static-priority mux the matrix controller wins, so
-        two consumers issued together leave the loser silently reading the winner's address. A vmatpop and a vld stay
-        out of it, reading the array's own output and VMEM.
+        vpu.sv's `effective_raddr_a` is one physical port behind a static-priority mux the matrix controller wins,
+        so two consumers issued together leave the loser silently reading the winner's address.
 
     Args:
         word: The bundle word to inspect.
@@ -1224,11 +1212,9 @@ def _is_barrier(word: int) -> bool:
     """Determines whether a bundle must keep its emitted position exactly.
 
     Notes:
-        A DMA bundle is a barrier, because a descriptor's completion is observed through `flush_slot` and VMEM
-        aliasing against a vld is beyond what this pass proves. So is any F slot, which preserves control flow bit for
-        bit. M and S slots are barriers because their consumers sit outside the region: a descriptor reads the SREG an
-        S op writes across the barrier that ends it, and `_pack_region` prices the uninterlocked scalar writeback only
-        against the ops it holds.
+        A DMA bundle is a barrier, because VMEM aliasing against a vld is beyond what this pass proves, and so is
+        any F slot, which preserves control flow bit for bit. M and S slots are barriers because their consumers
+        sit outside the region, which `_pack_region` does not price against.
 
     Args:
         word: The bundle word to inspect.
@@ -1369,9 +1355,8 @@ def _check_slot_reuse(words: list[int]) -> None:
     """Raises when a descriptor reuses a slot the previous one has not been flushed from.
 
     Notes:
-        A slot carries one descriptor. Issuing a second before a flush covers the first leaves the device waiting on
-        a done bit that never settles, which is the same wedge a flush on an unused slot causes and is just as
-        silent.
+        A slot carries one descriptor, so issuing a second before a flush covers the first leaves the device
+        waiting on a done bit that never settles.
 
     Args:
         words: The bundle stream to check, in program order.
@@ -1423,9 +1408,8 @@ def _check_port_a_exclusive(words: list[int]) -> None:
 def _pack_region(ops: list[int]) -> list[int]:
     """List-schedules one region, merging independent ops into shared bundles.
 
-    Every op is placed at the earliest cycle its dependences and the slot resources allow, in program order, so an
-    op stays behind everything it depends on. Merging is a bitwise OR, which holds because no word inside a region
-    carries the DMA bit and the delay fields are still zero, so the slots stay disjoint.
+    Every op is placed at the earliest cycle its dependences and the slot resources allow, in program order.
+    Merging is a bitwise OR, which holds because no word inside a region carries the DMA bit.
 
     Args:
         ops: The region's non-empty bundles, in program order.
@@ -1502,9 +1486,8 @@ def _pack_region(ops: list[int]) -> list[int]:
 def _reframe(words: list[int], region_placer: Callable[[list[int]], list[int]]) -> list[int]:
     """Splits a stream at its barriers and hands each region to `region_placer`.
 
-    Empty bundles inside a region are dropped, because `schedule` re-derives the delay. Empty bundles immediately
-    before a barrier are re-emitted, because a DMA descriptor reads its base and stride from scalar registers
-    across that boundary and the gap is the uninterlocked scalar writeback.
+    Empty bundles inside a region are dropped, because `schedule` re-derives the delay. Ones immediately before a
+    barrier are re-emitted, since that gap is the uninterlocked scalar writeback a descriptor reads across.
 
     Args:
         words: The emitted bundle stream, before scheduling.

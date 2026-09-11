@@ -12,10 +12,12 @@ from .compile import (  # noqa: E402
     MatMul,
     Plan,
     ProgramError,
+    compile_launch,
     plan,
     read_program,
     signature_of,
     stage,
 )
 
-__all__ = ["MatMul", "Plan", "ProgramError", "plan", "read_program", "signature_of", "stage"]
+__all__ = ["MatMul", "Plan", "ProgramError", "compile_launch", "plan", "read_program", "signature_of",
+           "stage"]

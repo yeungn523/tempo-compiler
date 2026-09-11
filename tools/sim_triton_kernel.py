@@ -30,10 +30,7 @@ from bf16 import (  # noqa: E402
     pack_activations,
     pack_weights,
 )
-from compiler import plan, read_program, signature_of, stage  # noqa: E402
-from compiler.compile import Launch  # noqa: E402
-from asm import AsmKernel  # noqa: E402
-from emit import Staging, looped_gemm_stream  # noqa: E402
+from compiler import compile_launch, plan, read_program, signature_of, stage  # noqa: E402
 
 
 @triton.jit
@@ -70,42 +67,6 @@ def matmul_kernel(
                 weight_pointers += BLOCK_K * stride_bk
             output_pointers = output_pointer + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
             tl.store(output_pointers, accumulator)
-
-
-def compile_launch(launch: Launch) -> tuple[bytes, Staging]:
-    """Returns the image one launch compiles to and what a host stages for it.
-
-    Args:
-        launch: The launch the planner produced.
-
-    Returns:
-        The image bytes padded to the loader's boundary, and the staging the emitter placed them from.
-
-    Raises:
-        NotImplementedError: If the launch activates its staged tiles, which the emitter does not place yet.
-    """
-    if launch.activate:
-        message = (
-            "Unable to compile a launch that activates its staged tiles. The emitter places the staging, the "
-            "matrix commands and the drain only, so such a launch must come from `kernels.build_looped_gemm` "
-            "until the activation is placed here too."
-        )
-        raise NotImplementedError(message)
-    bundles, staging = looped_gemm_stream(**_counts(launch))
-    return AsmKernel(name="looped_gemm", bundles=bundles).to_bytes(pad_to=4), staging
-
-
-def _counts(launch: Launch) -> dict[str, int | bool]:
-    """Returns the counts the emitter places an image and states its staging from.
-
-    Args:
-        launch: The launch the planner produced.
-
-    Returns:
-        The counts, as the keywords both emitter entry points take.
-    """
-    return dict(column_tiles=launch.column_tiles, groups=launch.groups, loop_blocks=launch.loop_blocks,
-                fuse_groups=launch.fuse_groups, block_m=launch.block_m, block_n=launch.block_n)
 
 
 def main() -> int:

@@ -10,7 +10,9 @@ from dataclasses import dataclass, field
 import numpy as np
 from numpy.typing import NDArray
 
+from asm import AsmKernel
 from bf16 import _BLOCK_DEPTH, _TILE, _ZERO_TILE_WORDS
+from emit import Staging, looped_gemm_stream
 from layout import LayoutError, register_map
 from triton.runtime import JITFunction
 
@@ -82,9 +84,7 @@ class Guard:
 
     Notes:
         The array holds no per element predicate, so a mask is runnable only when the elements it excludes are a
-        trailing run the host zero fills going in and slices off coming out. A ragged GEMM bounds several axes at
-        once and each bound is one of these, because a zero anywhere in a product contributes nothing to the sum
-        it lands in.
+        trailing run the host zero fills going in and slices off coming out.
 
     Attributes:
         axis: Induction variable the predicate bounds, being "m", "n" or "k".
@@ -148,11 +148,9 @@ class MatMul:
         left_source: Index of the matmul producing the left operand, or None when it comes from memory.
         reduction: Whole reduction the loop walks, or None when its bound is a runtime argument.
         tile_loops: Every loop walking the output rather than the contraction, outermost first, holding the ones
-            whose bounds are compile time constants. A kernel walking its output tiles on the grid leaves this
-            empty, because a grid dimension reaches the module as a launch argument.
+            whose bounds are compile time constants. A kernel walking its tiles on the grid leaves this empty.
         steps_inside_reduction: The step of every loop nested inside the reduction loop, which names the axis it
-            walks. The step is kept rather than the loop because a tile loop bounded by a runtime argument has no
-            readable trip count, and that is the case `_resident_tiles` most needs to see.
+            walks. The step is kept rather than the loop, which a runtime bound leaves with no trip count.
         accesses: How each operand is addressed, keyed by role.
     """
 
@@ -212,9 +210,8 @@ class Drain:
         zero_tile_words: Words of clearing tile the drain buffer opens with, which a reader skips.
         words: Words the drain buffer holds, the clearing tile included.
         shape: Extent of each axis of the drained partials, as blocks by partials by the block's output tiles by
-            token rows by lanes. The axes follow the loops the image walks, so the tiles a block covers sit inside
-            the partials rather than around them. The second axis is one when the device summed the groups itself,
-            and is the one a host sums over.
+            token rows by lanes, following the loops the image walks. The second axis is the one a host sums
+            over, and is one when the device summed the groups itself.
     """
 
     zero_tile_words: int
@@ -227,19 +224,18 @@ class Launch:
     """Holds the arguments the GEMM builder takes for one matmul.
 
     Attributes:
-        row_blocks: Token blocks the product covers. The image holds one block at a time, so this is the count of
-            launches the host issues rather than a trip count inside the image.
+        row_blocks: Token blocks the product covers, being launches the host issues rather than a trip count,
+            since the image holds one block at a time.
         column_tiles: Output column tiles the product covers.
         groups: Reduction groups each column tile accumulates.
         loop_blocks: Accumulation blocks one group carries.
         activate: Determines whether each staged tile is activated entering the array.
         fuse_groups: Determines whether groups accumulate on the device rather than draining a partial each.
         block_m: Token rows one block covers, which the emitter lays its registers out for.
-        block_n: Output columns one block covers. A block wider than one tile keeps that many accumulators at
-            once, which `column_tiles` alone cannot say because it counts tiles rather than the blocks holding them.
+        block_n: Output columns one block covers, which `column_tiles` cannot say because it counts tiles rather
+            than the blocks holding them.
         partials: Partial products each column tile leaves, being one when the device sums the groups itself. A
-            block accumulating in VMEM leaves two of each, since consecutive blocks fold into opposite VMEM banks
-            and both are drained.
+            block accumulating in VMEM leaves two of each, since consecutive blocks fold into opposite banks.
     """
 
     row_blocks: int
@@ -278,9 +274,8 @@ class Plan:
         drains: What each launch writes back, in the order the host issues them.
         padding: Every axis grown to reach whole launches, which the host zero fills and slices back.
         repack: Every operand the host must rewrite in memory, because the lanes read one contiguous run.
-        masks_covered: Every predicate the padding stands in for, as the access carrying it and the bound it holds
-            its axis under. A predicate the padding cannot reproduce is refused when the kernel is read rather
-            than appearing here.
+        masks_covered: Every predicate the padding stands in for, as the access carrying it and the bound it
+            holds its axis under. One the padding cannot reproduce is refused when the kernel is read.
         issued_over_useful: Multiplies the padded shapes issue over the multiplies the problems hold.
     """
 
@@ -423,11 +418,10 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
 
     Args:
         matmuls: The matmuls a kernel computes, in program order.
-        strides: Value of each stride parameter at the launch. A symbolic stride states nothing until a call site
-            binds it, so this is where an operand's layout becomes a number the machine can judge.
-        dims: Extent of each matmul's problem, keyed "m", "n" and "k" for whichever of them the module leaves
-            open. An axis put on the grid reaches a launch rather than the module, as does a reduction whose
-            bound is a runtime argument. Omitted entirely, every extent comes from the kernel.
+        strides: Value of each stride parameter at the launch, which is where an operand's layout becomes a
+            number the machine can judge.
+        dims: Extent of each matmul's problem, keyed "m", "n" and "k" for whichever the module leaves open,
+            which is an axis put on the grid or a reduction bounded by a runtime argument.
 
     Returns:
         The plan.
@@ -470,9 +464,8 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
             for position, guard in enumerate(access.guards):
                 masks_covered.append(f"matmul {index} {role} holds {guard.axis} under {guard.bound}")
                 if isinstance(guard.bound, int):
-                    # Named per conjunct rather than per role, so two bounds on one axis reach `_stated_extent` as
-                    # two sources: it takes the tighter when they agree on the tile count and refuses when they do
-                    # not.
+                    # Names each conjunct apart, so two bounds on one axis reach `_stated_extent` as two
+                    # sources rather than one.
                     name = f"its {role} mask" if position == 0 else f"its {role} mask ({position + 1})"
                     stated.setdefault(guard.axis, {})[name] = guard.bound
                 elif guard.axis not in extent:
@@ -485,8 +478,8 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
                     raise ProgramError(message)
 
         covered, asked = {}, {}
-        # Pads the columns to a whole block rather than a whole tile, because a descriptor names the tiles one block
-        # stages outright and the emitter cannot place a partial block.
+        # Pads the columns to a whole block rather than a whole tile, since the emitter cannot place a partial
+        # block.
         for axis, unit in (("m", matmul.rows), ("n", matmul.columns), ("k", blocks * _BLOCK_DEPTH)):
             asked[axis] = _stated_extent(index=index, axis=axis, unit=unit, sources=stated.get(axis, {}))
             covered[axis] = unit * -(-asked[axis] // unit)
@@ -501,14 +494,13 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
             groups=covered["k"] // (blocks * _BLOCK_DEPTH),
             loop_blocks=blocks,
             activate=_EPILOGUES[matmul.epilogue] == "gelu",
-            # The device sums in BF16, so honouring a float32 accumulator means draining a partial per group.
+            # Drains a partial per group to honour a float32 accumulator, since the device sums in BF16.
             fuse_groups=matmul.accumulator != _FUSED_ACCUMULATOR_ELEMENT,
             block_m=matmul.rows,
             block_n=matmul.columns,
         )
         launches.append(launch)
-        # Measures the drain in the block the launch states, since a block narrower than the token block drains
-        # fewer rows than the constant names.
+        # Measures the drain in the block the launch states, since a narrower one drains fewer rows.
         shape = (launch.blocks, launch.partials, launch.output_tiles, launch.block_m, _TILE)
         drains.append(Drain(
             zero_tile_words=_ZERO_TILE_WORDS,
@@ -537,8 +529,7 @@ def stage(left: NDArray[np.float32], right: NDArray[np.float32], *, matmul: MatM
     columns = launch.column_tiles * _TILE
     staged = []
     for operand, shape in ((left, (rows, depth)), (right, (depth, columns))):
-        # Slices before measuring, so an operand already larger than its launch covers is cut rather than
-        # broadcast into a destination that cannot hold it.
+        # Slices before measuring, so an operand larger than its launch covers is cut rather than broadcast.
         kept = operand[: shape[0], : shape[1]]
         padded = np.zeros(shape, dtype=operand.dtype)
         padded[: kept.shape[0], : kept.shape[1]] = kept
@@ -611,7 +602,7 @@ class _Graph:
             self._loop_of_block[body.id()] = loop
             self._body_of_loop[id(loop)] = body
             for index in range(1, body.get_num_arguments()):
-                # Body argument zero is the induction variable, and argument index carries loop operand two plus
+                # Reads argument zero as the induction variable, and argument index as loop operand two plus
                 # index, which is the value it entered the loop holding.
                 self._carried[body.get_argument(index).id()] = loop.get_operand(2 + index)
             self._yield_of_loop[id(loop)] = next(
@@ -826,8 +817,8 @@ class _Graph:
             )
             raise ProgramError(message)
 
-        # A store names no fill, because the launch writes the whole padded tile and the host slices it. A load
-        # does, and the padding writes zeros, so a load asking for anything else computes something else.
+        # Skips a store, which names no fill because the launch writes the whole padded tile. A load names one,
+        # and the padding writes zeros, so a load asking for anything else computes something else.
         if role != "output" and not self.reads_zero_outside(operation):
             refuse("fills its excluded elements with something other than zero, which the padding cannot write")
 
@@ -838,11 +829,9 @@ class _Graph:
         """Returns True when a masked load fills its excluded elements with zero.
 
         Notes:
-            The MLIR binding returns None for a dense float constant, so every load's fill is read once from the
-            module's printed form and matched by position, which is the order str_nodebug prints them. A load
-            with no fill selects every element and reports True. A fill this reader cannot resolve reports False,
-            because one that is not known to be zero has to be refused rather than assumed on a machine that
-            returns plausible numbers for a wrong one.
+            The MLIR binding returns None for a dense float constant, so every load's fill is read from the
+            module's printed form and matched by position. A load with no fill selects every element and reports
+            True, and a fill this reader cannot resolve reports False rather than being assumed zero.
         """
         if self._zero_filled is None:
             zeros: set[str] = set()
@@ -900,9 +889,8 @@ class _Graph:
         """Returns every comparison a predicate is the conjunction of, with what placed each one in the tile.
 
         Notes:
-            A mask is compared at rank one and only then expanded into the operand's shape, so the comparison
-            alone does not say which axis it bounds. The expand_dims axes crossed on the way down to it are
-            carried out with it.
+            A mask is compared at rank one and only then expanded into the operand's shape, so the expand_dims
+            axes crossed on the way down to it are carried out with it.
 
         Args:
             value: The predicate operand of a load or store.
@@ -923,7 +911,7 @@ class _Graph:
                 placements = (*placements, operation.get_int_attr("axis"))
                 pending.append((operation.get_operand(0), placements))
             elif name in _PREDICATE_RESHAPES:
-                # Broadcasting and widening reshape without moving which axis an element varies along.
+                # Traces through broadcast and widen, which reshape without moving which axis an element varies along.
                 pending.append((operation.get_operand(0), placements))
             elif name == "arith.andi":
                 pending.extend((operation.get_operand(side), placements) for side in range(2))
@@ -959,16 +947,16 @@ class _Graph:
             refuse(f"compares {counts[0]} axes against {counts[1]}, rather than one against none")
         iota_left = counts[0] == 1
         walked, uniform = sides if iota_left else sides[::-1]
-        # An axis on the left of a "less" and an axis on the right of a "greater" are the same upper bound. The
-        # other two orientations bound from below, which excludes a leading run the padding does not hold.
+        # Reads an axis left of a "less" and right of a "greater" as the same upper bound. The other two
+        # orientations bound from below, which excludes a leading run the padding does not hold.
         if less != iota_left:
             refuse("bounds an axis from below, so the elements it excludes lead rather than trail")
 
         axis, stride = next(iter(walked.axes.items()))
         if stride != 1:
             refuse(f"walks its axis by {stride} rather than one element at a time")
-        # The comparison was made at rank one, so its iota is still waiting for the expand_dims that placed it.
-        # Applying them innermost first is what `_resolve_expand_dims` does for an address.
+        # Applies the expand_dims innermost first, as `_resolve_expand_dims` does for an address, since the
+        # comparison was made at rank one.
         for inserted in reversed(placements):
             axis = (1 - inserted) if axis == _PENDING_AXIS else (axis if axis < inserted else axis + 1)
         if not 0 <= axis < len(variables):
@@ -1068,8 +1056,8 @@ def _machine_tile(*, index: int, matmul: MatMul) -> int:
             f"{_TILE}, because a token group is as deep as the systolic array."
         )
         raise ProgramError(message)
-    # Both the tile width the array fixes and the registers a block needs are the map's to judge, so a block that
-    # is not a whole number of tiles and one that does not fit are refused in the same place.
+    # Leaves both the tile width and the register budget to the map, so a block that is not whole tiles and one
+    # that does not fit are refused in the same place.
     try:
         register_map(block_m=matmul.rows, block_n=matmul.columns)
     except LayoutError as error:
@@ -1090,9 +1078,8 @@ def _check_strides_bound(matmuls: tuple[MatMul, ...], *, strides: dict[str, int]
     """Refuses a launch that has not said what every stride the kernel names is worth.
 
     Notes:
-        The kernel says which strides exist and the launch says what each is worth, and both halves are needed to
-        tell whether an operand lies as the 16 lanes read it. An unbound stride would reach `_repacking_needed`
-        as its own name, which is never 1, so the host would rewrite data that was already right.
+        An unbound stride reaches `_repacking_needed` as its own name, which is never 1, so the host would
+        rewrite data that was already right.
 
     Args:
         matmuls: The matmuls a kernel computes.
@@ -1124,9 +1111,8 @@ def _stated_extent(*, index: int, axis: str, unit: int, sources: dict[str, int])
     """Returns what one axis covers, refusing a kernel whose loops, masks and caller do not agree on it.
 
     Notes:
-        A launch issues whole tiles, so two sources agree when they round up to the same number of them, and the
-        tightest of those is the extent the padding is measured from. Sources rounding up to different tile counts
-        name different launches, and this reader will not pick one of them.
+        A launch issues whole tiles, so two sources agree when they round up to the same number of them and the
+        tightest is what the padding is measured from. Sources rounding up differently name different launches.
 
     Args:
         index: Position of the matmul in the kernel.
@@ -1173,8 +1159,7 @@ def _tiles_walked(*, index: int, matmul: MatMul) -> dict[str, int]:
 
     Returns:
         The extent stated along "m", along "n", or both, holding only the axes a loop states. This is the loop's
-        own bound rather than the whole tiles it walks, so an extent the tile does not divide reaches the plan as
-        the number the kernel wrote and is padded from there.
+        own bound rather than the whole tiles it walks, so the plan pads it.
 
     Raises:
         ProgramError: If a loop addresses neither operand, or if two loops walk one axis.
@@ -1199,13 +1184,37 @@ def _tiles_walked(*, index: int, matmul: MatMul) -> dict[str, int]:
     return walked
 
 
+def compile_launch(launch: Launch) -> tuple[bytes, Staging]:
+    """Returns the image one launch compiles to and what a host stages for it.
+
+    Args:
+        launch: The launch the planner produced.
+
+    Returns:
+        The image bytes padded to the loader's boundary, and the staging the emitter placed them from.
+
+    Raises:
+        NotImplementedError: If the launch activates its staged tiles, which the emitter does not place.
+    """
+    if launch.activate:
+        message = (
+            "Unable to compile a launch that activates its staged tiles. The emitter places the staging, the "
+            "matrix commands and the drain only, so such a launch comes from `kernels.build_looped_gemm` until "
+            "the activation is placed here too."
+        )
+        raise NotImplementedError(message)
+    counts = dict(column_tiles=launch.column_tiles, groups=launch.groups, loop_blocks=launch.loop_blocks,
+                  fuse_groups=launch.fuse_groups, block_m=launch.block_m, block_n=launch.block_n)
+    bundles, staging = looped_gemm_stream(**counts)
+    return AsmKernel(name="looped_gemm", bundles=bundles).to_bytes(pad_to=4), staging
+
+
 def _resident_tiles(*, index: int, matmul: MatMul, covered: dict[str, int]) -> None:
     """Judges the output tiles a matmul accumulates at once, refusing a block the machine cannot stage.
 
     Notes:
         Tiles past what the register file affords accumulate in VMEM, so what this rejects is a block whose own
-        staging does not fit, which no spill relieves. The nest's width reaches the map as the block it implies,
-        so what a nest may hold and what a block may is one derivation.
+        staging does not fit, which no spill relieves.
 
     Args:
         index: Position of the matmul in the kernel.
@@ -1223,8 +1232,8 @@ def _resident_tiles(*, index: int, matmul: MatMul, covered: dict[str, int]) -> N
         axis = inner.get(step)
         if axis is not None:
             resident *= covered[axis] // step
-    # Asks the map for a block wide enough to hold them, which spills what the registers cannot keep and raises
-    # only where a step's own staging overruns the file.
+    # Asks the map for a block wide enough to hold them, which raises only where a step's own staging
+    # overruns the file.
     try:
         register_map(block_m=matmul.rows, block_n=resident * _TILE)
     except LayoutError as error:
@@ -1241,9 +1250,8 @@ def _repacking_needed(*, index: int, matmul: MatMul, strides: dict[str, int]) ->
     """Reports every operand the host must rewrite in memory before this matmul can read it.
 
     Notes:
-        The 16 lanes read one contiguous run, so whichever dimension lands on them must step by one element. A
-        weight held as depth by columns is read where it lies, and one held as columns by depth steps a whole row
-        per column, so the host rewrites it first at the cost of a pass over the data.
+        The 16 lanes read one contiguous run, so whichever dimension lands on them must step by one element.
+        One that does not is rewritten on the host first, at the cost of a pass over the data.
 
     Args:
         index: Position of the matmul in the kernel.

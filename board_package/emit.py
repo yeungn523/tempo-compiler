@@ -1,9 +1,7 @@
 """Derives the tiled GEMM's bundle placement from the published ISA contract and the loop nest it walks.
 
-Every placement constant that follows from the machine is computed from the writeback offsets and controller
-occupancies `compiler/minitpuisa.td` publishes through `isa_model.py`, and the two that remain written out are
-scheduling policy their own docstrings name as such. Correctness is judged by reproducing `kernels.py`'s bundle
-stream, which is the only one a board is known to accept.
+Every placement constant that follows from the machine is computed from what `compiler/minitpuisa.td` publishes
+through `isa_model.py`, and the two that remain written out are scheduling policy their own docstrings name as such.
 """
 
 from __future__ import annotations
@@ -39,34 +37,23 @@ from layout import RegisterMap, VmemAllocator, register_map  # noqa: E402
 
 
 _MATLOAD_AT: int = (_TILE_VREGS - 1) + RTL_PARAMS["WB_W_VLD"] + 1
-"""Offset the weight load issues at, being the first cycle every weight register has landed.
-
-The weight loads occupy the step's first `_TILE_VREGS` offsets, and a load's earliest dependent consumer sits one
-cycle past its writeback reservation.
-"""
+"""Offset the weight load issues at, being the first cycle every weight register has landed, which is one cycle
+past the last weight load's writeback reservation."""
 
 _PUSH_AT: int = _MATLOAD_AT + MATRIX_OCCUPANCY["vmatload"] + 1
-"""Offset the first activation push issues at, being the first cycle the matrix controller is free again.
-
-A command issued at one cycle holds the controller for its occupancy, so the next becomes legal one cycle later.
-"""
+"""Offset the first activation push issues at, being the first cycle the matrix controller is free again. A
+command holds the controller for its occupancy, so the next becomes legal one cycle later."""
 
 _PUSH_II: int = MATRIX_OCCUPANCY["vmatpush"] + 1
 """Offsets between consecutive pushes, being the interval the controller's occupancy allows."""
 
 _POP_II: int = 5
-"""Offsets between consecutive pops, which is scheduling policy rather than a consequence of the ISA.
-
-A pop holds the controller for seven cycles, so the ISA alone would place the next one eight offsets later. Placing
-them closer states an intent to issue and leaves the real distance to `asm.schedule`, which prices it from that same
-occupancy.
-"""
+"""Offsets between consecutive pops, which is scheduling policy rather than a consequence of the ISA. Placing them
+closer than the controller's occupancy states an intent to issue and leaves the real distance to `asm.schedule`."""
 
 _ACCUMULATE_POP_GAP: int = 2
-"""Offsets left after a group's accumulate before the next pop, which is scheduling policy.
-
-The adds hold the result registers the following pop overwrites, so the gap keeps them clear of its write window.
-"""
+"""Offsets left after a group's accumulate before the next pop, which is scheduling policy. The adds hold the
+result registers the following pop overwrites, so the gap keeps them clear of its write window."""
 
 _ZERO_ROWS: int = _TILE
 """Rows the clearing tile occupies, which one descriptor fills before any column tile runs."""
@@ -93,8 +80,8 @@ class LoopLevel:
     """Describes one loop of the emitted nest.
 
     Attributes:
-        axis: Problem axis the loop walks, being "n" for output columns and "k" for the reduction. The token axis
-            is absent because the host issues one launch per token block rather than the image walking them.
+        axis: Problem axis the loop walks, being "n" for output columns and "k" for the reduction. The token
+            axis is absent, since the host issues one launch per token block.
         trips: Iterations the loop runs.
     """
 
@@ -106,8 +93,8 @@ class LoopLevel:
 class Staging:
     """Describes what a host stages for one emitted image and what it reads back.
 
-    The emitter settles these while placing the image, so a host taking them from here states them once rather
-    than deriving a second set that can disagree with the one the bundles were built from.
+    The emitter settles these while placing the image, so a host takes them from here rather than deriving a
+    second set that can disagree with it.
 
     Attributes:
         rows: Token rows one launch covers.
@@ -139,9 +126,8 @@ class Staging:
     def activation_slack(self) -> int:
         """Returns the bytes past the packed activation the trailing prefetch reads, which a host allocates.
 
-        The block loop stages one block ahead of the one it computes, so the last iteration issues a descriptor for
-        a block that is not there. The read is discarded, but the address must still be mapped, and how far past
-        the end it lands scales with the rows one block covers.
+        The block loop stages one block ahead, so the last iteration reads a block that is not there. The read is
+        discarded, but the address must still be mapped.
         """
         return _STEPS * self.rows * _ROW_BYTES
 
@@ -234,10 +220,7 @@ def staging_levels(*, nest: tuple[LoopLevel, ...],
 
     Notes:
         An operand is re-staged at the innermost loop whose axis its address depends on, because every loop inside
-        that one leaves the address unchanged and would re-read what VMEM already holds. Which loops those are is
-        what the nesting order decides, so this is where a loop order becomes a different image: a reduction inside
-        the column loop leaves the left operand re-read once per column tile, and a column loop inside the reduction
-        stages it once and reuses it.
+        that one leaves the address unchanged and would re-read what VMEM already holds.
 
     Args:
         nest: The emitted loops, outermost first.
@@ -268,10 +251,8 @@ def resident_tiles(*, nest: tuple[LoopLevel, ...]) -> int:
     """Returns the output tiles the accumulators must hold at once for one pass of the nest.
 
     Notes:
-        An output tile is invariant to the reduction, so it stays live across every reduction loop enclosing it.
-        A column loop nested inside one therefore keeps all of its tiles live at once, while a column loop outside
-        every reduction loop keeps one. This is the cost a nesting order charges against the register file, and it
-        is what makes walking the columns inside the contraction expensive rather than free.
+        An output tile is invariant to the reduction, so a column loop nested inside one keeps all of its tiles
+        live at once while a column loop outside every reduction loop keeps one.
 
     Args:
         nest: The emitted loops, outermost first.
@@ -295,9 +276,7 @@ def gemm_step(*, activation_row: int, weight_row: int, close_loop: bool,
 
     Notes:
         One rule places the matrix commands. Push as early as the output FIFO allows and pop only when a further
-        push would overflow it, because a pop stalls until the array produces the result it takes while a push is
-        what the array waits on. The FIFO's depth is read rather than assumed, so a deeper one changes the
-        placement without changing this function.
+        push would overflow it, because a pop stalls on the array while a push is what the array waits on.
 
     Args:
         activation_row: First VMEM row of this step's activation pair, spanning both token groups.
@@ -328,8 +307,8 @@ def gemm_step(*, activation_row: int, weight_row: int, close_loop: bool,
             x=builder.vld(vreg=registers.activation + vreg, row=activation_row + _NUM_SUBLANES * vreg))
     put(offset=_MATLOAD_AT, m=builder.vmatload(vreg=registers.weight))
     if spill_row is not None and registers.reload_hoisted:
-        # Reads what earlier steps accumulated, which this step's results do not feed, so the load issues beside
-        # the operand staging and lands well before the adds that consume it.
+        # Reads what earlier steps accumulated, which this step's results do not feed, so the load rides beside
+        # the operand staging.
         for group in range(registers.token_groups):
             for vreg in range(_TILE_VREGS):
                 put(offset=_TILE_VREGS * (2 + group) + vreg,
@@ -366,9 +345,6 @@ def looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups
                 block_m: int = _BLOCK_TOKENS, block_n: int = _TILE) -> tuple[dict[int, dict[str, int]], Staging]:
     """Returns the tiled GEMM's bundles and what a host stages for them, both from one derivation.
 
-    The staging comes out of the same register map and block width the bundles are placed from, so the two
-    cannot describe different launches.
-
     Notes:
         Staging is overlapped onto compute by double buffering. A block computes out of one VMEM slot while the
         next block's operands land in the other, and `vmemswap` exchanges them once per block.
@@ -377,12 +353,11 @@ def looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups
         column_tiles: Output column tiles the product covers, being the outer loop's trip count.
         groups: Reduction groups each column tile accumulates, being the middle loop's trip count.
         loop_blocks: Accumulation blocks one group carries, which the two way unroll halves into a trip count.
-        fuse_groups: Determines whether the accumulators stay resident across every group and drain once per
-            column tile, summing the contraction on the device in BF16, rather than draining a partial per
-            group for the host to sum in float32.
+        fuse_groups: Determines whether the accumulators drain once per column tile, summing the contraction on
+            the device in BF16, rather than once per group for the host to sum in float32.
         block_m: Token rows one block covers, being the activation tiles it stages and pushes.
-        block_n: Output columns one block covers. A block spanning several tiles accumulates them together, so its
-            activations are staged once for the group rather than once for each tile.
+        block_n: Output columns one block covers, whose tiles accumulate together and share one staging of the
+            activations.
 
     Returns:
         The image's bundles, keyed by offset, and the staging a host reads them back with.
@@ -432,8 +407,8 @@ def looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups
     at += 1
     at = _emit_rewind(put=put, builder=builder, at=at, loop=nest[0], operands=staged)
 
-    # Clears the accumulators once per column tile, so they carry every group and the contraction sums in BF16 on
-    # the device.
+    # Clears the accumulators once per column tile, so they carry every group and the contraction sums on
+    # the device in BF16.
     if fuse_groups:
         at = _emit_clear(put=put, builder=builder, at=at, rows=rows, registers=registers)
 
@@ -479,7 +454,7 @@ def looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups
     put(offset=at, f=builder.loop_end())
     at += 1
     put(offset=at, f=builder.halt())
-    # A spilled tile drains once per bank, since the blocks alternate banks, so each drain leaves two partials.
+    # Drains a spilled tile once per bank, since the blocks alternate banks and each leaves two partials.
     held = registers.resident or registers.spilled
     staging = Staging(rows=block_m, columns=column_tiles * _TILE, output_tiles=tiles,
                       blocks=nest[0].trips,
@@ -524,8 +499,7 @@ def _innermost_staging(*, nest: tuple[LoopLevel, ...], operands: tuple[StagedOpe
         ValueError: If the nest holds more output tiles resident than the register map carries, or if it assigns
             an operand to any loop but the innermost one.
     """
-    # Counts every tile the block accumulates, since a spilled one is held as much as a resident one and only
-    # costs more to fold.
+    # Counts every tile the block accumulates, since a spilled one is held as much as a resident one.
     registers_held = registers.output_tiles
     tiles = resident_tiles(nest=nest)
     if tiles > registers_held:
@@ -576,9 +550,7 @@ def _emit_rewind(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at
 
     Notes:
         An operand whose address does not walk this loop's axis is read again from its base on every iteration,
-        so the pointer returns to the launch argument rather than walking on. One whose address does walk it is
-        left alone, because the next iteration wants exactly where the last one stopped. The rebind is followed by
-        one block's advance, which is the lead the innermost loop's prefetch runs at.
+        so its pointer returns to the launch argument. One whose address does walk it is left where it stopped.
 
     Args:
         put: Merges slot words into the bundle at one offset.
@@ -612,8 +584,8 @@ def _emit_stage(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at:
         # Issues one descriptor per tile, since DMEM holds them a contraction apart rather than side by side.
         for tile in range(operand.tiles):
             if tile:
-                # Frees the slot before this tile reuses it, waiting on this operand's alone so the other stays
-                # in flight.
+                # Frees the slot before this tile reuses it, waiting on this operand's alone so the other
+                # stays in flight.
                 put(offset=at, f=builder.flush_slot(mask=1 << operand.dma_slot))
                 at += 1
             put(offset=at, d=builder.dma_load(slot=operand.dma_slot,
@@ -648,9 +620,8 @@ def _emit_clear_spill(*, put: Callable[..., None], builder: asm_module.AsmBuilde
     """Zeroes the spilled accumulators in both VMEM banks, returning the next free offset.
 
     Notes:
-        A block ends in `vmemswap`, so consecutive blocks fold into opposite banks and each carries half the
-        contraction. Compute reaches only the bank it is on, so both are cleared across a swap, and the pair of
-        swaps leaves the bank the blocks expect.
+        A block ends in `vmemswap`, so consecutive blocks fold into opposite banks. Compute reaches only the bank
+        it is on, so both are cleared across a swap and the pair of swaps leaves the bank the blocks expect.
 
     Args:
         put: Merges slot words into the bundle at one offset.
@@ -704,9 +675,8 @@ def _emit_drain_spill(*, put: Callable[..., None], builder: asm_module.AsmBuilde
     """Stores both banks' spilled accumulators, returning the next free offset.
 
     Notes:
-        The tiles already lie in VMEM, so a descriptor stores them where they are. Each bank holds the blocks
-        that folded into it, which is half of them, so both drain and the host sums them alongside the partials it
-        already sums. A descriptor names its VMEM slot outright, which reaches the bank compute is not on.
+        The tiles already lie in VMEM, so a descriptor stores them where they are. Each bank holds half the
+        blocks, so both drain and a descriptor names its slot outright to reach the bank compute is not on.
 
     Args:
         put: Merges slot words into the bundle at one offset.
@@ -796,8 +766,7 @@ def _place_matrix_commands(*, put: Callable[..., None], builder: asm_module.AsmB
                     put(offset=at, f=builder.loop_end())
                 at += 1
         else:
-            # The runs stay apart because a vst reads VREG port A, which every add and every push holds while it
-            # issues.
+            # Keeps the runs apart, since a vst reads VREG port A and every add and push holds it while issuing.
             group_row = spill_row + _TILE_ROWS * pending
             scratch = registers.scratch + (_TILE_VREGS * pending if registers.reload_hoisted else 0)
             if not registers.reload_hoisted:
@@ -851,9 +820,8 @@ def _merge(*, bundles: dict[int, dict[str, int]], offset: int, slots: dict[str, 
     """Merges one offset's slot words into the image, refusing what a bundle cannot issue.
 
     Notes:
-        Co-issue is the ordinary case, so a merge naming a free slot lands beside what the offset holds. A bundle
-        issues one word per slot, so a merge naming one the offset already holds is a placement bug, and the word
-        it would replace leaves an image nothing downstream re-checks.
+        A bundle issues one word per slot, so a merge naming one the offset already holds is a placement bug and
+        the word it would replace leaves an image nothing downstream re-checks.
 
     Args:
         bundles: The image under construction, keyed by offset.

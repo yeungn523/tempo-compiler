@@ -161,23 +161,30 @@ def minitpuMemcpy(dst: HostOperand, src: HostOperand, nbytes: int, kind: str) ->
         host.sync_from_device()
 
 
-def minitpuMemcpyAsync(
-    dst: HostOperand,
-    src: HostOperand,
-    nbytes: int,
-    kind: str,
-    stream=None,
-):
-    """Copies bytes asynchronously, which this runtime does not implement.
+def minitpuMemcpyAsync(dst: HostOperand, src: HostOperand, nbytes: int, kind: str,
+                       stream: None = None) -> None:
+    """Copies bytes between the host and the device.
+
+    Args:
+        dst: The destination, being the device address for a host to device copy and the host buffer otherwise.
+        src: The source, being the host buffer for a host to device copy and the device address otherwise.
+        nbytes: The number of bytes to transfer.
+        kind: The direction, being one of the ``MemcpyKind`` values.
+        stream: The stream to order the copy on. The device runs one command at a time and exposes no stream, so
+            None is the only value it accepts.
 
     Raises:
-        NotImplementedError: Always, since this runtime is sequential and depth-1. An async copy needs a command
-            ring, per-command completion and multi-slot tracking.
+        ValueError: When the kind is unknown, the byte count is negative or zero, either operand address is
+            misaligned, or a stream is named.
+        TimeoutError: When the command does not retire within the poll timeout.
     """
-    message = (
-        "Unable to copy asynchronously. This runtime is sequential and depth-1, so use minitpuMemcpy instead."
-    )
-    raise NotImplementedError(message)
+    if stream is not None:
+        message = (
+            f"Unable to order a copy on a stream. The command window is one deep and the device exposes no "
+            f"stream, so the stream must be None, but got {stream!r}."
+        )
+        raise ValueError(message)
+    minitpuMemcpy(dst=dst, src=src, nbytes=nbytes, kind=kind)
 
 
 def minitpuDrain(timeout: float = _DRAIN_TIMEOUT) -> bool:

@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Holds the GEMM kernel this compiler is exercised against, and writes the operand pair it runs on.
 
-The extents are GPT-2's feed forward projection, being the model width by four times it.
-
 Compiling the kernel needs only the declaration below, which `kernel_entry_point.py` reads by name. Running it
 needs numbers too, so this file writes an operand pair when it is executed rather than imported, into the directory
 named as its one argument. The pair comes from `bf16.build_operands`, which refuses a draw whose rows or columns
@@ -28,11 +26,11 @@ from bf16 import build_operands  # noqa: E402
 _ROWS: int = 64
 """Token rows the whole product covers, which the operands are drawn at and the kernel walks in BLOCK_M steps."""
 
-_COLUMNS: int = 3072
-"""Output columns the whole product covers, being GPT-2's four times model width, walked in BLOCK_N steps."""
+_COLUMNS: int = 48
+"""Output columns the whole product covers, walked in BLOCK_N steps."""
 
-_DEPTH: int = 768
-"""The contraction both operands share, being GPT-2's model width, walked in BLOCK_K steps."""
+_DEPTH: int = 192
+"""The contraction both operands share, walked in BLOCK_K steps."""
 
 _SEED: int = 0
 """Draw the operands are generated from, fixed so two runs compile the same numbers."""

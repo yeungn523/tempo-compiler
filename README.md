@@ -110,6 +110,9 @@ python3 kernel_entry_point.py --kernel sample_gemm.py:matmul_kernel \
 python3 tools/sim_gemm.py --image build/e2e/matmul_0.bin --operands build/e2e/matmul_0_operands.npz
 ```
 
+***Note,*** widening the sample to GPT-2's model width by four times it needs `--max-cycles` on the last line,
+because one token block then runs past the two million cycles the testbench allows a round by default.
+
 These three carry one kernel from its Triton declaration through the reader, the planner and the emitter, run the
 image they produce against the RTL, and compare the drained product against a float64 reference. The last line reports
 the relative error and exits non-zero past the tolerance the BF16 accumulate chain allows, so the sequence stands as a

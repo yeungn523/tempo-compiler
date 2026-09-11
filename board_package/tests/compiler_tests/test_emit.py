@@ -22,8 +22,18 @@ import asm  # noqa: E402
 import bf16  # noqa: E402
 import emit  # noqa: E402
 import kernels  # noqa: E402
+import numpy as np  # noqa: E402
 from compiler_tests.test_layout import renaming_onto  # noqa: E402
 from layout import register_map  # noqa: E402
+
+_ACTIVATION_POINTER: int = 0
+"""Scalar register the activation operand's host address lives in, as `emit.gemm_operands` assigns it."""
+
+_F_LBEGIN: int = 1
+"""F-slot opcode opening a hardware loop, which `AsmBuilder.lbegin` encodes."""
+
+_F_LOOP_END: int = 2
+"""F-slot opcode closing the innermost hardware loop."""
 
 
 class EmitterConformanceTest(unittest.TestCase):
@@ -112,20 +122,170 @@ class EmitterHandoverTest(unittest.TestCase):
                 stored = {_descriptor_rows(word) for word in words if _stores(word)}
                 self.assertEqual(stored, {staging.drain_rows})
 
+    def test_the_activation_slack_covers_the_blocks_the_image_prefetches(self) -> None:
+        """Asserts the slack a host allocates is the activation the image's trailing prefetch reads past the end.
 
-class EmitterStagingTest(unittest.TestCase):
-    """Covers the staging analysis the emitter places its loads from."""
+        The block loop stages one block ahead, so the last iteration reads a block that is not there. A slack taken
+        from a constant rather than from the block the image stages leaves that read off the end of the buffer.
+        """
+        for counts in (dict(column_tiles=3, groups=3, loop_blocks=2),
+                       dict(column_tiles=4, groups=3, loop_blocks=2, block_n=32),
+                       dict(column_tiles=3, groups=3, loop_blocks=2, block_m=16)):
+            with self.subTest(**counts):
+                words, staging = emit.looped_gemm_stream(**counts)
+                staged = {_descriptor_rows(word) for word in words
+                          if _loads(word) and _descriptor_base(word) == _ACTIVATION_POINTER}
+                self.assertEqual(staged, {staging.rows})
+                self.assertEqual(staging.activation_slack, bf16._STEPS * staging.rows * bf16._ROW_BYTES)
 
-    def test_a_step_places_one_bundle_per_offset(self) -> None:
-        """Asserts one GEMM step names no offset twice, since two slots of a kind cannot share a bundle."""
+    def test_the_drain_fires_in_the_order_the_reduction_reads_it(self) -> None:
+        """Asserts the loops the image drains under run in the order `reduce_drain`'s leading axes assume.
+
+        The rows a descriptor moves say nothing about the order the loops issue them in, so a reader whose axes are
+        permuted still sees a buffer of the right size and sums the wrong rows together.
+        """
+        for counts in (dict(column_tiles=3, groups=3, loop_blocks=2),
+                       dict(column_tiles=4, groups=3, loop_blocks=2, block_n=32),
+                       dict(column_tiles=3, groups=3, loop_blocks=2, block_m=16),
+                       dict(column_tiles=4, groups=3, loop_blocks=2, block_n=32, fuse_groups=True)):
+            with self.subTest(**counts):
+                words, staging = emit.looped_gemm_stream(**counts)
+                # Pads a fused launch's vector, whose drain sits outside the group loop and carries the block alone.
+                issued = [(counters + (0,))[:2] for counters in _drain_sequence(words)]
+                self.assertEqual(issued, [(block, partial) for block in range(staging.blocks)
+                                          for partial in range(staging.partials)])
+
+    def test_the_drain_reduces_to_the_product_the_launch_covers(self) -> None:
+        """Asserts `reduce_drain` recovers each column's value from a buffer laid out as the image fills it."""
+        for counts in (dict(column_tiles=4, groups=3, loop_blocks=2, block_n=32),
+                       dict(column_tiles=3, groups=3, loop_blocks=2, block_m=16)):
+            with self.subTest(**counts):
+                _, staging = emit.looped_gemm_stream(**counts)
+                shape = (staging.blocks, staging.partials, staging.output_tiles, staging.rows, bf16._TILE)
+                wanted = np.arange(staging.rows * staging.columns, dtype=np.float32).reshape(
+                    staging.rows, staging.columns)
+                drained = np.empty(shape, dtype=np.float32)
+                for block, partial, tile in np.ndindex(*shape[:3]):
+                    column = (block * staging.output_tiles + tile) * bf16._TILE
+                    # Splits each column across its partials, so a reduction summing the wrong axis misses the value.
+                    drained[block, partial, tile] = wanted[:, column : column + bf16._TILE] / staging.partials
+                np.testing.assert_allclose(bf16.reduce_drain(drained.reshape(-1), shape=shape), wanted, rtol=1e-6)
+
+
+class SpillReloadTest(unittest.TestCase):
+    """Covers where a spilled tile's reload lands in the step that folds it."""
+
+    def test_a_hoisted_reload_issues_before_the_first_push(self) -> None:
+        """Asserts a block owning a scratch tile per group loads its accumulators at the step's head.
+
+        The reload reads what earlier steps left, so placing it ahead of the array work hides its latency behind
+        the pushes instead of stalling the adds that consume it.
+        """
+        registers = register_map(block_m=32, block_n=64)
+        self.assertTrue(registers.reload_hoisted)
+        rows = emit.vmem_map(output_tiles=registers.output_tiles, token_groups=registers.token_groups,
+                             spilled=registers.spilled)
+        step = emit.gemm_step(activation_row=rows["activation"][0], weight_row=rows["weight"][0],
+                              close_loop=False, registers=registers, tile=0, spill_row=rows["spill"][0])
+        first_push = min(offset for offset, slots in step.items() if "m" in slots and offset > emit._MATLOAD_AT)
+        loaded = {register
+                  for offset, slots in step.items() if offset < first_push and "x" in slots
+                  for register, _ in asm._decode(slots["x"])["writes"]}
+        scratch = set(range(registers.scratch, registers.scratch + registers.scratch_tiles * bf16._TILE_VREGS))
+        self.assertTrue(scratch <= loaded, "a scratch tile is left unloaded when the pushes begin")
+
+
+class BundleMergeTest(unittest.TestCase):
+    """Covers the merge every placed bundle goes through, which is the only thing holding one word per slot."""
+
+    def test_a_slot_the_offset_already_carries_is_refused(self) -> None:
+        """Asserts a second word of one slot raises instead of replacing the word already placed there.
+
+        A bundle issues one word per slot, so replacing the first would drop an instruction from an image nothing
+        downstream re-checks, which reaches a board as wrong numbers.
+        """
+        builder = asm.AsmBuilder()
+        bundles: dict[int, dict[str, int]] = {}
+        emit._merge(bundles=bundles, offset=0, slots={"x": builder.vld(vreg=16, row=48)})
+        with self.assertRaises(ValueError):
+            emit._merge(bundles=bundles, offset=0, slots={"x": builder.vst(vreg=24, row=208)})
+        self.assertEqual(bundles[0]["x"], builder.vld(vreg=16, row=48), "the placed load was replaced")
+
+    def test_a_slot_the_offset_leaves_free_co_issues(self) -> None:
+        """Asserts a merge naming a free slot lands beside what the offset holds, which is what co-issue is."""
+        builder = asm.AsmBuilder()
+        bundles: dict[int, dict[str, int]] = {}
+        emit._merge(bundles=bundles, offset=0, slots={"m": builder.vmatpush(vreg=8)})
+        emit._merge(bundles=bundles, offset=0, slots={"x": builder.vld(vreg=16, row=48)})
+        self.assertEqual(sorted(bundles[0]), ["m", "x"])
+
+    def test_a_descriptor_co_issued_with_a_compute_slot_is_refused(self) -> None:
+        """Asserts a compute slot merged onto a descriptor raises, since the two encodings overlap."""
+        builder = asm.AsmBuilder()
+        bundles: dict[int, dict[str, int]] = {}
+        emit._merge(bundles=bundles, offset=0, slots={"d": builder.dma_load(
+            slot=0, vmem_address=0, rows=16, base_sreg=1, stride_sreg=3)})
+        with self.assertRaises(ValueError):
+            emit._merge(bundles=bundles, offset=0, slots={"x": builder.vld(vreg=16, row=48)})
+
+    def test_the_emitted_step_places_one_word_per_slot(self) -> None:
+        """Asserts a step's own placement never asks one bundle to issue two words of a slot."""
         step = emit.gemm_step(activation_row=0, weight_row=0, close_loop=False)
-        for offset, slots in step.items():
-            self.assertEqual(len(slots), len(set(slots)), f"offset {offset} names a slot twice")
+        self.assertTrue(all(slots for slots in step.values()))
+
+
+def _drain_sequence(words: tuple[int, ...]) -> list[tuple[int, ...]]:
+    """Returns the enclosing loop counters at every store descriptor, in the order the image issues them.
+
+    The hardware loops are unrolled here rather than measured on a device, so the order a drain lands in the buffer
+    is read off the image itself.
+    """
+    events: list[tuple] = []
+    for word in words:
+        if _stores(word):
+            events.append(("store",))
+        field = (word >> asm._F_SHIFT) & ((1 << asm.F_SLOT_W) - 1)
+        operation = (field >> (asm.F_SLOT_W - 3)) & 0x7 if field else 0
+        if operation == _F_LBEGIN:
+            events.append(("lbegin", field & 0xFFFF))
+        elif operation == _F_LOOP_END:
+            events.append(("loop_end",))
+
+    issued: list[tuple[int, ...]] = []
+
+    def walk(start: int, counters: tuple[int, ...]) -> int:
+        """Runs the events from one position, returning the position past the loop it closes."""
+        at = start
+        while at < len(events):
+            event = events[at]
+            if event[0] == "lbegin":
+                for trip in range(event[1]):
+                    past = walk(at + 1, (*counters, trip))
+                at = past
+            elif event[0] == "loop_end":
+                return at + 1
+            else:
+                issued.append(counters)
+                at += 1
+        return at
+
+    walk(0, ())
+    return issued
 
 
 def _stores(word: int) -> bool:
     """Returns whether one bundle carries a descriptor writing host memory."""
     return bool(asm._decode(word)["dma"]) and bool((word >> asm._D_SHIFT) >> 35 & 1)
+
+
+def _loads(word: int) -> bool:
+    """Returns whether one bundle carries a descriptor reading host memory."""
+    return bool(asm._decode(word)["dma"]) and not (word >> asm._D_SHIFT) >> 35 & 1
+
+
+def _descriptor_base(word: int) -> int:
+    """Returns the scalar register one descriptor reads its host base address from."""
+    return (word >> asm._D_SHIFT) >> 2 & 0x3
 
 
 def _descriptor_rows(word: int) -> int:

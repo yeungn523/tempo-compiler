@@ -1,19 +1,12 @@
 """Provides the layouts that say where a tensor's elements live, and what each one costs.
-
-DMEM is an ABI, because a tensor one launch writes the next one reads and no compiler sees that program, so `Tiled`
-writes the layout down rather than inferring it. VMEM is per-launch scratch that `VmemAllocator` hands out in
-disjoint regions. A VREG is not a choice at all: it is `NUM_SUBLANES` by `NUM_LANES` and always holds that many
-consecutive VMEM rows. Everything else here is derivation, since the descriptor fields and the `vld` fields follow
-from a layout and an access by arithmetic.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-from bf16 import (_BLOCK_DEPTH, _ELEMENT_BYTES, _LOOP_BLOCKS,
-                  _MAX_DESCRIPTOR_ROWS, _NUM_LANES, _NUM_SUBLANES, _ROW_BYTES,
-                  _TILE, _TILE_VREGS, _VMEM_ENTRIES_PER_LANE)
+from bf16 import (_MAX_DESCRIPTOR_ROWS, _NUM_LANES, _ROW_BYTES, _TILE, _TILE_VREGS,
+                  _VMEM_ENTRIES_PER_LANE)
 from isa_model import PROFILE
 from asm import AGU_SHIFT_W
 
@@ -208,6 +201,9 @@ class RegisterMap:
         output_tiles: Output tiles one block covers, being its columns over the tile.
         resident: Output tiles the accumulators hold in registers. The rest accumulate in VMEM, and zero means every
             one of them does.
+        scratch: First register of the tiles a spilled accumulator is read into and written back from, or None when
+            every output tile stays in registers and none is needed.
+        scratch_tiles: Scratch tiles the map hands out, being one per token group where the file affords it.
     """
 
     accumulator: int
@@ -217,16 +213,25 @@ class RegisterMap:
     token_groups: int
     output_tiles: int
     resident: int
+    scratch: int | None = None
+    scratch_tiles: int = 0
 
     @property
     def used(self) -> int:
         """Returns the registers the map hands out."""
-        return self.result + _TILE_VREGS
+        if self.scratch is None:
+            return self.result + _TILE_VREGS
+        return self.scratch + self.scratch_tiles * _TILE_VREGS
 
     @property
     def spilled(self) -> int:
         """Returns the output tiles that accumulate in VMEM rather than in registers."""
         return self.output_tiles - self.resident
+
+    @property
+    def reload_hoisted(self) -> bool:
+        """Returns whether every token group owns a scratch tile, which lets its reload issue at a step's head."""
+        return bool(self.spilled) and self.scratch_tiles == self.token_groups
 
 
 @dataclass(frozen=True)
@@ -392,50 +397,12 @@ class VmemAllocator:
                 raise LayoutError(message)
 
 
-def choose_loop_blocks(depth: int, *, limit: int = _LOOP_BLOCKS) -> int:
-    """Returns the blocks one accumulation group covers, for a contraction of `depth`.
-
-    The drain is emitted in pairs, so the count must be even, and a group must tile the contraction exactly, so it
-    must divide the block count.
-
-    Args:
-        depth: The contraction, a whole number of `_BLOCK_DEPTH`.
-        limit: The largest group to consider. A larger group amortises the group loop's prologue over more blocks,
-            so the largest legal one is taken.
-
-    Returns:
-        The blocks per group.
-
-    Raises:
-        LayoutError: If the depth is not a whole number of blocks, or no even count at or below `limit` divides it.
-    """
-    if depth <= 0 or depth % _BLOCK_DEPTH:
-        message = (
-            f"Unable to contract over {depth}. One accumulation block is "
-            f"{_BLOCK_DEPTH} deep, so the contraction must be a whole number of "
-            f"them."
-        )
-        raise LayoutError(message)
-    blocks = depth // _BLOCK_DEPTH
-    for candidate in range(limit - limit % 2, 1, -2):
-        if blocks % candidate == 0:
-            return candidate
-    message = (
-        f"Unable to cover a contraction of {depth} -- {blocks} blocks of "
-        f"{_BLOCK_DEPTH} -- in even groups of at most {limit}. The drain is "
-        f"emitted in pairs, so the group must be even, and it must divide the "
-        f"block count. Pad the contraction to a multiple of "
-        f"{2 * _BLOCK_DEPTH}."
-    )
-    raise LayoutError(message)
-
-
 def register_map(*, block_m: int, block_n: int) -> RegisterMap:
     """Returns where a block's operands live in the register file, and how much of it accumulates in registers.
 
     A step stages one activation set per token group, one weight tile and one result tile, so those are placed first
     and the registers left over decide how many output tiles accumulate in registers. The rest accumulate in VMEM,
-    which is what a tile larger than the register file costs.
+    which costs a scratch tile to read them into and one fewer resident with it.
 
     Args:
         block_m: Rows one block covers, a whole number of the tile.
@@ -445,8 +412,8 @@ def register_map(*, block_m: int, block_n: int) -> RegisterMap:
         The map.
 
     Raises:
-        LayoutError: If either extent is not a positive whole number of tiles, or a step's own staging does not fit
-            in the register file.
+        LayoutError: If either extent is not a positive whole number of tiles, if a step's own staging does not fit
+            in the register file, or if a block that must spill leaves no room for the scratch tile it reads into.
     """
     for name, extent in (("block_m", block_m), ("block_n", block_n)):
         if extent < _TILE or extent % _TILE:
@@ -467,13 +434,36 @@ def register_map(*, block_m: int, block_n: int) -> RegisterMap:
             f"result tile want {staging} of the {entries} registers present. Narrow the block's rows."
         )
         raise LayoutError(message)
-    resident = min(output_tiles, (entries - staging) // per_tile)
+    # A tile the registers cannot hold accumulates in VMEM, which needs somewhere to read it into and add against,
+    # so a block that spills any of them buys that scratch out of what it could otherwise keep resident.
+    affordable = (entries - staging) // per_tile
+    if affordable >= output_tiles:
+        resident, scratch_rows, scratch_tiles = output_tiles, 0, 0
+    else:
+        scratch_rows = _TILE_VREGS
+        # The staging check above passes a block whose staging fills the file exactly, which leaves the scratch
+        # tile nowhere to sit. A spill needs it, so this is the block's real floor rather than the staging alone.
+        if staging + scratch_rows > entries:
+            message = (
+                f"Unable to spill a block of {block_m} rows by {block_n} columns: its staging takes {staging} of "
+                f"the {entries} registers present, which leaves no room for the {scratch_rows} register scratch "
+                f"tile a spilled accumulator is read into. Narrow the block's rows."
+            )
+            raise LayoutError(message)
+        # Every tile spills once any does. A spilled tile drains as two partials, one per VMEM bank, and a
+        # resident one as a single tile, so a block holding both leaves the drain ragged where the host reads it
+        # as one rectangle.
+        resident = 0
+        # A scratch tile per token group lets each group's reload issue before the group ahead of it has folded,
+        # which is what puts the reload under a push instead of in front of its own adds.
+        scratch_tiles = min(token_groups, (entries - staging) // _TILE_VREGS)
 
     activation = accumulator + resident * per_tile
     weight = activation + per_tile
-    return RegisterMap(accumulator=accumulator, activation=activation, weight=weight,
-                       result=weight + _TILE_VREGS, token_groups=token_groups,
-                       output_tiles=output_tiles, resident=resident)
+    result = weight + _TILE_VREGS
+    return RegisterMap(accumulator=accumulator, activation=activation, weight=weight, result=result,
+                       token_groups=token_groups, output_tiles=output_tiles, resident=resident,
+                       scratch=result + _TILE_VREGS if scratch_rows else None, scratch_tiles=scratch_tiles)
 
 
 def rows_per_token(tiles: int) -> int:

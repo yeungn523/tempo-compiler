@@ -24,7 +24,6 @@ import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
 from bf16 import (  # noqa: E402
-    _BLOCK_ACTIVATION_BYTES,
     _BLOCK_WEIGHT_BYTES,
     _ELEMENT_BYTES,
     build_operands,
@@ -161,7 +160,7 @@ def main() -> int:
         activations=packed_activations,
         weights=packed_weights,
         expected=(left.astype(np.float64) @ right.astype(np.float64)).astype(np.float32),
-        activation_bytes=packed_activations[0].nbytes + _BLOCK_ACTIVATION_BYTES,
+        activation_bytes=packed_activations[0].nbytes + staging.activation_slack,
         weight_bytes=packed_weights.nbytes + _BLOCK_WEIGHT_BYTES,
         drain_words=drain.words,
         drain_bytes=drain.words * _ELEMENT_BYTES,

@@ -21,6 +21,7 @@ import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
 import kernels  # noqa: E402
+from bf16 import _TILE  # noqa: E402
 from compiler import ProgramError, plan, read_program, signature_of  # noqa: E402
 from compiler_tests.test_layout import renaming_onto  # noqa: E402
 from layout import register_map  # noqa: E402
@@ -75,10 +76,11 @@ class PlannerTest(unittest.TestCase):
         self.assertEqual(planned.repack, ())
 
     def test_the_drain_matches_the_partials_the_launch_leaves(self) -> None:
-        """Asserts the drain covers one partial per group per column tile when the groups are not fused."""
+        """Asserts the drain covers one partial per group per block, in the order the image walks them."""
         _, planned = compile_one(gemm)
         launch, drain = planned.launches[0], planned.drains[0]
-        self.assertEqual(drain.shape[:2], (launch.column_tiles, launch.groups))
+        self.assertEqual(drain.shape, (launch.blocks, launch.groups, launch.output_tiles, launch.block_m, _TILE))
+        self.assertEqual(launch.blocks * launch.output_tiles, launch.column_tiles)
 
     def test_a_block_wider_than_the_array_is_planned_as_its_column_tiles(self) -> None:
         """Asserts a block covering several column tiles is planned, since the register file holds its accumulators.
@@ -134,6 +136,40 @@ class PipelineTest(unittest.TestCase):
         base = dataclasses.replace(compile_one(gemm)[1].launches[0], column_tiles=4)
         self.assertEqual(compile_launch(dataclasses.replace(base, row_blocks=4))[0],
                          compile_launch(base)[0])
+
+    def test_the_planned_drain_matches_the_one_the_image_writes(self) -> None:
+        """Asserts the drain the plan states is the drain the emitter placed, for every block the planner produces.
+
+        The board sizes its buffer and reshapes its partials from the plan's copy while the emitter settles its own,
+        so a drift between the two reads a product out of the wrong rows rather than raising.
+        """
+        from sim_triton_kernel import compile_launch  # noqa: PLC0415  -- a tool, not a package module
+
+        for kernel, dims in ((gemm, ()), (gemm_wide_columns, ({"m": 32},)), (gemm_short_rows, ())):
+            with self.subTest(kernel=kernel.fn.__name__):
+                _, planned = compile_one(kernel, dims=dims)
+                launch, drain = planned.launches[0], planned.drains[0]
+                _, staging = compile_launch(launch)
+                self.assertEqual(drain.shape, (staging.blocks, staging.partials, staging.output_tiles,
+                                               staging.rows, _TILE))
+                self.assertEqual(drain.words, staging.drain_words)
+
+    def test_a_spilling_block_plans_the_drain_its_image_writes(self) -> None:
+        """Asserts a block accumulating in VMEM states the drain the emitter placed for it.
+
+        A spilled tile drains once per VMEM bank, since consecutive blocks fold into opposite banks. A plan
+        missing that doubling sizes the buffer at half what the image writes.
+        """
+        import dataclasses  # noqa: PLC0415  -- used only here
+        from sim_triton_kernel import compile_launch  # noqa: PLC0415  -- a tool, not a package module
+
+        base = compile_one(gemm)[1].launches[0]
+        launch = dataclasses.replace(base, column_tiles=4, block_n=4 * _TILE)
+        self.assertTrue(register_map(block_m=launch.block_m, block_n=launch.block_n).spilled,
+                        "the block this covers no longer spills, so it covers the resident path twice")
+        _, staging = compile_launch(launch)
+        self.assertEqual((launch.blocks, launch.partials, launch.output_tiles, launch.block_m, _TILE),
+                         (staging.blocks, staging.partials, staging.output_tiles, staging.rows, _TILE))
 
     def test_a_launch_that_activates_is_refused(self) -> None:
         """Asserts a launch carrying an epilogue raises, since the emitter places the plain product only."""
@@ -228,6 +264,26 @@ def gemm_tall_rows(ap, wp, op, stride_am, stride_ak, stride_bk, stride_bn, strid
                    M: tl.constexpr = 64, N: tl.constexpr = 48, K: tl.constexpr = 192,
                    BLOCK_M: tl.constexpr = 64, BLOCK_N: tl.constexpr = 16, BLOCK_K: tl.constexpr = 64):
     """Multiplies with a token block that steps by the same amount the reduction does."""
+    offs_k = tl.arange(0, BLOCK_K)
+    for block in range(0, M, BLOCK_M):
+        offs_m = block + tl.arange(0, BLOCK_M)
+        for tile in range(0, N, BLOCK_N):
+            offs_n = tile + tl.arange(0, BLOCK_N)
+            a = ap + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+            b = wp + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+            accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for _ in range(0, K, BLOCK_K):
+                accumulator += tl.dot(tl.load(a), tl.load(b))
+                a += BLOCK_K * stride_ak
+                b += BLOCK_K * stride_bk
+            tl.store(op + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, accumulator)
+
+
+@triton.jit
+def gemm_short_rows(ap, wp, op, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+                    M: tl.constexpr = 64, N: tl.constexpr = 48, K: tl.constexpr = 192,
+                    BLOCK_M: tl.constexpr = 16, BLOCK_N: tl.constexpr = 16, BLOCK_K: tl.constexpr = 64):
+    """Multiplies with a token block covering one group rather than the two the token block holds."""
     offs_k = tl.arange(0, BLOCK_K)
     for block in range(0, M, BLOCK_M):
         offs_m = block + tl.arange(0, BLOCK_M)

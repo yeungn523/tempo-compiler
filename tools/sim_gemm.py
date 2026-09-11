@@ -25,7 +25,8 @@ import asm  # noqa: E402
 import emit  # noqa: E402
 from compiler.compile import Launch  # noqa: E402
 from bf16 import (_BLOCK_DEPTH, _BLOCK_TOKENS, _BLOCK_WEIGHT_BYTES, _ELEMENT_BYTES, _TILE,  # noqa: E402
-                  _ZERO_TILE_WORDS, build_operands, from_bf16_words, pack_activations, pack_weights)
+                  _ZERO_TILE_WORDS, build_operands, from_bf16_words, pack_activations, pack_weights,
+                  reduce_drain)
 
 _TOLERANCE: float = 0.02
 """Relative error the BF16 accumulate chain is allowed, which the board check also holds to."""
@@ -104,11 +105,9 @@ def simulate(*, launch: Launch, reduction: int, build_dir: str | None = None) ->
             raise RuntimeError(message)
         dumped = np.frombuffer((stage / "dump.bin").read_bytes(), dtype="<u2")[:drain_words]
 
-    # Reshapes by the blocks the emitter walked, since a block drains its tiles together.
     drained = from_bf16_words(words=dumped[_ZERO_TILE_WORDS:drain_words])
-    shaped = drained.reshape(staging.blocks, staging.partials, staging.output_tiles, staging.rows, _TILE)
-    summed = shaped.sum(axis=1, dtype=np.float32).reshape(staging.column_tiles, staging.rows, _TILE)
-    product: NDArray[np.float32] = summed.transpose(1, 0, 2).reshape(staging.rows, staging.columns)
+    product: NDArray[np.float32] = reduce_drain(drained, shape=(
+        staging.blocks, staging.partials, staging.output_tiles, staging.rows, _TILE))
     expected = (left.astype(np.float64) @ right.astype(np.float64)).astype(np.float32)
     return float(np.abs(product - expected).max() / np.abs(expected).max())
 

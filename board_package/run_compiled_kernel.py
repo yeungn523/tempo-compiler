@@ -14,7 +14,7 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent
 
 sys.path.insert(0, str(_HERE / "minitpu_runtime"))
 
-from bf16 import from_bf16_words  # noqa: E402
+from bf16 import from_bf16_words, reduce_drain  # noqa: E402
 from runtime import (  # noqa: E402
     MemcpyKind,
     minitpuFree,
@@ -41,7 +41,9 @@ def _run_on_device(*, image: bytes, operands: np.lib.npyio.NpzFile) -> NDArray[n
     weights = operands["weights"]
     drain_bytes = int(operands["drain_bytes"])
     zero_tile_words = int(operands["zero_tile_words"])
-    column_tiles, drained, block_tokens, tile = (int(extent) for extent in operands["drain_shape"])
+    shape = tuple(int(extent) for extent in operands["drain_shape"])
+    blocks, _, output_tiles, block_tokens, tile = shape
+    column_tiles = blocks * output_tiles
     drain_words = int(operands["drain_words"])
     product = np.empty((activations.shape[0] * block_tokens, column_tiles * tile), dtype=np.float32)
 
@@ -81,12 +83,7 @@ def _run_on_device(*, image: bytes, operands: np.lib.npyio.NpzFile) -> NDArray[n
 
             partials = from_bf16_words(words=host_drain.view.view("<u2")[zero_tile_words:drain_words])
 
-            # Adds the reduction groups in float32. The MXU rounds its 24 bit accumulator to BF16 as a result
-            # leaves the array, so every partial crossing a block boundary is BF16, and a kernel asking for a
-            # float32 accumulator is served here.
-            summed = partials.reshape(column_tiles, drained, block_tokens, tile).sum(axis=1, dtype=np.float32)
-            product[index * block_tokens : (index + 1) * block_tokens] = (
-                summed.transpose(1, 0, 2).reshape(block_tokens, column_tiles * tile))
+            product[index * block_tokens : (index + 1) * block_tokens] = reduce_drain(partials, shape=shape)
     finally:
         for address in owned:
             minitpuFree(address)
@@ -118,8 +115,9 @@ def main() -> int:
     expected: NDArray[np.float32] = operands["expected"]
 
     print(f"image    {len(image)} bytes, {len(image) // 16} bundles")
-    tiles, groups = (int(extent) for extent in operands["drain_shape"][:2])
-    print(f"product  {expected.shape[0]} by {expected.shape[1]}, {tiles} column tiles draining {groups} each")
+    blocks, groups, output_tiles = (int(extent) for extent in operands["drain_shape"][:3])
+    print(f"product  {expected.shape[0]} by {expected.shape[1]}, {blocks * output_tiles} column tiles in "
+          f"{blocks} blocks, draining {groups} each")
 
     product = _run_on_device(image=image, operands=operands)
     error = float(np.abs(product - expected).max() / np.abs(expected).max())

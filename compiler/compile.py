@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -9,7 +10,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from numpy.typing import NDArray
 
-from bf16 import _BLOCK_DEPTH, _BLOCK_TOKENS, _TILE, _ZERO_TILE_WORDS
+from bf16 import _BLOCK_DEPTH, _TILE, _ZERO_TILE_WORDS
 from layout import LayoutError, register_map
 from triton.runtime import JITFunction
 
@@ -210,13 +211,15 @@ class Drain:
     Attributes:
         zero_tile_words: Words of clearing tile the drain buffer opens with, which a reader skips.
         words: Words the drain buffer holds, the clearing tile included.
-        shape: Extent of each axis of the drained partials, as column tiles by partials by token rows by lanes.
-            The second axis is one when the device summed the groups itself, and is what a host sums over.
+        shape: Extent of each axis of the drained partials, as blocks by partials by the block's output tiles by
+            token rows by lanes. The axes follow the loops the image walks, so the tiles a block covers sit inside
+            the partials rather than around them. The second axis is one when the device summed the groups itself,
+            and is the one a host sums over.
     """
 
     zero_tile_words: int
     words: int
-    shape: tuple[int, int, int, int]
+    shape: tuple[int, int, int, int, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +237,9 @@ class Launch:
         block_m: Token rows one block covers, which the emitter lays its registers out for.
         block_n: Output columns one block covers. A block wider than one tile keeps that many accumulators at
             once, which `column_tiles` alone cannot say because it counts tiles rather than the blocks holding them.
+        partials: Partial products each column tile leaves, being one when the device sums the groups itself. A
+            block accumulating in VMEM leaves two of each, since consecutive blocks fold into opposite VMEM banks
+            and both are drained.
     """
 
     row_blocks: int
@@ -244,6 +250,23 @@ class Launch:
     fuse_groups: bool
     block_m: int
     block_n: int
+    partials: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Settles the partial count from the block, which decides where the accumulators live."""
+        counted = 1 if self.fuse_groups else self.groups
+        spilled = register_map(block_m=self.block_m, block_n=self.block_n).spilled
+        object.__setattr__(self, "partials", counted * (2 if spilled else 1))
+
+    @property
+    def output_tiles(self) -> int:
+        """Returns the output tiles one block covers, being its columns over the tile."""
+        return self.block_n // _TILE
+
+    @property
+    def blocks(self) -> int:
+        """Returns the blocks the column loop walks, being the product's tiles over the tiles one block covers."""
+        return self.column_tiles // self.output_tiles
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,7 +485,9 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
                     raise ProgramError(message)
 
         covered, asked = {}, {}
-        for axis, unit in (("m", matmul.rows), ("n", _TILE), ("k", blocks * _BLOCK_DEPTH)):
+        # Pads the columns to a whole block rather than a whole tile, because a descriptor names the tiles one block
+        # stages outright and the emitter cannot place a partial block.
+        for axis, unit in (("m", matmul.rows), ("n", matmul.columns), ("k", blocks * _BLOCK_DEPTH)):
             asked[axis] = _stated_extent(index=index, axis=axis, unit=unit, sources=stated.get(axis, {}))
             covered[axis] = unit * -(-asked[axis] // unit)
             if covered[axis] != asked[axis]:
@@ -481,12 +506,14 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
             block_m=matmul.rows,
             block_n=matmul.columns,
         )
-        partials = 1 if launch.fuse_groups else launch.groups
         launches.append(launch)
+        # Measures the drain in the block the launch states, since a block narrower than the token block drains
+        # fewer rows than the constant names.
+        shape = (launch.blocks, launch.partials, launch.output_tiles, launch.block_m, _TILE)
         drains.append(Drain(
             zero_tile_words=_ZERO_TILE_WORDS,
-            words=_ZERO_TILE_WORDS + launch.column_tiles * partials * _BLOCK_TOKENS * _TILE,
-            shape=(launch.column_tiles, partials, _BLOCK_TOKENS, _TILE),
+            words=_ZERO_TILE_WORDS + math.prod(shape),
+            shape=shape,
         ))
     return Plan(launches=tuple(launches), drains=tuple(drains), padding=tuple(padding), repack=tuple(repack),
                 masks_covered=tuple(masks_covered), issued_over_useful=ratio)
@@ -505,7 +532,7 @@ def stage(left: NDArray[np.float32], right: NDArray[np.float32], *, matmul: MatM
     Returns:
         The staged pair.
     """
-    rows = launch.row_blocks * _BLOCK_TOKENS
+    rows = launch.row_blocks * launch.block_m
     depth = launch.groups * matmul.depth
     columns = launch.column_tiles * _TILE
     staged = []
@@ -1173,7 +1200,12 @@ def _tiles_walked(*, index: int, matmul: MatMul) -> dict[str, int]:
 
 
 def _resident_tiles(*, index: int, matmul: MatMul, covered: dict[str, int]) -> None:
-    """Returns the output tiles a matmul accumulates at once, refusing more than the register file holds.
+    """Judges the output tiles a matmul accumulates at once, refusing a block the machine cannot stage.
+
+    Notes:
+        Tiles past what the register file affords accumulate in VMEM, so what this rejects is a block whose own
+        staging does not fit, which no spill relieves. The nest's width reaches the map as the block it implies,
+        so what a nest may hold and what a block may is one derivation.
 
     Args:
         index: Position of the matmul in the kernel.
@@ -1182,7 +1214,7 @@ def _resident_tiles(*, index: int, matmul: MatMul, covered: dict[str, int]) -> N
             argument gets its trip count from.
 
     Raises:
-        ProgramError: If the kernel holds more tiles than the register file has accumulators for.
+        ProgramError: If the register file cannot stage one step of the block the nest implies.
     """
     inner = {loop.step: loop.axis for loop in matmul.tile_loops if loop.axis is not None}
     resident = 1
@@ -1191,18 +1223,18 @@ def _resident_tiles(*, index: int, matmul: MatMul, covered: dict[str, int]) -> N
         axis = inner.get(step)
         if axis is not None:
             resident *= covered[axis] // step
-    # Asks the map for a block wide enough to hold them, so what a nest may keep resident and what a block may is
-    # the one derivation rather than two.
-    mapped = register_map(block_m=matmul.rows, block_n=resident * _TILE)
-    if mapped.spilled:
+    # Asks the map for a block wide enough to hold them, which spills what the registers cannot keep and raises
+    # only where a step's own staging overruns the file.
+    try:
+        register_map(block_m=matmul.rows, block_n=resident * _TILE)
+    except LayoutError as error:
         message = (
             f"Unable to accumulate {resident} output tiles at once in matmul {index}, whose tile loop runs inside "
-            f"its reduction. The register file affords {mapped.resident} of them beside a step's staging, and the "
-            f"emitter has no path that accumulates the rest in VMEM. Walk the tiles outside the reduction "
-            f"instead, because per accumulator that is the same additions in the same order and it leaves one "
-            f"tile resident however many the product covers."
+            f"its reduction. {error} Walk the tiles outside the reduction instead, because per accumulator that "
+            f"is the same additions in the same order and it leaves one tile resident however many the product "
+            f"covers."
         )
-        raise ProgramError(message)
+        raise ProgramError(message) from error
 
 
 def _repacking_needed(*, index: int, matmul: MatMul, strides: dict[str, int]) -> list[Repack]:

@@ -163,6 +163,21 @@ _DMA_DELAY_SHIFT: int = _D_SHIFT - DELAY_W
 """Bit position the DMA bundle's delay field starts at, which the descriptor layout places apart from the
 compute one."""
 
+_D_ADDRESS_W: int = 14
+"""Bits the descriptor's VMEM address field holds, being the slot bit above the row."""
+
+_D_ROWS_W: int = 7
+"""Bits the descriptor's row count field holds, which carries one less than the rows it moves."""
+
+_SREG_SELECT_W: int = 2
+"""Bits each field naming a scalar register holds, in the descriptor and in the S slot alike."""
+
+_VREG_SELECT_W: int = 5
+"""Bits the X slot's VREG field holds."""
+
+_X_ROW_W: int = 13
+"""Bits the X slot's VMEM row field holds, which reaches one slot rather than both."""
+
 assert _DELAY_SHIFT == COMPUTE_RESERVED_W, (
     "compute payload field positions disagree with the slot widths")
 
@@ -285,7 +300,7 @@ class AsmBuilder:
                 f"{sorted(slots)}."
             )
             raise TypeError(message)
-        _check_dma_exclusive(slots)
+        check_dma_exclusive(slots)
         word = words[0] if words else 0
         for slot, value in slots.items():
             if slot not in {"e", "v", "m", "x", "s", "d", "f"}:
@@ -880,7 +895,7 @@ def _is_halt(word: int) -> bool:
     return word == HALT_BUNDLE
 
 
-def _check_dma_exclusive(slots: dict[str, int]) -> None:
+def check_dma_exclusive(slots: dict[str, int]) -> None:
     """Rejects a DMA bundle that also names a compute slot.
 
     Args:
@@ -980,12 +995,28 @@ def _compute_x(store: bool, vreg: int, row: int, *, agu: bool, shift: int,
         The X-slot word, shifted into its bundle field.
 
     Raises:
-        ValueError: If the mask names no sublane, or the level overflows the loop stack.
+        ValueError: If the mask names no sublane, the VREG or row reaches outside its field, or the level overflows
+            the loop stack.
     """
     if not 0 < mask < (1 << NUM_SUBLANES):
         message = (
             f"Unable to encode the given sublane mask. The mask must name at least one of the {NUM_SUBLANES} "
             f"sublanes, but got 0x{mask:x}."
+        )
+        raise ValueError(message)
+    # The VREG field sits directly below the store bit and the row field directly below the VREG, so a register
+    # past the file encodes a vst and a row past the slot corrupts the register the access names.
+    if not 0 <= vreg < (1 << _VREG_SELECT_W):
+        message = (
+            f"Unable to encode the given VREG. The field is {_VREG_SELECT_W} bits, so it names registers 0 through "
+            f"{(1 << _VREG_SELECT_W) - 1}, and a register past that sets the store bit instead, but got {vreg}."
+        )
+        raise ValueError(message)
+    if not 0 <= row < (1 << _X_ROW_W):
+        message = (
+            f"Unable to encode the given VMEM row. The field is {_X_ROW_W} bits, so it reaches row "
+            f"{(1 << _X_ROW_W) - 1} of one slot, and a row past that overflows into the VREG the access names, but "
+            f"got {row}."
         )
         raise ValueError(message)
     x = (1 << 32) | (int(store) << 31) | (int(vreg) << 26) | (int(row) << 13)
@@ -1031,7 +1062,24 @@ def _dma(store: bool, slot: int, vmem_address: int, rows: int, base_sreg: int, s
 
     Returns:
         The complete DMA bundle word.
+
+    Raises:
+        ValueError: If any operand reaches outside the field that carries it.
     """
+    # The descriptor's fields abut, so an operand past one runs into the next: a row count of zero sets every bit
+    # of the count and turns a load into a store, a slot of two lands on the store bit, and an address past the
+    # 14 bits selects the other descriptor slot. Nothing in hardware rejects the word, so it is rejected here.
+    for name, value, low, high in (("slot", slot, 0, DMA_SLOT_COUNT - 1),
+                                   ("vmem_address", vmem_address, 0, (1 << _D_ADDRESS_W) - 1),
+                                   ("rows", rows, 1, 1 << _D_ROWS_W),
+                                   ("base_sreg", base_sreg, 0, (1 << _SREG_SELECT_W) - 1),
+                                   ("stride_sreg", stride_sreg, 0, (1 << _SREG_SELECT_W) - 1)):
+        if not low <= int(value) <= high:
+            message = (
+                f"Unable to encode a descriptor whose {name} is {value}. It must be {low} through {high}, which is "
+                f"what the field holds, and a value past that overflows into the neighbouring field."
+            )
+            raise ValueError(message)
     d = (int(store) << 35) | (int(slot) << 34) | (int(vmem_address) << 20)
     d |= (1 << 19) | ((int(rows) - 1) << 4) | (int(base_sreg) << 2) | int(stride_sreg)
     return (1 << (BUNDLE_BITS - 1)) | (d << _D_SHIFT)

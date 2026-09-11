@@ -26,6 +26,8 @@ sys.path.insert(0, str(_HERE))
 
 import asm  # noqa: E402
 from asm import AsmBuilder, _delay_of, mxu_output_fifo, schedule  # noqa: E402
+from bf16 import _VMEM_ENTRIES_PER_LANE  # noqa: E402
+from isa_model import PROFILE  # noqa: E402
 
 
 class AssemblerEncodingTest(unittest.TestCase):
@@ -238,6 +240,53 @@ class VmemAccessCostTest(unittest.TestCase):
         builder = AsmBuilder()
         for mask in (0xF, 0b0101, 0b0001):
             self.assertEqual(asm._decode(builder.vld(vreg=0, row=0, mask=mask))["vmem_cycles"], 1)
+
+
+class FieldOverflowTest(unittest.TestCase):
+    """An operand past the field that carries it is refused rather than encoded.
+
+    The fields abut, so an overflow lands in the neighbour rather than being dropped, and the hardware rejects
+    nothing. A descriptor whose row count is zero would set every bit of the count and read as a store.
+    """
+
+    def test_a_descriptor_row_count_past_the_field_is_refused(self) -> None:
+        """The count field holds one less than the rows, so it reaches 128 and no further."""
+        builder = AsmBuilder()
+        builder.dma_load(slot=0, vmem_address=0, rows=128, base_sreg=0, stride_sreg=1)
+        for rows in (0, 129, 256):
+            with self.subTest(rows=rows), self.assertRaises(ValueError):
+                builder.dma_load(slot=0, vmem_address=0, rows=rows, base_sreg=0, stride_sreg=1)
+
+    def test_a_descriptor_address_past_the_field_is_refused(self) -> None:
+        """The address field holds the slot bit above the row, so it reaches 16383 and no further."""
+        builder = AsmBuilder()
+        builder.dma_load(slot=0, vmem_address=16383, rows=16, base_sreg=0, stride_sreg=1)
+        with self.assertRaises(ValueError):
+            builder.dma_load(slot=0, vmem_address=16384, rows=16, base_sreg=0, stride_sreg=1)
+
+    def test_a_descriptor_naming_a_register_or_slot_it_has_no_field_for_is_refused(self) -> None:
+        """The register fields are two bits and the slot field one, so a wider operand reaches the store bit."""
+        builder = AsmBuilder()
+        with self.assertRaises(ValueError):
+            builder.dma_load(slot=asm.DMA_SLOT_COUNT, vmem_address=0, rows=16, base_sreg=0, stride_sreg=1)
+        for base, stride in ((4, 1), (0, 4)):
+            with self.subTest(base=base, stride=stride), self.assertRaises(ValueError):
+                builder.dma_load(slot=0, vmem_address=0, rows=16, base_sreg=base, stride_sreg=stride)
+
+    def test_an_access_naming_a_register_past_the_file_is_refused(self) -> None:
+        """The VREG field sits directly below the store bit, so a load past the file would encode a store."""
+        builder = AsmBuilder()
+        builder.vld(vreg=PROFILE["vreg_entry_count"] - 1, row=0)
+        for vreg in (PROFILE["vreg_entry_count"], 33, -1):
+            with self.subTest(vreg=vreg), self.assertRaises(ValueError):
+                builder.vld(vreg=vreg, row=0)
+
+    def test_an_access_past_the_rows_one_slot_holds_is_refused(self) -> None:
+        """The row field reaches one slot, and a row past it overflows into the register the access names."""
+        builder = AsmBuilder()
+        builder.vst(vreg=0, row=_VMEM_ENTRIES_PER_LANE - 1)
+        with self.assertRaises(ValueError):
+            builder.vst(vreg=0, row=_VMEM_ENTRIES_PER_LANE)
 
 
 class RememberedScheduleTest(unittest.TestCase):

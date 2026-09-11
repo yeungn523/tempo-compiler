@@ -95,7 +95,10 @@ _VMEM_SLOT_STRIDE: int = _VMEM_ENTRIES_PER_LANE
 """The VMEM row distance between consecutive staging slots, which is a whole lane so no two slots share a row."""
 
 _BLOCK_ACTIVATION_BYTES: int = _STEPS * _TOKEN_GROUPS * _TILE * _ROW_BYTES
-"""The byte size of one block's activation tiles."""
+"""The byte size of one block's activation tiles, at the token block the hand-written kernels cover.
+
+A block narrower or wider than `_BLOCK_TOKENS` stages a different size, so an emitted image takes this from
+`emit.Staging.activation_slack` instead, which reads the rows its own block covers."""
 
 _BLOCK_WEIGHT_BYTES: int = _STEPS * _TILE * _ROW_BYTES
 """The byte size of one block's weight tiles."""
@@ -256,6 +259,25 @@ def as_bf16_words(values: NDArray[np.float32]) -> NDArray[np.uint16]:
 def from_bf16_words(words: NDArray[np.uint16]) -> NDArray[np.float32]:
     """Recovers the float32 values the MINITPU's BF16 container words hold."""
     return (words.astype("<u4") << 16).view("<f4")
+
+
+def reduce_drain(partials: NDArray[np.float32], *, shape: tuple[int, int, int, int, int]) -> NDArray[np.float32]:
+    """Sums one launch's drained partials into the token block's product.
+
+    The drain lies in the order the image walked its loops, so a block's output tiles sit inside its partials and
+    the groups are summed in float32 because the array rounds each partial to BF16 as it leaves.
+
+    Args:
+        partials: The drained partials, with the clearing tile already skipped.
+        shape: Extent of each axis of the drain, as the plan's `Drain` states it.
+
+    Returns:
+        The product, as token rows by the columns the launch covers.
+    """
+    blocks, _, output_tiles, rows, tile = shape
+    tiles = blocks * output_tiles
+    summed = partials.reshape(shape).sum(axis=1, dtype=np.float32)
+    return summed.reshape(tiles, rows, tile).transpose(1, 0, 2).reshape(rows, tiles * tile)
 
 
 def pack_gemm_input(activations: NDArray[np.float32], weights: NDArray[np.float32]) -> NDArray[np.uint16]:

@@ -82,6 +82,22 @@ def simulate(*, launch: Launch, reduction: int, build_dir: str | None = None,
     return float(np.abs(product - expected).max() / np.abs(expected).max())
 
 
+def _issued(*, order: str, tokens: int, columns: int) -> list[tuple[int, int]]:
+    """Returns every launch a host issues, as its token block and column block, in the order the kernel walks them.
+
+    Args:
+        order: The output axes the kernel walks, outermost first, as the entry point packed them.
+        tokens: Token blocks the product covers.
+        columns: Column blocks one token block is issued against.
+
+    Returns:
+        The token block and column block of each launch, in issue order.
+    """
+    if order.startswith("n"):
+        return [(token, column) for column in range(columns) for token in range(tokens)]
+    return [(token, column) for token in range(tokens) for column in range(columns)]
+
+
 def simulate_compiled(*, image: bytes, operands: np.lib.npyio.NpzFile, build_dir: str | None = None,
                       max_cycles: int | None = None) -> float:
     """Runs a compiled image against the RTL once per token block and returns its error.
@@ -100,22 +116,26 @@ def simulate_compiled(*, image: bytes, operands: np.lib.npyio.NpzFile, build_dir
         RuntimeError: If the testbench does not report every round halted.
     """
     activations = operands["activations"]
-    weights = operands["weights"].tobytes()
-    slack = bytes(int(operands["weight_bytes"]) - len(weights))
+    weights = operands["weights"]
     drain_words = int(operands["drain_words"])
     zero_tile_words = int(operands["zero_tile_words"])
     shape = tuple(int(extent) for extent in operands["drain_shape"])
+    block_columns = int(operands["block_columns"])
+    block_rows = shape[3]
 
-    blocks = []
-    for index, block in enumerate(activations):
-        dump = _run_image(image=image, activations=block.tobytes(), weights=weights + slack,
-                          drain_bytes=int(operands["drain_bytes"]), build_dir=build_dir, max_cycles=max_cycles,
-                          what=f"token block {index}")
-        dumped = np.frombuffer(dump, dtype="<u2")[:drain_words]
-        blocks.append(reduce_drain(from_bf16_words(words=dumped[zero_tile_words:drain_words]), shape=shape))
-
-    product: NDArray[np.float32] = np.vstack(blocks)
     expected: NDArray[np.float32] = operands["expected"]
+    product: NDArray[np.float32] = np.empty(expected.shape, dtype=np.float32)
+    for token, column in _issued(order=str(operands["issue_order"]), tokens=len(activations),
+                                 columns=len(weights)):
+        packed = weights[column].tobytes()
+        dump = _run_image(image=image, activations=activations[token].tobytes(),
+                          weights=packed + bytes(int(operands["weight_bytes"]) - len(packed)),
+                          drain_bytes=int(operands["drain_bytes"]), build_dir=build_dir, max_cycles=max_cycles,
+                          what=f"token block {token} column block {column}")
+        dumped = np.frombuffer(dump, dtype="<u2")[:drain_words]
+        piece = reduce_drain(from_bf16_words(words=dumped[zero_tile_words:drain_words]), shape=shape)
+        product[token * block_rows : (token + 1) * block_rows,
+                column * block_columns : (column + 1) * block_columns] = piece
     return float(np.abs(product - expected).max() / np.abs(expected).max())
 
 

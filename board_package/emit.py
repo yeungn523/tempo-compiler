@@ -211,7 +211,9 @@ def vmem_map(*, output_tiles: int = 1, token_groups: int = _TOKEN_GROUPS,
     activation, weight = [], []
     for step in range(_STEPS):
         activation.append(vmem.region(f"activation {step}", token_groups * _TILE).base)
-        weight.append(vmem.region(f"weight {step}", _TILE * output_tiles).base)
+        # Reserves the tiles a step stages as the tiles its descriptors move, one apiece, so a block wider
+        # than the row field encodes still lays out.
+        weight.append(vmem.region(f"weight {step}", _TILE, tiles=output_tiles).base)
     rows["activation"] = tuple(activation)
     rows["weight"] = tuple(weight)
     moved, descriptors = drain_descriptors(token_groups * _TILE * output_tiles)

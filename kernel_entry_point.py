@@ -19,7 +19,7 @@ sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE / "board_package"))
 
 from compiler import ProgramError, compile_launch, plan, read_program, signature_of, stage  # noqa: E402
-from asm import BUNDLE_BYTES  # noqa: E402
+from asm import BUNDLE_BYTES, IRAM_DEPTH  # noqa: E402
 from bf16 import _BLOCK_WEIGHT_BYTES, _ELEMENT_BYTES, pack_activations, pack_weights  # noqa: E402
 from triton.runtime import JITFunction  # noqa: E402
 
@@ -91,15 +91,20 @@ def _pack_operands(*, path: pathlib.Path, left: NDArray[np.float32], right: NDAr
     left, right = stage(left, right, matmul=matmul, launch=launch)
     activations = np.stack([pack_activations(activations=left[token : token + staging.rows])
                             for token in range(0, left.shape[0], staging.rows)])
-    weights = pack_weights(weights=right)
+    # Packs one weight buffer per column block, which is one whole buffer where the image walks the blocks
+    # itself and one apiece where the host issues them.
+    weights = np.stack([pack_weights(weights=right[:, column : column + staging.columns])
+                        for column in range(0, right.shape[1], staging.columns)])
     np.savez(
         path,
         activations=activations,
         weights=weights,
+        issue_order=",".join(axis for axis in launch.nest if axis != "k"),
+        block_columns=staging.columns,
         expected=(left.astype(np.float64) @ right.astype(np.float64)).astype(np.float32),
         # The slack on each operand is the block the image prefetches past the last one.
         activation_bytes=activations[0].nbytes + staging.activation_slack,
-        weight_bytes=weights.nbytes + _BLOCK_WEIGHT_BYTES,
+        weight_bytes=weights[0].nbytes + _BLOCK_WEIGHT_BYTES,
         drain_words=drain.words,
         drain_bytes=drain.words * _ELEMENT_BYTES,
         zero_tile_words=drain.zero_tile_words,
@@ -239,13 +244,11 @@ def main() -> int:
     for index, (matmul, launch) in enumerate(zip(matmuls, planned.launches, strict=True)):
         print(f"matmul {index}  {matmul.rows}x{matmul.columns} tile over {matmul.depth}, reduction "
               f"{matmul.reduction}, accumulator {matmul.accumulator}")
-        # A host issues one launch per token block, so an order holding the tokens outermost is the one the
-        # image can carry. Any other is reordered until the token loop moves into the image.
-        walked = ", ".join(launch.nest)
-        carried = ("emitted as written, over a block of "
-                   f"{launch.block_n} columns" if launch.nest[0] == "m" else
-                   "emitted with its token blocks outermost, which reorders it")
-        print(f"nest   {index}  kernel walks {walked}, {carried}")
+        # The block covers whatever the nest keeps live inside its reduction, so every order that plans is the
+        # order the launches walk.
+        issued = f"{launch.launches} launches" if launch.launches > 1 else "one launch"
+        print(f"nest   {index}  kernel walks {', '.join(launch.nest)}, issued as written over "
+              f"{issued} of {launch.block_m} by {launch.block_n}")
         print(f"launch {index}  row_blocks={launch.row_blocks} column_tiles={launch.column_tiles} "
               f"groups={launch.groups} loop_blocks={launch.loop_blocks} activate={launch.activate} "
               f"fuse_groups={launch.fuse_groups}")
@@ -255,8 +258,9 @@ def main() -> int:
             print(f"image  {index}  not emitted: {error}")
             return 1
         drain = planned.drains[index]
-        print(f"image  {index}  {len(image) // BUNDLE_BYTES} bundles over {staging.rows}x{staging.columns}, "
-              f"draining {drain.words} words shaped {drain.shape}")
+        bundles = len(image) // BUNDLE_BYTES
+        print(f"image  {index}  {bundles} bundles over {staging.rows}x{staging.columns}, "
+              f"{100 * bundles / IRAM_DEPTH:.0f}% of IRAM, draining {drain.words} words shaped {drain.shape}")
         if written is not None:
             target = written / f"matmul_{index}.bin"
             target.write_bytes(image)

@@ -1025,11 +1025,9 @@ def full_ffn(
     """Runs one transformer feed-forward layer at model dimensions on the MINITPU.
 
     Notes:
-        Runs as two full_gemm passes, since GELU needs the finished sum and one launch holds only 32 of a 768-deep
-        contraction, so fusing the activation onto the up projection would activate a partial. The activation rides
-        the down projection, whose left operand the host has already summed, and costs no bundle of its own. Every
-        product and every activation runs on the device, leaving the host to slice operands and sum contraction
-        blocks.
+        Two full_gemm passes, since GELU needs the finished sum and these drain one partial per contraction
+        group for the host to add. The activation rides the down projection's staging, whose left operand is
+        the summed intermediate, and costs no bundle of its own.
 
     Args:
         activations: The layer input, whose rows are tokens.

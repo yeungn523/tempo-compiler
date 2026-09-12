@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import pathlib
 import sys
+import time
+from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
@@ -24,7 +26,30 @@ from runtime import (  # noqa: E402
     minitpuMalloc,
     minitpuMemcpy,
     minitpuSetDevice,
+    read_perf,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class Measurement:
+    """Holds what one run of an image cost, as the device counted it and as the host timed it.
+
+    Attributes:
+        launches: Launches the host issued.
+        cycles: PL cycles the launches took, summed over them.
+        bundles: Bundles the launches issued, summed over them.
+        seconds: Wall clock the whole issue sequence took, the host's copies and polling included.
+    """
+
+    launches: int
+    cycles: int
+    bundles: int
+    seconds: float
+
+    def report(self) -> str:
+        """Returns the cost as one line, being what the device counted and what the host timed around it."""
+        return (f"{self.launches} launches, {self.cycles} cycles, {self.bundles} bundles, "
+                f"{1e3 * self.seconds:.2f} ms wall")
 
 
 def _issued(*, order: str, tokens: int, columns: int) -> list[tuple[int, int]]:
@@ -43,7 +68,8 @@ def _issued(*, order: str, tokens: int, columns: int) -> list[tuple[int, int]]:
     return [(token, column) for token in range(tokens) for column in range(columns)]
 
 
-def _run_on_device(*, image: bytes, operands: np.lib.npyio.NpzFile) -> NDArray[np.float32]:
+def _run_on_device(*, image: bytes,
+                   operands: np.lib.npyio.NpzFile) -> tuple[NDArray[np.float32], Measurement]:
     """Copies one packed operand pair to the device, launches the image against it, and sums the drain.
 
     Args:
@@ -51,7 +77,7 @@ def _run_on_device(*, image: bytes, operands: np.lib.npyio.NpzFile) -> NDArray[n
         operands: The packed operands and the sizes the host derived for them.
 
     Returns:
-        The float32 product.
+        The float32 product and what the run cost.
     """
     activations = operands["activations"]
     weights = operands["weights"]
@@ -67,6 +93,7 @@ def _run_on_device(*, image: bytes, operands: np.lib.npyio.NpzFile) -> NDArray[n
     minitpuSetDevice("minitpu")
     minitpuHostReset()
     owned: list[int] = []
+    cycles = bundles = 0
     try:
         host_image = minitpuHostAlloc(len(image))
         host_image.view[: len(image) // 4] = np.frombuffer(image, dtype="<u4")
@@ -90,6 +117,7 @@ def _run_on_device(*, image: bytes, operands: np.lib.npyio.NpzFile) -> NDArray[n
 
         # Copies both operands every launch, since the issue order decides which of them repeats and the
         # device holds one of each.
+        opened = time.perf_counter()
         for token, column in issued:
             block = activations[token]
             host_activations.view.view("<u2")[: block.size] = block
@@ -101,14 +129,21 @@ def _run_on_device(*, image: bytes, operands: np.lib.npyio.NpzFile) -> NDArray[n
                                 args=[device_activations, device_weights, device_drain])
             minitpuMemcpy(host_drain, device_drain, drain_bytes, MemcpyKind.DeviceToHost)
 
+            # Reads the counters here rather than once at the end, since the tile reset zeroes the cycle and
+            # bundle counts at every launch and a later read would carry the last launch alone.
+            sample = read_perf()
+            cycles += sample.cycles
+            bundles += sample.instrs
+
             partials = from_bf16_words(words=host_drain.view.view("<u2")[zero_tile_words:drain_words])
             product[token * block_tokens : (token + 1) * block_tokens,
                     column * block_columns : (column + 1) * block_columns] = reduce_drain(partials, shape=shape)
+        elapsed = time.perf_counter() - opened
     finally:
         for address in owned:
             minitpuFree(address)
         minitpuHostReset()
-    return product
+    return product, Measurement(launches=len(issued), cycles=cycles, bundles=bundles, seconds=elapsed)
 
 
 def main() -> int:
@@ -139,10 +174,11 @@ def main() -> int:
     print(f"product  {expected.shape[0]} by {expected.shape[1]}, {blocks * output_tiles} column tiles in "
           f"{blocks} blocks, draining {groups} each")
 
-    product = _run_on_device(image=image, operands=operands)
+    product, measured = _run_on_device(image=image, operands=operands)
     error = float(np.abs(product - expected).max() / np.abs(expected).max())
     verdict = "PASS" if error <= 0.02 else "FAIL"
     print(f"device   {verdict}, relative error {error * 100:.4f}%")
+    print(f"cost     {measured.report()}")
     return 0 if verdict == "PASS" else 1
 
 

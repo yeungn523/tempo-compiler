@@ -23,8 +23,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE / "minitpu_runtime"))
 
-from bf16 import (  # noqa: E402,F401  -- re-exported: the board and tools import them from here
-    HERE,
+from bf16 import (  # noqa: E402,F401  -- re-exported: the operand tests import them from here
     MAX_ATTENTION_ROWS,
     _BLOCK_ACTIVATION_BYTES,
     _BLOCK_DEPTH,
@@ -32,44 +31,20 @@ from bf16 import (  # noqa: E402,F401  -- re-exported: the board and tools impor
     _BLOCK_WEIGHT_BYTES,
     _CORRUPTION_WORD,
     _ELEMENT_BYTES,
-    _GELU_LIMIT_Q7,
-    _GELU_TABLE_ENTRIES,
     _INTERLEAVE_PAYLOAD_BYTES,
     _INTERLEAVE_ROUNDS,
     _LAUNCH_REPEATS,
     _LN_EPSILON,
-    _LN_ROW_CONST,
-    _LN_ROW_OUT,
-    _LN_ROW_X,
     _LOOP_BLOCKS,
     _MAX_DESCRIPTOR_ROWS,
-    _NUM_LANES,
     _MODEL_WIDTH,
     _NUM_LANES,
-    _NUM_SUBLANES,
-    _ROW_ACTIVATION,
     _ROW_BYTES,
-    _ROW_OUTPUT,
-    _ROW_SCORES,
-    _ROW_SOFTMAX_OUT,
-    _ROW_WEIGHT,
-    _ROW_ZERO,
-    _STEPS,
-    _STEP_TILES,
     _TILE,
-    _TILE_ROWS,
     _TILE_VREGS,
-    _TOKEN_GROUPS,
-    _VMEM_ENTRIES_PER_LANE,
-    _VMEM_SLOT_STRIDE,
     _VREG_ELEMENTS,
-    _WIDTH_ROWS,
-    _WIDTH_VREGS,
     _ZERO_TILE_BYTES,
     _ZERO_TILE_WORDS,
-    _bf16_round,
-    _fp32_abs_q7,
-    _gelu_table,
     _on_bf16_grid,
     _single_launch_operands,
     as_bf16_words,
@@ -80,15 +55,9 @@ from bf16 import (  # noqa: E402,F401  -- re-exported: the board and tools impor
     layernorm_constants,
     pack_activations,
     pack_bias,
-    pack_gemm_input,
     pack_weights,
 )
-from kernels import (  # noqa: E402,F401  -- re-exported: the board and tools import them from here
-    HERE,
-    _emit_accumulate,
-    _emit_gelu_gemm_step,
-    _emit_gemm_step,
-    _emit_pipelined_matrix,
+from kernels import (  # noqa: E402
     build_layernorm_rows,
     build_elementwise_add,
     build_head_copy,
@@ -581,49 +550,6 @@ def download_activations(d_tensor: DeviceTensor) -> NDArray[np.float32]:
     return h_out
 
 
-#: The clearing tile that heads every drain buffer, in the units a caller needs to
-#: allocate and zero it. Public because a caller driving the raw runtime has to
-#: place it, and reaching through the underscore to find out how big it is would
-#: mean the module never said.
-ZERO_TILE_BYTES = _ZERO_TILE_BYTES
-ZERO_TILE_WORDS = _ZERO_TILE_WORDS
-
-
-def gemm_kernel(*, depth: int, columns: int, activate: bool) -> tuple:
-    """Returns the assembled GEMM and its image for one operand shape.
-
-    Derives the kernel's trip counts from the shapes rather than making a caller
-    know that a group is `_LOOP_BLOCKS * _BLOCK_DEPTH` deep and a column tile is
-    `_TILE` wide. Always the group-fusing variant, since a caller reaching for the
-    raw runtime wants the product finished in DMEM.
-
-    Args:
-        depth: The contraction, a whole number of `_LOOP_BLOCKS * _BLOCK_DEPTH`.
-        columns: Output features, a whole number of `_TILE`.
-        activate: Whether each staged tile is GELU-activated entering the array.
-
-    Returns:
-        The (kernel, image bytes) pair, built at most once per shape.
-
-    Raises:
-        ValueError: If a dimension is not a whole number of the blocks a launch covers.
-    """
-    for name, value, block in (("depth", depth, _LOOP_BLOCKS * _BLOCK_DEPTH),
-                               ("columns", columns, _TILE)):
-        if value % block:
-            message = (
-                f"Unable to build a GEMM with {name} of {value}. It must be a whole "
-                f"number of {block}, which is what one launch covers."
-            )
-            raise ValueError(message)
-    column_tiles = columns // _TILE
-    groups = depth // (_LOOP_BLOCKS * _BLOCK_DEPTH)
-    return _kernel_and_image(
-        ("gemm", column_tiles, groups, activate, True),
-        lambda: build_looped_gemm(column_tiles=column_tiles, groups=groups,
-                                  activate=activate, fuse_groups=True))
-
-
 def upload_layernorm_constants(h_gamma: NDArray[np.float32],
                                h_beta: NDArray[np.float32]) -> int:
     """Uploads one LayerNorm's packed constants and returns their DMEM address.
@@ -1099,11 +1025,9 @@ def full_ffn(
     """Runs one transformer feed-forward layer at model dimensions on the MINITPU.
 
     Notes:
-        Runs as two full_gemm passes, since GELU needs the finished sum and one launch holds only 32 of a 768-deep
-        contraction, so fusing the activation onto the up projection would activate a partial. The activation rides
-        the down projection, whose left operand the host has already summed, and costs no bundle of its own. Every
-        product and every activation runs on the device, leaving the host to slice operands and sum contraction
-        blocks.
+        Two full_gemm passes, since GELU needs the finished sum and these drain one partial per contraction
+        group for the host to add. The activation rides the down projection's staging, whose left operand is
+        the summed intermediate, and costs no bundle of its own.
 
     Args:
         activations: The layer input, whose rows are tokens.

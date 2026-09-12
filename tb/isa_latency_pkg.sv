@@ -13,6 +13,7 @@ package isa_latency_pkg;
   localparam int unsigned DOC_WB_W_MPOP_LAST = 6;
   localparam int unsigned DOC_MXU_OUTPUT_FIFO_DEPTH = 32;
   localparam int unsigned DOC_LB_CAP = 24;
+  localparam int unsigned DOC_IRAM_DEPTH = 4096;
   localparam int unsigned DOC_DELAY_W = 6;
   localparam int unsigned DOC_DMA_SLOT_COUNT = 2;
   localparam int unsigned DOC_E_VADD = 1;

@@ -18,22 +18,11 @@ from collections.abc import Callable  # noqa: E402
 
 import asm as asm_module  # noqa: E402
 from asm import AGU_SHIFT_W  # noqa: E402
-from bf16 import (  # noqa: E402,F401
-    HERE,
+from bf16 import (  # noqa: E402
     MAX_ATTENTION_ROWS,
     _BLOCK_ACTIVATION_BYTES,
-    _BLOCK_DEPTH,
     _BLOCK_TOKENS,
     _BLOCK_WEIGHT_BYTES,
-    _CORRUPTION_WORD,
-    _ELEMENT_BYTES,
-    _GELU_LIMIT_Q7,
-    _GELU_TABLE_ENTRIES,
-    _INTERLEAVE_PAYLOAD_BYTES,
-    _INTERLEAVE_ROUNDS,
-    _LAUNCH_REPEATS,
-    _LN_EPSILON,
-    _LN_ROW_CONST,
     _LN_ROW_OUT,
     _LN_ROW_X,
     _LOOP_BLOCKS,
@@ -55,7 +44,6 @@ from bf16 import (  # noqa: E402,F401
     _ROW_WEIGHT,
     _ROW_ZERO,
     _STEPS,
-    _STEP_TILES,
     _TILE,
     _TILE_ROWS,
     _TILE_VREGS,
@@ -64,22 +52,7 @@ from bf16 import (  # noqa: E402,F401
     _VMEM_SLOT_STRIDE,
     _VREG_ELEMENTS,
     _WIDTH_ROWS,
-    _WIDTH_VREGS,
     _ZERO_TILE_BYTES,
-    _ZERO_TILE_WORDS,
-    _bf16_round,
-    _fp32_abs_q7,
-    _gelu_table,
-    _on_bf16_grid,
-    _single_launch_operands,
-    as_bf16_words,
-    assert_operands_discriminating,
-    from_bf16_words,
-    gelu_lut_reference,
-    layernorm_constants,
-    pack_activations,
-    pack_gemm_input,
-    pack_weights,
 )
 from runtime import MinitpuKernel, minitpu  # noqa: E402
 

@@ -21,6 +21,7 @@ from bf16 import (  # noqa: E402
     _BLOCK_DEPTH,
     _BLOCK_TOKENS,
     _BLOCK_WEIGHT_BYTES,
+    _MAX_DESCRIPTOR_ROWS,
     _NUM_SUBLANES,
     _ROW_BYTES,
     _STEPS,
@@ -166,6 +167,32 @@ class StagedOperand:
         return self.rows * _ROW_BYTES
 
 
+def drain_descriptors(rows: int) -> tuple[int, int]:
+    """Returns the rows one drain descriptor moves and how many of them a region of the given rows takes.
+
+    Notes:
+        A descriptor's row field encodes `_MAX_DESCRIPTOR_ROWS`, so a wider region is moved by several. The
+        widest count dividing the region evenly is taken, which leaves every descriptor the same size and the
+        region no larger than the rows it holds.
+
+    Args:
+        rows: Rows the region holds.
+
+    Returns:
+        The rows one descriptor moves and the descriptors the region takes.
+
+    Raises:
+        ValueError: If the region holds no rows.
+    """
+    if rows < 1:
+        message = f"Unable to drain a region of {rows} rows. A region holds at least one."
+        raise ValueError(message)
+    for moved in range(min(rows, _MAX_DESCRIPTOR_ROWS), 0, -1):
+        if not rows % moved:
+            return moved, rows // moved
+    return 1, rows
+
+
 def vmem_map(*, output_tiles: int = 1, token_groups: int = _TOKEN_GROUPS,
              spilled: int = 0) -> dict[str, tuple[int, ...]]:
     """Returns the first VMEM row of every region a launch stages, laid out end to end from row zero.
@@ -184,12 +211,16 @@ def vmem_map(*, output_tiles: int = 1, token_groups: int = _TOKEN_GROUPS,
     activation, weight = [], []
     for step in range(_STEPS):
         activation.append(vmem.region(f"activation {step}", token_groups * _TILE).base)
-        weight.append(vmem.region(f"weight {step}", _TILE * output_tiles).base)
+        # Reserves the tiles a step stages as the tiles its descriptors move, one apiece, so a block wider
+        # than the row field encodes still lays out.
+        weight.append(vmem.region(f"weight {step}", _TILE, tiles=output_tiles).base)
     rows["activation"] = tuple(activation)
     rows["weight"] = tuple(weight)
-    rows["output"] = (vmem.region("output", token_groups * _TILE * output_tiles).base,)
+    moved, descriptors = drain_descriptors(token_groups * _TILE * output_tiles)
+    rows["output"] = (vmem.region("output", moved, tiles=descriptors).base,)
     if spilled:
-        rows["spill"] = (vmem.region("spill", token_groups * _TILE * spilled).base,)
+        moved, descriptors = drain_descriptors(token_groups * _TILE * spilled)
+        rows["spill"] = (vmem.region("spill", moved, tiles=descriptors).base,)
     vmem.check_disjoint()
     return rows
 
@@ -308,6 +339,7 @@ def gemm_step(*, activation_row: int, weight_row: int, close_loop: bool,
         put(offset=_TILE_VREGS + vreg,
             x=builder.vld(vreg=registers.activation + vreg, row=activation_row + _NUM_SUBLANES * vreg))
     put(offset=_MATLOAD_AT, m=builder.vmatload(vreg=registers.weight))
+
     if spill_row is not None and registers.reload_hoisted:
         # Reads what earlier steps accumulated, which this step's results do not feed, so the load rides beside
         # the operand staging.
@@ -327,20 +359,6 @@ def gemm_step(*, activation_row: int, weight_row: int, close_loop: bool,
     _place_matrix_commands(put=put, builder=builder, stage_next=stage_next, close_loop=close_loop,
                            registers=registers, tile=tile, spill_row=spill_row)
     return bundles
-
-
-def gemm_step_stream(*, activation_row: int, weight_row: int, close_loop: bool) -> tuple[int, ...]:
-    """Returns one accumulation step as the contiguous bundle words it places, zero filling the offsets it leaves.
-
-    Args:
-        activation_row: First VMEM row of this step's activation pair, spanning both token groups.
-        weight_row: First VMEM row of this step's weight tile.
-        close_loop: Determines whether the step's final accumulate carries the enclosing loop's closing bundle.
-
-    Returns:
-        The bundle words, in placement order.
-    """
-    return _flatten(gemm_step(activation_row=activation_row, weight_row=weight_row, close_loop=close_loop))
 
 
 def looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups: bool = False,
@@ -688,14 +706,17 @@ def _emit_drain(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at:
                 x=builder.vst(vreg=registers.accumulator + _TILE_VREGS * group + vreg,
                               row=rows["output"][0] + _TILE_ROWS * group + _NUM_SUBLANES * vreg))
     at += held * _TILE_VREGS
-    drained = held * _TILE
-    put(offset=at, d=builder.dma_store(slot=0, vmem_address=rows["output"][0], rows=drained,
-                                       base_sreg=_DRAIN_POINTER, stride_sreg=_STRIDE_REGISTER))
-    at += 1
-    put(offset=at, f=builder.flush_slot(mask=1))
-    at += 1
-    put(offset=at, s=builder.saddi(rd=_DRAIN_POINTER, rs=_DRAIN_POINTER, value=drained * _ROW_BYTES))
-    return at + 1
+    moved, descriptors = drain_descriptors(held * _TILE)
+    for descriptor in range(descriptors):
+        put(offset=at, d=builder.dma_store(slot=0, vmem_address=rows["output"][0] + moved * descriptor,
+                                           rows=moved, base_sreg=_DRAIN_POINTER,
+                                           stride_sreg=_STRIDE_REGISTER))
+        at += 1
+        put(offset=at, f=builder.flush_slot(mask=1))
+        at += 1
+        at = _emit_split_advance(put=put, builder=builder, at=at, register=_DRAIN_POINTER,
+                                 delta=moved * _ROW_BYTES, gap=1)
+    return at
 
 
 def _emit_drain_spill(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int,
@@ -716,16 +737,18 @@ def _emit_drain_spill(*, put: Callable[..., None], builder: asm_module.AsmBuilde
     Returns:
         The next free offset.
     """
-    drained = registers.spilled * registers.token_groups * _TILE
+    moved, descriptors = drain_descriptors(registers.spilled * registers.token_groups * _TILE)
     for slot in range(2):
-        put(offset=at, d=builder.dma_store(slot=0, rows=drained, base_sreg=_DRAIN_POINTER,
-                                           stride_sreg=_STRIDE_REGISTER,
-                                           vmem_address=rows["spill"][0] + slot * _VMEM_SLOT_STRIDE))
-        at += 1
-        put(offset=at, f=builder.flush_slot(mask=1))
-        at += 1
-        put(offset=at, s=builder.saddi(rd=_DRAIN_POINTER, rs=_DRAIN_POINTER, value=drained * _ROW_BYTES))
-        at += 1
+        for descriptor in range(descriptors):
+            put(offset=at, d=builder.dma_store(slot=0, rows=moved, base_sreg=_DRAIN_POINTER,
+                                               stride_sreg=_STRIDE_REGISTER,
+                                               vmem_address=rows["spill"][0] + moved * descriptor
+                                               + slot * _VMEM_SLOT_STRIDE))
+            at += 1
+            put(offset=at, f=builder.flush_slot(mask=1))
+            at += 1
+            at = _emit_split_advance(put=put, builder=builder, at=at, register=_DRAIN_POINTER,
+                                     delta=moved * _ROW_BYTES, gap=1)
     return at
 
 

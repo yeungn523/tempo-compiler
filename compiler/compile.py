@@ -40,6 +40,16 @@ _AXIS_VARIABLES: dict[str, tuple[str, str]] = {
 }
 """Induction variable each tensor axis of each operand carries, before any transpose."""
 
+_REDUCTION_AXIS: str = "k"
+"""Axis the contraction walks, which the nest names alongside the output axes."""
+
+_COLUMN_AXIS: str = "n"
+"""Axis the output columns walk, whose place in the nest decides who issues the blocks."""
+
+_EMITTED_NEST: tuple[str, ...] = ("m", "n", "k")
+"""Order the emitter walks the axes in, being the token blocks a host issues, then the columns, then the
+contraction. A launch whose kernel wrote another order is emitted in this one."""
+
 _AXIS_NOUNS: dict[str, str] = {"m": "tokens", "n": "output features", "k": "reduction"}
 """What each axis's extent counts, for the messages that report one."""
 
@@ -149,9 +159,11 @@ class MatMul:
         reduction: Whole reduction the loop walks, or None when its bound is a runtime argument.
         tile_loops: Every loop walking the output rather than the contraction, outermost first, holding the ones
             whose bounds are compile time constants. A kernel walking its tiles on the grid leaves this empty.
-        steps_inside_reduction: The step of every loop nested inside the reduction loop, which names the axis it
-            walks. The step is kept rather than the loop, which a runtime bound leaves with no trip count.
+        nest: Axis each enclosing loop walks, outermost first, holding "k" for the contraction. An axis whose loop
+            ran once is absent, since canonicalization folds it before the reader sees the module.
         accesses: How each operand is addressed, keyed by role.
+        stores_inside_reduction: Determines whether the kernel writes its accumulator to memory on every step of
+            the contraction, rather than carrying it across the whole of it.
     """
 
     rows: int
@@ -162,8 +174,9 @@ class MatMul:
     left_source: int | None
     reduction: int | None
     tile_loops: tuple[TileLoop, ...]
-    steps_inside_reduction: tuple[int, ...]
+    nest: tuple[str, ...]
     accesses: dict[str, Access]
+    stores_inside_reduction: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +247,8 @@ class Launch:
         block_m: Token rows one block covers, which the emitter lays its registers out for.
         block_n: Output columns one block covers, which `column_tiles` cannot say because it counts tiles rather
             than the blocks holding them.
+        nest: Axis each loop walks in the order the kernel wrote them, outermost first. The emitter walks
+            `_EMITTED_NEST`, so a launch naming another order is emitted in that one.
         partials: Partial products each column tile leaves, being one when the device sums the groups itself. A
             block accumulating in VMEM leaves two of each, since consecutive blocks fold into opposite banks.
     """
@@ -246,6 +261,7 @@ class Launch:
     fuse_groups: bool
     block_m: int
     block_n: int
+    nest: tuple[str, ...] = _EMITTED_NEST
     partials: int = field(init=False)
 
     def __post_init__(self) -> None:
@@ -263,6 +279,21 @@ class Launch:
     def blocks(self) -> int:
         """Returns the blocks the column loop walks, being the product's tiles over the tiles one block covers."""
         return self.column_tiles // self.output_tiles
+
+    @property
+    def issues_columns(self) -> bool:
+        """Returns whether a host issues one launch per column block rather than one image walking them all."""
+        return self.nest[0] == _COLUMN_AXIS
+
+    @property
+    def image_blocks(self) -> int:
+        """Returns the column blocks one image walks, being one when a host issues them itself."""
+        return 1 if self.issues_columns else self.blocks
+
+    @property
+    def launches(self) -> int:
+        """Returns the launches a host issues, being a token block each and a column block each when it walks them."""
+        return self.row_blocks * (self.blocks if self.issues_columns else 1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,8 +413,14 @@ def read_program(kernel: JITFunction, *, signature: dict[str, str],
             left_source=dots.index(source) if source is not None else None,
             reduction=graph.constant(loops[at].get_operand(1)),
             tile_loops=walked([*loops[:at], *loops[at + 1:]]),
-            steps_inside_reduction=tuple(steps[at + 1:]),
+            nest=tuple(_REDUCTION_AXIS if position == at else graph.axis_of_loop(loop, pointers=pointers)
+                       for position, loop in enumerate(loops)
+                       if position == at or graph.axis_of_loop(loop, pointers=pointers) is not None),
             accesses=graph.accesses_of(dot=dot, store=stores[index] if index < len(stores) else None),
+            # A store the reduction encloses sits deeper than the reduction itself, which is the
+            # accumulator the kernel keeps in memory rather than in registers.
+            stores_inside_reduction=(index < len(stores)
+                                     and len(graph.enclosing_loops(stores[index])) > at),
         ))
     return tuple(matmuls)
 
@@ -466,23 +503,29 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
             if covered[axis] != asked[axis]:
                 padding.append(Padding(matmul=index, axis=axis, extent=asked[axis], padded=covered[axis]))
             ratio *= covered[axis] / asked[axis]
-        _resident_tiles(index=index, matmul=matmul, covered=covered)
+        live = _resident_blocks(index=index, matmul=matmul, covered=covered)
+        block_m, block_n = live["m"] * matmul.rows, live["n"] * matmul.columns
 
         launch = Launch(
-            row_blocks=covered["m"] // matmul.rows,
+            row_blocks=covered["m"] // block_m,
             column_tiles=covered["n"] // _TILE,
             groups=covered["k"] // (blocks * _BLOCK_DEPTH),
             loop_blocks=blocks,
             activate=_EPILOGUES[matmul.epilogue] == "gelu",
-            # Sums the groups on the device, which leaves the product where the next launch reads it. The
-            # dot's element type decides nothing here, as the machine carries no float32 state.
-            fuse_groups=True,
-            block_m=matmul.rows,
-            block_n=matmul.columns,
+            # Places the accumulator where the kernel put it, summing the groups on the device for one it
+            # carries across the reduction and draining a partial each for one it writes to memory per step.
+            fuse_groups=not matmul.stores_inside_reduction,
+            # Covers every block the nest keeps live, which is what a tile loop inside the reduction asks for
+            # and the kernel's own tile otherwise.
+            block_m=block_m,
+            block_n=block_n,
+            # Places an axis whose loop was folded outermost, where a single trip leaves the order it walks
+            # indistinguishable from any other.
+            nest=(*(axis for axis in _EMITTED_NEST if axis not in matmul.nest), *matmul.nest),
         )
         launches.append(launch)
         # Measures the drain in the block the launch states, since a narrower one drains fewer rows.
-        shape = (launch.blocks, launch.partials, launch.output_tiles, launch.block_m, _TILE)
+        shape = (launch.image_blocks, launch.partials, launch.output_tiles, launch.block_m, _TILE)
         drains.append(Drain(
             zero_tile_words=_ZERO_TILE_WORDS,
             words=_ZERO_TILE_WORDS + math.prod(shape),
@@ -1233,18 +1276,20 @@ def compile_launch(launch: Launch) -> tuple[bytes, Staging]:
             "the activation is placed here too."
         )
         raise NotImplementedError(message)
-    counts = dict(column_tiles=launch.column_tiles, groups=launch.groups, loop_blocks=launch.loop_blocks,
+    counts = dict(column_tiles=launch.image_blocks * launch.output_tiles, groups=launch.groups,
+                  loop_blocks=launch.loop_blocks,
                   fuse_groups=launch.fuse_groups, block_m=launch.block_m, block_n=launch.block_n)
     bundles, staging = looped_gemm_stream(**counts)
     return AsmKernel(name="looped_gemm", bundles=bundles).to_bytes(pad_to=4), staging
 
 
-def _resident_tiles(*, index: int, matmul: MatMul, covered: dict[str, int]) -> None:
-    """Judges the output tiles a matmul accumulates at once, refusing a block the machine cannot stage.
+def _resident_blocks(*, index: int, matmul: MatMul, covered: dict[str, int]) -> dict[str, int]:
+    """Returns the blocks each output axis keeps live inside the reduction, refusing one the array cannot stage.
 
     Notes:
-        Tiles past what the register file affords accumulate in VMEM, so what this rejects is a block whose own
-        staging does not fit, which no spill relieves.
+        A tile loop inside the reduction keeps every block it walks live until the contraction ends, so one
+        block covers them all along that axis. Columns past what the register file affords accumulate in VMEM,
+        while every token group needs staging registers of its own, which makes the rows the tighter of the two.
 
     Args:
         index: Position of the matmul in the kernel.
@@ -1252,28 +1297,30 @@ def _resident_tiles(*, index: int, matmul: MatMul, covered: dict[str, int]) -> N
         covered: Extent the launch covers along each axis, which is where a tile loop bounded by a runtime
             argument gets its trip count from.
 
+    Returns:
+        The blocks held live along "m" and along "n", each one where that axis walks outside the reduction.
+
     Raises:
-        ProgramError: If the register file cannot stage one step of the block the nest implies.
+        ProgramError: If the register file cannot stage the block those live sets imply.
     """
-    inner = {loop.step: loop.axis for loop in matmul.tile_loops if loop.axis is not None}
-    resident = 1
-    for step in matmul.steps_inside_reduction:
-        # Names the step by the loop walking it, which `read_program` read from the operand it addresses.
-        axis = inner.get(step)
-        if axis is not None:
-            resident *= covered[axis] // step
-    # Asks the map for a block wide enough to hold them, which raises only where a step's own staging
-    # overruns the file.
+    # Reads the axes from the nest rather than from the steps, which two loops sharing a step leave ambiguous.
+    live = {"m": 1, "n": 1}
+    for axis in matmul.nest[matmul.nest.index(_REDUCTION_AXIS) + 1:]:
+        if axis in live:
+            live[axis] = covered[axis] // (matmul.rows if axis == "m" else matmul.columns)
+
+    block_m, block_n = live["m"] * matmul.rows, live["n"] * matmul.columns
     try:
-        register_map(block_m=matmul.rows, block_n=resident * _TILE)
+        register_map(block_m=block_m, block_n=block_n)
     except LayoutError as error:
         message = (
-            f"Unable to accumulate {resident} output tiles at once in matmul {index}, whose tile loop runs inside "
-            f"its reduction. {error} Walk the tiles outside the reduction instead, because per accumulator that "
-            f"is the same additions in the same order and it leaves one tile resident however many the product "
-            f"covers."
+            f"Unable to stage matmul {index}'s block of {block_m} rows by {block_n} columns, which is what a "
+            f"nest walking {', '.join(matmul.nest)} keeps live. {error} Walk those tiles outside the reduction "
+            f"instead, because per accumulator that is the same additions in the same order and it leaves one "
+            f"block live however many the product covers."
         )
         raise ProgramError(message) from error
+    return live
 
 
 def _repacking_needed(*, index: int, matmul: MatMul, strides: dict[str, int]) -> list[Repack]:

@@ -27,6 +27,22 @@ from runtime import (  # noqa: E402
 )
 
 
+def _issued(*, order: str, tokens: int, columns: int) -> list[tuple[int, int]]:
+    """Returns every launch a host issues, as its token block and column block, in the order the kernel walks them.
+
+    Args:
+        order: The output axes the kernel walks, outermost first, as the compiler packed them.
+        tokens: Token blocks the product covers.
+        columns: Column blocks one token block is issued against.
+
+    Returns:
+        The token block and column block of each launch, in issue order.
+    """
+    if order.startswith("n"):
+        return [(token, column) for column in range(columns) for token in range(tokens)]
+    return [(token, column) for token in range(tokens) for column in range(columns)]
+
+
 def _run_on_device(*, image: bytes, operands: np.lib.npyio.NpzFile) -> NDArray[np.float32]:
     """Copies one packed operand pair to the device, launches the image against it, and sums the drain.
 
@@ -42,10 +58,11 @@ def _run_on_device(*, image: bytes, operands: np.lib.npyio.NpzFile) -> NDArray[n
     drain_bytes = int(operands["drain_bytes"])
     zero_tile_words = int(operands["zero_tile_words"])
     shape = tuple(int(extent) for extent in operands["drain_shape"])
-    blocks, _, output_tiles, block_tokens, tile = shape
-    column_tiles = blocks * output_tiles
+    _, _, _, block_tokens, _ = shape
+    block_columns = int(operands["block_columns"])
     drain_words = int(operands["drain_words"])
-    product = np.empty((activations.shape[0] * block_tokens, column_tiles * tile), dtype=np.float32)
+    issued = _issued(order=str(operands["issue_order"]), tokens=len(activations), columns=len(weights))
+    product = np.empty((activations.shape[0] * block_tokens, len(weights) * block_columns), dtype=np.float32)
 
     minitpuSetDevice("minitpu")
     minitpuHostReset()
@@ -57,11 +74,9 @@ def _run_on_device(*, image: bytes, operands: np.lib.npyio.NpzFile) -> NDArray[n
         owned.append(device_image)
         minitpuMemcpy(device_image, host_image, len(image), MemcpyKind.HostToDevice)
 
-        host_weights = minitpuHostAlloc(weights.nbytes)
-        host_weights.view.view("<u2")[: weights.size] = weights
+        host_weights = minitpuHostAlloc(weights[0].nbytes)
         device_weights = minitpuMalloc(int(operands["weight_bytes"]))
         owned.append(device_weights)
-        minitpuMemcpy(device_weights, host_weights, weights.nbytes, MemcpyKind.HostToDevice)
 
         host_drain = minitpuHostAlloc(drain_bytes)
         host_drain.view.view("<u2")[:drain_words] = 0
@@ -73,17 +88,22 @@ def _run_on_device(*, image: bytes, operands: np.lib.npyio.NpzFile) -> NDArray[n
         device_activations = minitpuMalloc(int(operands["activation_bytes"]))
         owned.append(device_activations)
 
-        for index, block in enumerate(activations):
+        # Copies both operands every launch, since the issue order decides which of them repeats and the
+        # device holds one of each.
+        for token, column in issued:
+            block = activations[token]
             host_activations.view.view("<u2")[: block.size] = block
             minitpuMemcpy(device_activations, host_activations, block.nbytes, MemcpyKind.HostToDevice)
+            host_weights.view.view("<u2")[: weights[column].size] = weights[column]
+            minitpuMemcpy(device_weights, host_weights, weights[column].nbytes, MemcpyKind.HostToDevice)
 
             minitpuLaunchKernel(device_image, len(image),
                                 args=[device_activations, device_weights, device_drain])
             minitpuMemcpy(host_drain, device_drain, drain_bytes, MemcpyKind.DeviceToHost)
 
             partials = from_bf16_words(words=host_drain.view.view("<u2")[zero_tile_words:drain_words])
-
-            product[index * block_tokens : (index + 1) * block_tokens] = reduce_drain(partials, shape=shape)
+            product[token * block_tokens : (token + 1) * block_tokens,
+                    column * block_columns : (column + 1) * block_columns] = reduce_drain(partials, shape=shape)
     finally:
         for address in owned:
             minitpuFree(address)

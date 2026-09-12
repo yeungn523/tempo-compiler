@@ -166,8 +166,7 @@ sets the PL clock, and a board that programs the PL without that step runs the f
 still passes and every time is about 1.8 times too slow. See [board_package/README.md](board_package/README.md) for
 what each target proves and what it costs.
 
-A compiled kernel is launched there under the names the board reads, being `triton_kernel.bin` for its image and
-`triton_operands.npz` for its operands:
+A compiled kernel is launched with `triton_kernel.bin` (the image) and `triton_operands.npz` (its operands):
 
 ```sh
 scp build/e2e/matmul_0.bin <netid>@<board>:board_package/triton_kernel.bin
@@ -180,7 +179,7 @@ scp build/e2e/matmul_0_operands.npz <netid>@<board>:board_package/triton_operand
 python3 -m unittest discover -s board_package/tests -t board_package/tests -q
 ```
 
-This runs 82 host tests covering the assembler encodings, the scheduling distances, the operand rule, the address
+This runs 86 unit tests covering the assembler encodings, the scheduling distances, the operand rule, the address
 space, the drain, and the compiler path from a decorated Triton kernel through to the image its plan emits. The
 compiler tests import Triton, so they run on the host rather than on the board.
 

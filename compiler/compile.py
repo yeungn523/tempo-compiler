@@ -360,35 +360,15 @@ def read_program(kernel: JITFunction, *, signature: dict[str, str],
             message = f"Unable to read the step of matmul {index}'s loops. Each must be a compile time constant."
             raise ProgramError(message)
 
-        walking = [position for position, step in enumerate(steps) if step not in (rows, columns)]
-        if not walking:
-            message = (
-                f"Unable to read matmul {index}'s reduction from loops stepping by "
-                f"{', '.join(str(step) for step in steps)}, which are the tile's own {rows} rows and {columns} "
-                f"columns. A reduction loop that runs once is folded before this reader sees it, leaving only "
-                f"tile loops, and reading one of their steps as the contraction depth would report a number the "
-                f"kernel never stated. Give the reduction more than one trip, or state its depth as a runtime "
-                f"argument so the loop survives."
-            )
-            raise ProgramError(message)
-        if len(walking) > 1:
-            message = (
-                f"Unable to tell which of matmul {index}'s loops walks the reduction: {len(walking)} of them step "
-                f"by neither the tile's {rows} rows nor its {columns} columns "
-                f"({', '.join(str(steps[position]) for position in walking)}). One loop may walk the contraction, "
-                f"because a reader that picked one of these would accumulate the wrong axis."
-            )
-            raise ProgramError(message)
-
-        at = walking[0]
+        pointers = {role: (None if operation is None else operation.get_operand(0))
+                    for role, (operation, _) in (("activation", graph._load_behind(dot.get_operand(0))),
+                                                 ("weight", graph._load_behind(dot.get_operand(1))))}
+        at = _reduction_position(index=index, graph=graph, loops=loops, steps=steps, pointers=pointers,
+                                 rows=rows, columns=columns)
         source, _ = graph.trace(dot.get_operand(0), among=dots)
         consumer = consumers[index] if index < len(consumers) else None
         epilogue = frozenset() if consumer is None else graph.trace(
             consumer.get_operand(1 if consumer.get_name() == "tt.store" else 0), among=dots)[1]
-
-        pointers = {role: (None if operation is None else operation.get_operand(0))
-                    for role, (operation, _) in (("activation", graph._load_behind(dot.get_operand(0))),
-                                                 ("weight", graph._load_behind(dot.get_operand(1))))}
 
         def walked(among) -> tuple[TileLoop, ...]:
             """Reads each of the given loops as a tile loop, dropping any whose bounds are runtime values."""
@@ -1034,6 +1014,55 @@ class _Graph:
             axes={**left.axes, **right.axes},
             scalar=left.scalar if right.scalar is None else right.scalar,
         )
+
+
+def _reduction_position(*, index: int, graph: _Graph, loops: list, steps: list[int],
+                        pointers: dict[str, object], rows: int, columns: int) -> int:
+    """Returns the position of the loop walking one matmul's contraction.
+
+    Notes:
+        A tile loop's variable addresses one operand alone, which names the axis it walks, so the contraction is
+        the loop naming none. Two loops the addresses leave unnamed are told apart by their step, since a tile
+        loop steps by its own tile.
+
+    Args:
+        index: Position of the matmul in the kernel.
+        graph: The indexed module the loops belong to.
+        loops: The loops enclosing the matmul, outermost first.
+        steps: The step each of those loops takes.
+        pointers: The activation's and the weight's pointer values, keyed by role.
+        rows: Token rows the matmul's tile covers.
+        columns: Output columns the matmul's tile covers.
+
+    Returns:
+        The position of the reduction loop.
+
+    Raises:
+        ProgramError: If every loop walks an output axis, or if two of them walk neither.
+    """
+    walking = [position for position, loop in enumerate(loops)
+               if graph.axis_of_loop(loop, pointers=pointers) is None]
+    if len(walking) > 1:
+        # Holds a tile loop advancing its operand from the body it encloses, whose own variable reaches neither
+        # pointer, to the step its tile gives it.
+        walking = [position for position in walking if steps[position] not in (rows, columns)]
+    if len(walking) == 1:
+        return walking[0]
+
+    if not walking:
+        message = (
+            f"Unable to read matmul {index}'s reduction, whose {len(loops)} enclosing loops each address one "
+            f"operand alone and so walk an output axis. A reduction loop that runs once is folded before this "
+            f"reader sees it, so give it more than one trip, or state its depth as a runtime argument."
+        )
+        raise ProgramError(message)
+    message = (
+        f"Unable to tell which of matmul {index}'s loops walks the reduction: {len(walking)} of them address "
+        f"neither operand alone and step by neither the tile's {rows} rows nor its {columns} columns "
+        f"({', '.join(str(steps[position]) for position in walking)}). One loop may walk the contraction, because "
+        f"a reader that picked one of these would accumulate the wrong axis."
+    )
+    raise ProgramError(message)
 
 
 def _machine_tile(*, index: int, matmul: MatMul) -> int:

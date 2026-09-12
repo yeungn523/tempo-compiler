@@ -58,7 +58,6 @@ result registers the following pop overwrites, so the gap keeps them clear of it
 _ZERO_ROWS: int = _TILE
 """Rows the clearing tile occupies, which one descriptor fills before any column tile runs."""
 
-
 _DRAIN_POINTER: int = 1
 """Scalar register holding the drain buffer's host address."""
 
@@ -67,6 +66,9 @@ _STRIDE_REGISTER: int = 3
 
 _SCALAR_GAP: int = asm_module.W_SCALAR + 1
 """Bundles a scalar write must clear before a descriptor may read the register, the unit interlocking nothing."""
+
+_MAX_SADDI: int = 0x7FFF
+"""Widest displacement one scalar add carries, being the signed reach of its 16 bit immediate field."""
 
 _REDUCTION_AXIS: str = "k"
 """Axis the contraction walks."""
@@ -447,10 +449,8 @@ def looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups
         at = _emit_drain(put=put, builder=builder, at=at, rows=rows, registers=registers)
     # Steps over the tiles the block covered past the first, which one iteration's own advance does not reach.
     for operand in staged:
-        if operand.tiles > 1:
-            skipped = operand.tile_stride * (operand.tiles - 1)
-            put(offset=at, s=builder.saddi(rd=operand.pointer, rs=operand.pointer, value=skipped))
-            at += _SCALAR_GAP
+        at = _emit_split_advance(put=put, builder=builder, at=at, register=operand.pointer,
+                                 delta=operand.tile_stride * (operand.tiles - 1), gap=_SCALAR_GAP)
     put(offset=at, f=builder.loop_end())
     at += 1
     put(offset=at, f=builder.halt())
@@ -573,6 +573,34 @@ def _emit_rewind(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at
     return at
 
 
+def _emit_split_advance(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int, register: int,
+                        delta: int, gap: int) -> int:
+    """Issues the scalar adds moving one pointer by the given displacement, returning the next free offset.
+
+    Notes:
+        One add reaches as far as its 16 bit immediate holds, so a displacement past that is split across
+        several. The tiles a block covers and the depth of its group both grow the rewind its staging ends on.
+
+    Args:
+        put: Merges slot words into the bundle at one offset.
+        builder: Encodes each slot word.
+        at: Offset the first add sits at.
+        register: Scalar register holding the pointer.
+        delta: Signed bytes the pointer moves.
+        gap: Offsets between one add and the next.
+
+    Returns:
+        The next free offset.
+    """
+    remaining = delta
+    while remaining:
+        step = max(-_MAX_SADDI, min(_MAX_SADDI, remaining))
+        put(offset=at, s=builder.saddi(rd=register, rs=register, value=step))
+        at += gap
+        remaining -= step
+    return at
+
+
 def _emit_stage(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int, step: int,
                 vmem_slot: int, operands: tuple[StagedOperand, ...]) -> int:
     """Issues one step's descriptors into the named VMEM slot, returning the next free offset.
@@ -595,8 +623,8 @@ def _emit_stage(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at:
             at += 1
             walked = operand.tile_stride * (operand.tiles - 1)
             step_bytes = operand.tile_stride if tile + 1 < operand.tiles else operand.advance - walked
-            put(offset=at, s=builder.saddi(rd=operand.pointer, rs=operand.pointer, value=step_bytes))
-            at += 1
+            at = _emit_split_advance(put=put, builder=builder, at=at, register=operand.pointer,
+                                     delta=step_bytes, gap=1)
     return at
 
 

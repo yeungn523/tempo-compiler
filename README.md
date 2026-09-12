@@ -170,8 +170,8 @@ A compiled kernel is launched there under the names the board reads, being `trit
 `triton_operands.npz` for its operands:
 
 ```sh
-scp build/e2e/matmul_0.bin <account>@<board>:board_package/triton_kernel.bin
-scp build/e2e/matmul_0_operands.npz <account>@<board>:board_package/triton_operands.npz
+scp build/e2e/matmul_0.bin <netid>@<board>:board_package/triton_kernel.bin
+scp build/e2e/matmul_0_operands.npz <netid>@<board>:board_package/triton_operands.npz
 ```
 
 ### Running the Tests

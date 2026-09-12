@@ -47,15 +47,29 @@ class ProgramReaderTest(unittest.TestCase):
         self.assertEqual(matmul.accumulator, "f32")
         self.assertEqual(tuple(loop.step for loop in matmul.tile_loops), (32, 16))
 
-    def test_a_token_loop_stepping_like_the_reduction_is_refused(self) -> None:
-        """Asserts a nest whose loops cannot be told apart by their step is refused rather than misread.
+    def test_a_shared_token_step_is_read(self) -> None:
+        """Asserts a token block the size of the reduction block leaves the reduction named by its addresses."""
+        matmuls, planned = compile_one(gemm_tall_rows, dims=({"m": 64},))
+        matmul = matmuls[0]
+        self.assertEqual((matmul.rows, matmul.columns, matmul.depth), (64, 16, 64))
+        self.assertEqual(matmul.reduction, 192)
+        self.assertEqual(tuple(loop.axis for loop in matmul.tile_loops), ("n",))
+        self.assertEqual(planned.launches[0].row_blocks, 1)
 
-        The reader names each axis by the step of the loop walking it, so a token block the size of the reduction
-        block leaves two loops indistinguishable. Recovering the axes from the addresses each loop advances is what
-        would lift this.
-        """
+    def test_a_shared_column_step_is_read(self) -> None:
+        """Asserts a block as wide as its reduction is deep leaves every loop's axis recovered."""
+        matmuls, planned = compile_one(gemm_square_tile)
+        matmul = matmuls[0]
+        self.assertEqual((matmul.rows, matmul.columns, matmul.depth), (32, 64, 64))
+        self.assertEqual(matmul.reduction, 192)
+        self.assertEqual(tuple(loop.axis for loop in matmul.tile_loops), ("m", "n"))
+        launch = planned.launches[0]
+        self.assertEqual((launch.row_blocks, launch.column_tiles, launch.groups), (2, 8, 3))
+
+    def test_a_folded_reduction_is_refused(self) -> None:
+        """Asserts a kernel whose reduction ran once, leaving tile loops alone, is refused rather than misread."""
         with self.assertRaises(ProgramError):
-            compile_one(gemm_tall_rows)
+            compile_one(gemm_folded_reduction)
 
 
 class PlannerTest(unittest.TestCase):
@@ -255,6 +269,46 @@ def gemm_tall_rows(ap, wp, op, stride_am, stride_ak, stride_bk, stride_bn, strid
                    M: tl.constexpr = 64, N: tl.constexpr = 48, K: tl.constexpr = 192,
                    BLOCK_M: tl.constexpr = 64, BLOCK_N: tl.constexpr = 16, BLOCK_K: tl.constexpr = 64):
     """Multiplies with a token block that steps by the same amount the reduction does."""
+    offs_k = tl.arange(0, BLOCK_K)
+    for block in range(0, M, BLOCK_M):
+        offs_m = block + tl.arange(0, BLOCK_M)
+        for tile in range(0, N, BLOCK_N):
+            offs_n = tile + tl.arange(0, BLOCK_N)
+            a = ap + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+            b = wp + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+            accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for _ in range(0, K, BLOCK_K):
+                accumulator += tl.dot(tl.load(a), tl.load(b))
+                a += BLOCK_K * stride_ak
+                b += BLOCK_K * stride_bk
+            tl.store(op + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, accumulator)
+
+
+@triton.jit
+def gemm_folded_reduction(ap, wp, op, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+                          M: tl.constexpr = 64, N: tl.constexpr = 48, K: tl.constexpr = 64,
+                          BLOCK_M: tl.constexpr = 32, BLOCK_N: tl.constexpr = 16, BLOCK_K: tl.constexpr = 64):
+    """Multiplies over a contraction one block covers, which canonicalization folds the reduction loop of."""
+    offs_k = tl.arange(0, BLOCK_K)
+    for block in range(0, M, BLOCK_M):
+        offs_m = block + tl.arange(0, BLOCK_M)
+        for tile in range(0, N, BLOCK_N):
+            offs_n = tile + tl.arange(0, BLOCK_N)
+            a = ap + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+            b = wp + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+            accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for _ in range(0, K, BLOCK_K):
+                accumulator += tl.dot(tl.load(a), tl.load(b))
+                a += BLOCK_K * stride_ak
+                b += BLOCK_K * stride_bk
+            tl.store(op + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, accumulator)
+
+
+@triton.jit
+def gemm_square_tile(ap, wp, op, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+                     M: tl.constexpr = 64, N: tl.constexpr = 128, K: tl.constexpr = 192,
+                     BLOCK_M: tl.constexpr = 32, BLOCK_N: tl.constexpr = 64, BLOCK_K: tl.constexpr = 64):
+    """Multiplies with an output block as wide as the reduction block is deep."""
     offs_k = tl.arange(0, BLOCK_K)
     for block in range(0, M, BLOCK_M):
         offs_m = block + tl.arange(0, BLOCK_M)

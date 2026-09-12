@@ -195,6 +195,37 @@ class SpillReloadTest(unittest.TestCase):
         self.assertTrue(scratch <= loaded, "a scratch tile is left unloaded when the pushes begin")
 
 
+class PointerAdvanceTest(unittest.TestCase):
+    """Covers the adds the emitter moves an operand's pointer with."""
+
+    def test_a_wide_displacement_splits(self) -> None:
+        """Asserts the adds a displacement is split across carry it whole, each inside the immediate's reach."""
+        bundles: dict[int, dict[str, int]] = {}
+
+        def put(*, offset: int, **slots: int) -> None:
+            """Records the bundle one add is placed at."""
+            bundles[offset] = slots
+
+        for delta in (512, -48640, emit._MAX_SADDI, emit._MAX_SADDI + 1, -3 * emit._MAX_SADDI):
+            with self.subTest(delta=delta):
+                bundles.clear()
+                at = emit._emit_split_advance(put=put, builder=asm.AsmBuilder(), at=0, register=2, delta=delta,
+                                              gap=1)
+                addends = [_scalar_addend(slots["s"]) for slots in bundles.values()]
+                self.assertEqual(sum(addends), delta)
+                self.assertEqual(at, len(addends))
+                self.assertTrue(all(abs(addend) <= emit._MAX_SADDI for addend in addends))
+
+    def test_a_wide_rewind_still_emits(self) -> None:
+        """Asserts a block wide and deep enough to rewind past one immediate still places every bundle."""
+        words, staging = emit.looped_gemm_stream(column_tiles=48, groups=4, loop_blocks=4, block_m=32, block_n=64)
+        self.assertEqual(staging.output_tiles, 4)
+        addends = [_scalar_addend(word) for word in words if asm._decode(word)["s_writes"]]
+        self.assertIn(-emit._MAX_SADDI, addends)
+        # Scheduling refuses a stream it cannot space, so one it returns is legal.
+        self.assertTrue(asm.schedule(list(words)))
+
+
 class BundleMergeTest(unittest.TestCase):
     """Covers the merge every placed bundle goes through, which is the only thing holding one word per slot."""
 
@@ -291,6 +322,12 @@ def _descriptor_base(word: int) -> int:
 def _descriptor_rows(word: int) -> int:
     """Returns the rows one descriptor moves, which it holds one less than."""
     return ((word >> asm._D_SHIFT) >> 4 & 0x7F) + 1
+
+
+def _scalar_addend(word: int) -> int:
+    """Returns the signed immediate one scalar add carries."""
+    immediate = (word >> asm._S_SHIFT) & 0xFFFF
+    return immediate - 0x10000 if immediate & 0x8000 else immediate
 
 
 if __name__ == "__main__":

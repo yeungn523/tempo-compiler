@@ -21,8 +21,8 @@ from .frontend import compile_to_ttir
 _MINIMUM_LOOP_BLOCKS: int = 2
 """Smallest number of accumulation blocks a group carries, set by the two way unroll of the block loop."""
 
-_FUSED_ACCUMULATOR_ELEMENT: str = "f32"
-"""Accumulator element type the device cannot deliver, so its groups drain for the host to sum."""
+_ASSUMED_ACCUMULATOR_ELEMENT: str = "f32"
+"""Element type a dot accumulates in when its printed result type states none."""
 
 _EPILOGUES: dict[frozenset[str], str] = {
     frozenset(): "",
@@ -377,7 +377,7 @@ def read_program(kernel: JITFunction, *, signature: dict[str, str],
 
         matmuls.append(MatMul(
             rows=rows, columns=columns, depth=steps[at],
-            accumulator=accumulators[index] if index < len(accumulators) else _FUSED_ACCUMULATOR_ELEMENT,
+            accumulator=accumulators[index] if index < len(accumulators) else _ASSUMED_ACCUMULATOR_ELEMENT,
             epilogue=epilogue,
             left_source=dots.index(source) if source is not None else None,
             reduction=graph.constant(loops[at].get_operand(1)),
@@ -474,8 +474,9 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
             groups=covered["k"] // (blocks * _BLOCK_DEPTH),
             loop_blocks=blocks,
             activate=_EPILOGUES[matmul.epilogue] == "gelu",
-            # Drains a partial per group to honour a float32 accumulator, since the device sums in BF16.
-            fuse_groups=matmul.accumulator != _FUSED_ACCUMULATOR_ELEMENT,
+            # Sums the groups on the device, which leaves the product where the next launch reads it. The
+            # dot's element type decides nothing here, as the machine carries no float32 state.
+            fuse_groups=True,
             block_m=matmul.rows,
             block_n=matmul.columns,
         )
@@ -862,7 +863,7 @@ class _Graph:
         for line in self.module.str_nodebug().splitlines():
             if "tt.dot" in line:
                 found = re.search(r"->\s*tensor<[0-9x]+x(\w+)>", line)
-                elements.append(found.group(1) if found else _FUSED_ACCUMULATOR_ELEMENT)
+                elements.append(found.group(1) if found else _ASSUMED_ACCUMULATOR_ELEMENT)
         return tuple(elements)
 
     def _conjuncts(self, value) -> list:

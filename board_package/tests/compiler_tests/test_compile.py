@@ -84,16 +84,17 @@ class PlannerTest(unittest.TestCase):
         self.assertEqual(launch.groups, 3)
         self.assertEqual(launch.loop_blocks, 2)
         self.assertFalse(launch.activate)
-        self.assertFalse(launch.fuse_groups)
+        self.assertTrue(launch.fuse_groups)
         self.assertEqual(planned.issued_over_useful, 1.0)
         self.assertEqual(planned.padding, ())
         self.assertEqual(planned.repack, ())
 
     def test_the_drain_matches_the_partials_the_launch_leaves(self) -> None:
-        """Asserts the drain covers one partial per group per block, in the order the image walks them."""
+        """Asserts the drain covers one partial per block, which is what summing the groups on the device leaves."""
         _, planned = compile_one(gemm)
         launch, drain = planned.launches[0], planned.drains[0]
-        self.assertEqual(drain.shape, (launch.blocks, launch.groups, launch.output_tiles, launch.block_m, _TILE))
+        self.assertEqual(launch.partials, 1)
+        self.assertEqual(drain.shape, (launch.blocks, 1, launch.output_tiles, launch.block_m, _TILE))
         self.assertEqual(launch.blocks * launch.output_tiles, launch.column_tiles)
 
     def test_a_block_wider_than_the_array_is_planned_as_its_column_tiles(self) -> None:
@@ -134,7 +135,7 @@ class PipelineTest(unittest.TestCase):
         base = dataclasses.replace(compile_one(gemm)[1].launches[0], column_tiles=4)
         reference, _ = compile_launch(base)
         for field, value in (("column_tiles", 8), ("groups", 6), ("loop_blocks", 4),
-                             ("fuse_groups", True), ("block_m", 16), ("block_n", 32)):
+                             ("fuse_groups", False), ("block_m", 16), ("block_n", 32)):
             with self.subTest(field=field):
                 altered, _ = compile_launch(dataclasses.replace(base, **{field: value}))
                 self.assertNotEqual(altered, reference)

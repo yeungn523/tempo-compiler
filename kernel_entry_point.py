@@ -221,6 +221,16 @@ def main() -> int:
     dims = _integer_bindings(arguments.dims, flag="--dims")
     planned = plan(matmuls, strides=_integer_bindings(arguments.strides, flag="--strides"),
                    dims=(dims,) * len(matmuls))
+    if arguments.activations is not None and planned.repack:
+        rewritten = ", ".join(f"matmul {repacked.matmul}'s {repacked.role} steps by {repacked.stride} along "
+                              f"{repacked.axis}" for repacked in planned.repack)
+        message = (
+            f"Unable to pack an operand this plan repacks, being {rewritten}. The packing below lays each "
+            f"operand out where it already lies, so one whose lane axis steps by more than one would be packed "
+            f"as though it were contiguous, and the reference written beside it would carry the same mistake. "
+            f"Lay the operand out with a unit stride along that axis, or omit --activations to plan alone."
+        )
+        raise ProgramError(message)
 
     written = pathlib.Path(arguments.output).expanduser().resolve() if arguments.output else None
     if written is not None:

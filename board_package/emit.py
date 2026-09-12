@@ -308,6 +308,7 @@ def gemm_step(*, activation_row: int, weight_row: int, close_loop: bool,
         put(offset=_TILE_VREGS + vreg,
             x=builder.vld(vreg=registers.activation + vreg, row=activation_row + _NUM_SUBLANES * vreg))
     put(offset=_MATLOAD_AT, m=builder.vmatload(vreg=registers.weight))
+
     if spill_row is not None and registers.reload_hoisted:
         # Reads what earlier steps accumulated, which this step's results do not feed, so the load rides beside
         # the operand staging.
@@ -327,20 +328,6 @@ def gemm_step(*, activation_row: int, weight_row: int, close_loop: bool,
     _place_matrix_commands(put=put, builder=builder, stage_next=stage_next, close_loop=close_loop,
                            registers=registers, tile=tile, spill_row=spill_row)
     return bundles
-
-
-def gemm_step_stream(*, activation_row: int, weight_row: int, close_loop: bool) -> tuple[int, ...]:
-    """Returns one accumulation step as the contiguous bundle words it places, zero filling the offsets it leaves.
-
-    Args:
-        activation_row: First VMEM row of this step's activation pair, spanning both token groups.
-        weight_row: First VMEM row of this step's weight tile.
-        close_loop: Determines whether the step's final accumulate carries the enclosing loop's closing bundle.
-
-    Returns:
-        The bundle words, in placement order.
-    """
-    return _flatten(gemm_step(activation_row=activation_row, weight_row=weight_row, close_loop=close_loop))
 
 
 def looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups: bool = False,

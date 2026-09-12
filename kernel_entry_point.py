@@ -239,6 +239,13 @@ def main() -> int:
     for index, (matmul, launch) in enumerate(zip(matmuls, planned.launches, strict=True)):
         print(f"matmul {index}  {matmul.rows}x{matmul.columns} tile over {matmul.depth}, reduction "
               f"{matmul.reduction}, accumulator {matmul.accumulator}")
+        # A host issues one launch per token block, so an order holding the tokens outermost is the one the
+        # image can carry. Any other is reordered until the token loop moves into the image.
+        walked = ", ".join(launch.nest)
+        carried = ("emitted as written, over a block of "
+                   f"{launch.block_n} columns" if launch.nest[0] == "m" else
+                   "emitted with its token blocks outermost, which reorders it")
+        print(f"nest   {index}  kernel walks {walked}, {carried}")
         print(f"launch {index}  row_blocks={launch.row_blocks} column_tiles={launch.column_tiles} "
               f"groups={launch.groups} loop_blocks={launch.loop_blocks} activate={launch.activate} "
               f"fuse_groups={launch.fuse_groups}")

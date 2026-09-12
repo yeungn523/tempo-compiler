@@ -401,6 +401,14 @@ def LoopBuffer : Resource<"loop_buffer">
     let note = "A body longer than this refetches from IRAM instead of replaying, which bounds replay rather than speed.";
 }
 
+def InstructionMemory : Resource<"iram">
+{
+    let rtl_parameter = "IRAM_DEPTH";
+    let values = [ResourceValue<"depth_bundles", 4096>];
+    let asm_constants = [AsmConstant<"IRAM_DEPTH", "depth_bundles">];
+    let note = "Bundles the loader places, being 2**IRAM_ADDR_WIDTH. A longer image is loaded up to this and its tail never runs, so the drain it ends on leaves the buffer untouched.";
+}
+
 def DelayField : Resource<"delay_field">
 {
     let rtl_parameter = "DELAY_W";
@@ -460,7 +468,7 @@ def IsaOrder : EmissionOrder
 
     let matrix_commands = [MatrixLoadCommand, MatrixPushCommand, MatrixPopCommand];
 
-    let resources = [MatrixOutputFifo, LoopBuffer, DelayField, DmaSlots, VectorMemory];
+    let resources = [MatrixOutputFifo, LoopBuffer, InstructionMemory, DelayField, DmaSlots, VectorMemory];
 }
 
 // The dialect's operation definitions belong beside the scheduling records they constrain. Adding them makes the file

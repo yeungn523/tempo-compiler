@@ -119,6 +119,9 @@ leaving two bundles between a scalar write and its use."""
 LB_CAP: int = 24
 """Loop-buffer capacity in bundles, mirroring sequencer_loop_ctrl's LB_CAP. A longer body refetches from IRAM."""
 
+IRAM_DEPTH: int = 4096
+"""Bundles the loader places, mirroring minitpu_config_pkg's IRAM_DEPTH."""
+
 DMA_SLOT_COUNT: int = 2
 """Descriptor slots a flush mask selects between, mirroring minitpu_config_pkg's DMA_SLOT_COUNT."""
 
@@ -637,8 +640,19 @@ class AsmKernel:
 
         Returns:
             The image as the bytes an IRAM load expects.
+
+        Raises:
+            ValueError: If the scheduled image holds more bundles than IRAM places.
         """
-        return b"".join(word.to_bytes(BUNDLE_BYTES, "little") for word in self.assemble(pad_to=pad_to))
+        words = self.assemble(pad_to=pad_to)
+        if len(words) > IRAM_DEPTH:
+            message = (
+                f"Unable to load an image of {len(words)} bundles. IRAM places {IRAM_DEPTH}, and a longer image "
+                f"is loaded up to that, so the drain it ends on never runs and leaves the buffer untouched. "
+                f"Narrow the block or shorten the body this image walks."
+            )
+            raise ValueError(message)
+        return b"".join(word.to_bytes(BUNDLE_BYTES, "little") for word in words)
 
 
 def mxu_output_fifo() -> tuple[int, int, int]:

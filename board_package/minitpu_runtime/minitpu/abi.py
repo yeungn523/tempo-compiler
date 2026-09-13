@@ -75,8 +75,6 @@ tells the two apart. A copy-only bitstream carries no loader and leaves the regi
 has to catch instead.
 """
 
-DMA_SLOT_DONE_CSR: int = AXI_REG["dma_slot_done"]
-
 # The v7 host-dispatch sub-FSM still decodes these mode values, so the constant generator keeps emitting the matching
 # localparams to keep the modes package elaborating. No opcode maps to them and the runtime never writes them.
 _LEGACY_RTL_MODES: dict[str, int] = {
@@ -278,11 +276,6 @@ LAUNCH_DESCRIPTOR: tuple[CmdField, ...] = CMD_HEADER + (
     CmdField(7, 0, 32, "grid_y", "v3"),
 )
 """Wire layout of a LAUNCH command, which runs a kernel binary resident in device memory."""
-
-CMD_DESCRIPTORS: dict[int, tuple[CmdField, ...]] = {
-    CmdOpc.COPY: COPY_DESCRIPTOR,
-    CmdOpc.LAUNCH: LAUNCH_DESCRIPTOR,
-}
 
 
 def build_cmd_words(descriptor: tuple[CmdField, ...], values: dict[str, int]) -> list[int]:

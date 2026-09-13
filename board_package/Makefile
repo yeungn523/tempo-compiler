@@ -3,7 +3,7 @@ SHELL := /bin/bash
 HERE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 PYTHON ?= python3 -u
 
-.PHONY: help minitpu provision run check chat kernels reproduce \
+.PHONY: help minitpu provision check chat kernels reproduce \
         identity batch throughput boundary trace
 
 help:
@@ -19,7 +19,6 @@ help:
 	@echo "  make chat       - TTFT and decode rate, 5-token prompt (~30 s)"
 	@echo "  make trace      - the 18 launches one layer issues     (seconds)"
 	@echo
-	@echo "make run       - assemble and run the editable MINITPU program"
 	@echo "make check     - verify package files without hardware access"
 	@echo
 	@echo "make chat accepts the CLI's own flags through ARGS, e.g."
@@ -45,9 +44,6 @@ minitpu:
 
 provision:
 	@$(HERE)minitpu/scripts/provision.sh
-
-run:
-	@$(PYTHON) $(HERE)run_example_kernel.py
 
 check:
 	@$(PYTHON) $(HERE)minitpu/scripts/check_package.py

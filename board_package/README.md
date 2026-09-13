@@ -138,12 +138,9 @@ The package is three layers. Each one only knows about the one below it.
 | `minitpu_runtime/runtime/` | Board runtime: UIO, udmabuf, COPY, LAUNCH. |
 | `minitpu_runtime/minitpu/` | Hardware ABI, register map, launch limits. |
 | | **Examples and tests** |
-| `run_example_kernel.py` | A hand-written example program, meant to be opened and changed. `make run`. |
 | `run_compiled_kernel.py` | Launches the image the compiler produced. `kernel_entry_point.py` emits it, and it is copied here as `triton_kernel.bin`. |
 | `tests/` | Host-only tests: assembler encodings, scheduling distances, the operand rule. `make check` runs them. |
 
-The two example runners are not variants of each other: `run_example_kernel.py`
-assembles its own source and calls it through the high-level callable, while
 `run_compiled_kernel.py` launches a pre-built `triton_kernel.bin` against the
 explicit allocate/COPY/LAUNCH primitives and reduces the drain on the host.
 
@@ -175,9 +172,9 @@ numbers; `tb_isa_conformance.sv` holds the RTL to it and
 
 ## Writing a kernel
 
-Edit `run_example_kernel.py`. The `@minitpu.asm` decorator runs the Python function as
-an assembler, emitting one 128-bit VLIW bundle per `minitpu.bundle` call. Every
-program must end in `F:halt`.
+The `@minitpu.asm` decorator runs a Python function as an assembler, emitting one
+128-bit VLIW bundle per `minitpu.bundle` call, and `kernels.py` is where the
+assembled programs live. Every program must end in `F:halt`.
 
 ```python
 @minitpu.asm
@@ -196,14 +193,6 @@ bf16_mul_add(h_src1, h_src2, h_dest)
 Arguments are C-contiguous `numpy.uint16` arrays — the BF16 wire format. Every
 argument before the last is an input; the last is the output. On a board whose
 UIO node is named differently, use `@minitpu(uio_name="my-minitpu")`.
-
-`run_example_kernel.py` keeps its own copy of the example program on purpose: it
-is the file you open to see what one looks like. Nothing compares the two copies
-directly; each is held to a numpy reference on the board instead, `check_mul_add`
-in `gpt2_kernels.py` for `kernels.py`'s and `main` for its own. Keep it that way
-when you edit either: the copies once disagreed because a DMA row pitch stayed at
-64 bytes after BF16-native halved a row to 32, so every descriptor read every
-other row, and a check against the other copy would not have caught it.
 
 ## The chat demo
 

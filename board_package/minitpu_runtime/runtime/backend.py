@@ -178,6 +178,7 @@ class UdmabufBuffer:
         _owns: Cached objects this instance closes.
         _nodes: Write descriptors held open for each sync node the instance exposes.
         _window: Byte range currently latched into the driver's sync nodes.
+        _unwritable: Sync nodes that exist but that this account cannot write.
     """
 
     _SYNC_NODES: tuple[str, ...] = ("sync_for_device", "sync_for_cpu", "sync_offset", "sync_size")
@@ -191,6 +192,7 @@ class UdmabufBuffer:
         self._owns = _owns
         self._nodes: dict[str, int] = {}
         self._window: tuple[int, int] | None = None
+        self._unwritable: list[str] = []
         self._open_sync_nodes()
 
     def sync_to_device(self, offset: int = 0, nbytes: int | None = None) -> None:
@@ -269,8 +271,34 @@ class UdmabufBuffer:
             try:
                 self._nodes[name] = os.open(self._sysfs / name, os.O_WRONLY)
             except OSError:
-                # Leaves the driver's default in force when a node is absent or not writable by this user.
-                continue
+                # An ABSENT node leaves the driver's whole-buffer default in force, which is safe. A node that
+                # EXISTS and is merely unwritable does not: it is sticky state some other account last wrote, so
+                # the default is not what is in force. The two are recorded apart and judged below.
+                if (self._sysfs / name).exists():
+                    self._unwritable.append(name)
+        self._check_window_is_ours()
+
+    def _check_window_is_ours(self) -> None:
+        """Refuses a buffer whose sync window this account cannot set, naming the fix.
+
+        Raises:
+            RuntimeError: If a trigger is writable but the window nodes are present and are not.
+        """
+        triggers = {"sync_for_cpu", "sync_for_device"} & self._nodes.keys()
+        stolen = [name for name in ("sync_offset", "sync_size") if name in self._unwritable]
+        if not triggers or not stolen:
+            return
+        message = (
+            f"Unable to own the sync window of {self._sysfs}. This account holds "
+            f"{', '.join(sorted(triggers))} but cannot write {', '.join(stolen)}, which is the sticky byte range "
+            f"every sync consumes. Another account latched that range, so a device-to-host copy would invalidate "
+            f"their bytes instead of this buffer's and the host would read stale cache while the copy engine "
+            f"reported success. Reload the driver so the nodes are recreated for this account:\n"
+            f"  sudo rmmod u-dma-buf 2>/dev/null || sudo rmmod u_dma_buf\n"
+            f"  sudo ./minitpu/scripts/provision.sh\n"
+            f"Or open the buffer with cached=False, which maps it O_SYNC and needs no sync at all."
+        )
+        raise RuntimeError(message)
 
     def _write_node(self, name: str, value: int) -> None:
         """Writes one integer to a held sync descriptor."""

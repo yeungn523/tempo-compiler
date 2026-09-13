@@ -130,7 +130,6 @@ The package is three layers. Each one only knows about the one below it.
 | `kernels.py` | Every assembled program. The machine has no hazard interlocks, so each schedule is a correctness argument and the comments carry it. |
 | `bf16.py` | Device geometry, BF16 packing, operand layouts, host references. Touches no device, so it can be checked by inspection. |
 | `layout.py` | Where a tensor's elements live and what that costs: the DMEM tiling ABI and the VMEM allocator. |
-| `dsl.py` | The kernel surface. The programmer writes layouts and tiling; every descriptor and `vld`/`vst` field is derived. |
 | | **The assembler** |
 | `asm.py` | Fills delay fields, and **rejects** what no delay can fix. |
 | `isa_model.py` | The per-opcode scheduling facts `asm.py` schedules against. Generated — run `tools/gen_isa_doc.py --write`, never edit by hand. |

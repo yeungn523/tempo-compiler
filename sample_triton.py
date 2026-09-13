@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
-"""Holds the GEMM kernels this compiler is exercised against, one per order their loops walk, and writes the
-operand pair they run on.
-
-Every kernel computes the same product and differs only in the order of its loops, which is what the compiler
-carries through to the block each launch covers and the launches a host issues. Compiling one needs the
-declaration alone, which `kernel_entry_point.py` reads by name. Running one needs numbers too, so this file writes
-an operand pair when it is executed rather than imported, into the directory named as its one argument. The pair
-comes from `bf16.build_operands`, which refuses a draw whose rows or columns repeat, because such a draw lets an
-image that reorders them look correct.
-
-A kernel walking its output tiles inside the reduction holds every one of them live until the contraction ends, so
-its block covers them all and its image grows with the width. Those kernels therefore state `_RESIDENT_COLUMNS`
-rather than the whole width, which is what the instruction memory holds at this depth.
-"""
+"""Provides the sample GEMM kernels and a full FFN this compiler is exercised against."""
 
 from __future__ import annotations
 
@@ -51,12 +38,21 @@ token row the product holds."""
 _SEED: int = 0
 """Draw the operands are generated from, fixed so two runs compile the same numbers."""
 
+_PROJECTION_SCALE: float = 0.02
+"""Deviation the feed-forward projections are drawn at, being the one GPT-2 initialises its own weights to. A
+layer contracts twice and activates between, so weights drawn at unit deviation leave an intermediate two
+orders of magnitude above anything a trained layer holds, which the BF16 chain carries far less accurately."""
+
+_ROOT_TWO: tl.constexpr = tl.constexpr(1.4142135623730951)
+"""Divisor the exact GELU scales its argument by before the error function reads it. Triton reaches a global from
+a decorated function only where the value is a constexpr instance, so the annotation alone would not carry it."""
+
 
 @triton.jit
 def matmul_kernel(
-    activation_pointer,
-    weight_pointer,
-    output_pointer,
+    activation_pointer: "*bf16",
+    weight_pointer: "*bf16",
+    output_pointer: "*fp32",
     stride_am: tl.constexpr = _DEPTH,
     stride_ak: tl.constexpr = 1,
     stride_bk: tl.constexpr = _COLUMNS,
@@ -97,9 +93,9 @@ def matmul_kernel(
 
 @triton.jit
 def matmul_n_m_k(
-    activation_pointer,
-    weight_pointer,
-    output_pointer,
+    activation_pointer: "*bf16",
+    weight_pointer: "*bf16",
+    output_pointer: "*fp32",
     stride_am: tl.constexpr = _DEPTH,
     stride_ak: tl.constexpr = 1,
     stride_bk: tl.constexpr = _COLUMNS,
@@ -133,9 +129,9 @@ def matmul_n_m_k(
 
 @triton.jit
 def matmul_m_k_n(
-    activation_pointer,
-    weight_pointer,
-    output_pointer,
+    activation_pointer: "*bf16",
+    weight_pointer: "*bf16",
+    output_pointer: "*fp32",
     stride_am: tl.constexpr = _DEPTH,
     stride_ak: tl.constexpr = 1,
     stride_bk: tl.constexpr = _COLUMNS,
@@ -168,9 +164,9 @@ def matmul_m_k_n(
 
 @triton.jit
 def matmul_n_k_m(
-    activation_pointer,
-    weight_pointer,
-    output_pointer,
+    activation_pointer: "*bf16",
+    weight_pointer: "*bf16",
+    output_pointer: "*fp32",
     stride_am: tl.constexpr = _DEPTH,
     stride_ak: tl.constexpr = 1,
     stride_bk: tl.constexpr = _COLUMNS,
@@ -203,9 +199,9 @@ def matmul_n_k_m(
 
 @triton.jit
 def matmul_k_m_n(
-    activation_pointer,
-    weight_pointer,
-    output_pointer,
+    activation_pointer: "*bf16",
+    weight_pointer: "*bf16",
+    output_pointer: "*fp32",
     stride_am: tl.constexpr = _DEPTH,
     stride_ak: tl.constexpr = 1,
     stride_bk: tl.constexpr = _COLUMNS,
@@ -238,9 +234,9 @@ def matmul_k_m_n(
 
 @triton.jit
 def matmul_k_n_m(
-    activation_pointer,
-    weight_pointer,
-    output_pointer,
+    activation_pointer: "*bf16",
+    weight_pointer: "*bf16",
+    output_pointer: "*fp32",
     stride_am: tl.constexpr = _DEPTH,
     stride_ak: tl.constexpr = 1,
     stride_bk: tl.constexpr = _COLUMNS,
@@ -271,16 +267,84 @@ def matmul_k_n_m(
                          + tl.dot(tl.load(activation_pointers), tl.load(weight_pointers)))
 
 
+@triton.jit
+def gelu(value):
+    """Returns the exact GELU of one tile, written in the error function form the compiler fuses.
+    """
+    widened = value.to(tl.float32)
+    return (0.5 * widened * (1.0 + tl.math.erf(widened / _ROOT_TWO))).to(value.dtype)
+
+
+@triton.jit
+def fused_ffn_kernel(
+    activation_pointer: "*bf16",
+    up_weight_pointer: "*bf16",
+    down_weight_pointer: "*bf16",
+    output_pointer: "*fp32",
+    stride_am: tl.constexpr = _DEPTH,
+    stride_ak: tl.constexpr = 1,
+    stride_uk: tl.constexpr = _COLUMNS,
+    stride_un: tl.constexpr = 1,
+    stride_dk: tl.constexpr = _DEPTH,
+    stride_dn: tl.constexpr = 1,
+    stride_cm: tl.constexpr = _DEPTH,
+    stride_cn: tl.constexpr = 1,
+    M: tl.constexpr = _ROWS,
+    K: tl.constexpr = _DEPTH,
+    H: tl.constexpr = _COLUMNS,
+    N: tl.constexpr = _DEPTH,
+    BLOCK_M: tl.constexpr = 32,
+    BLOCK_K: tl.constexpr = 64,
+    BLOCK_H: tl.constexpr = 16,
+    BLOCK_N: tl.constexpr = 16,
+):
+    """Runs both projections of a feed-forward layer and the activation between them, in one kernel.
+
+    Notes:
+        Each hidden chunk is activated and read by the down projection in the iteration that produced it, so the
+        intermediate stays in registers.
+
+        The output accumulates through memory across the hidden width, so the buffer is entered zeroed.
+    """
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_h = tl.arange(0, BLOCK_H)
+    for block in range(0, M, BLOCK_M):
+        offs_m = block + tl.arange(0, BLOCK_M)
+        for chunk in range(0, H, BLOCK_H):
+            activation_pointers = activation_pointer + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+            up_pointers = up_weight_pointer + offs_k[:, None] * stride_uk + (chunk + offs_h)[None, :] * stride_un
+            hidden = tl.zeros((BLOCK_M, BLOCK_H), dtype=tl.float32)
+            for _ in range(0, K, BLOCK_K):
+                hidden += tl.dot(tl.load(activation_pointers), tl.load(up_pointers))
+                activation_pointers += BLOCK_K * stride_ak
+                up_pointers += BLOCK_K * stride_uk
+            # Rounds the chunk to the width the array stages before the activation reads it.
+            activated = gelu(hidden.to(tl.bfloat16))
+            for tile in range(0, N, BLOCK_N):
+                offs_n = tile + tl.arange(0, BLOCK_N)
+                down_pointers = (down_weight_pointer + (chunk + offs_h)[:, None] * stride_dk
+                                 + offs_n[None, :] * stride_dn)
+                output_pointers = output_pointer + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+                tl.store(output_pointers, tl.load(output_pointers) + tl.dot(activated, tl.load(down_pointers)))
+
+
 def main() -> int:
-    """Writes the operand pair the kernels above run on, at the widest extents any of them declares.
+    """Writes the operands the kernels above run on, at the widest extents any of them declares.
+
+    The plain products read an activation and a weight, and the feed-forward layer a third operand besides,
+    its two projections being contracted one after the other.
 
     Returns:
-        Zero once both files are written.
+        Zero once every file is written.
     """
     written = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".").expanduser()
     written.mkdir(parents=True, exist_ok=True)
     left, right = build_operands(_ROWS, _DEPTH, _COLUMNS, kind="varying", seed=_SEED)
-    for name, operand in (("activations.npy", left), ("weights.npy", right)):
+    # The down projection contracts the hidden width back to the model width, which is what the layer drains.
+    _, down = build_operands(_ROWS, _COLUMNS, _DEPTH, kind="varying", seed=_SEED + 1)
+    projections = [(operand * _PROJECTION_SCALE).astype(np.float32) for operand in (right, down)]
+    for name, operand in (("activations.npy", left), ("weights.npy", right),
+                          ("up_weight.npy", projections[0]), ("down_weight.npy", projections[1])):
         np.save(written / name, operand)
         print(f"wrote {written / name}  {operand.shape} {operand.dtype}")
     return 0

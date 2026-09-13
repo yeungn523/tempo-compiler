@@ -397,6 +397,66 @@ class VmemAllocator:
                 raise LayoutError(message)
 
 
+@dataclass(frozen=True, slots=True)
+class FusedRegisterMap:
+    """Holds where the fused feed-forward layer's tiles live in the vector register file.
+
+    The regions are laid end to end from register zero, one pair of tiles per token group for each of the three
+    the layer carries across a chunk, then the single tiles the array streams through.
+
+    Attributes:
+        hidden: First register of each token group's hidden tile, which the up projection accumulates, the
+            activation rewrites in place and the down projection pushes.
+        output: First register of each token group's output tile, read and written per output tile swept.
+        staged: First register of each token group's staged input tile.
+        weight: First register of the staged weight tile, being the base a vmatload streams from.
+        result: First register a matrix result pops into.
+    """
+
+    hidden: tuple[int, ...]
+    output: tuple[int, ...]
+    staged: tuple[int, ...]
+    weight: int
+    result: int
+
+    @property
+    def used(self) -> int:
+        """Returns the registers the map hands out."""
+        return self.result + _TILE_VREGS
+
+
+def fused_register_map(*, token_groups: int) -> FusedRegisterMap:
+    """Returns where the fused feed-forward layer's tiles sit, refusing an allocation the file cannot hold.
+
+    Args:
+        token_groups: Token groups one block covers, each carrying a tile of every region the layer holds.
+
+    Returns:
+        The map.
+
+    Raises:
+        LayoutError: If the tiles the layer holds live want more registers than the file has.
+    """
+    if token_groups < 1:
+        message = f"Unable to map {token_groups} token groups. A block covers at least one."
+        raise LayoutError(message)
+    grouped = token_groups * _TILE_VREGS
+    hidden, output, staged = (tuple(base + _TILE_VREGS * group for group in range(token_groups))
+                              for base in (0, grouped, 2 * grouped))
+    weight = 3 * grouped
+    mapped = FusedRegisterMap(hidden=hidden, output=output, staged=staged, weight=weight,
+                              result=weight + _TILE_VREGS)
+    entries = PROFILE["vreg_entry_count"]
+    if mapped.used > entries:
+        message = (
+            f"Unable to hold a fused layer over {token_groups} token groups: its hidden, output and input "
+            f"tiles, its weight tile and its result tile want {mapped.used} of the {entries} registers present. "
+            f"Narrow the block's rows."
+        )
+        raise LayoutError(message)
+    return mapped
+
+
 def register_map(*, block_m: int, block_n: int) -> RegisterMap:
     """Returns where a block's operands live in the register file, and how much of it accumulates in registers.
 

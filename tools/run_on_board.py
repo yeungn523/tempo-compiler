@@ -24,8 +24,10 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent.parent
 _ADDRESS: str = "132.236.59."
 """Network the course boards sit on, which the last octet selects one of."""
 
-_FORWARDED: tuple[str, ...] = ("operands", "constexprs", "strides", "dims", "activations", "weights")
-"""Flags this passes to the compiler entry point untouched, being the ones that describe the launch."""
+_FORWARDED: tuple[str, ...] = ("operands", "constexprs", "strides", "dims", "activations", "weights",
+                               "up-weight", "down-weight")
+"""Flags this passes to the compiler entry point untouched, being the ones that describe the launch. A fused
+feed-forward layer names its two projections rather than one weight, so both spellings are carried."""
 
 
 def compile_kernel(*, kernel: str, forwarded: dict[str, str], written: pathlib.Path) -> pathlib.Path:
@@ -136,7 +138,7 @@ def main() -> int:
     arguments = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as scratch:
-        forwarded = {name: getattr(arguments, name) for name in _FORWARDED}
+        forwarded = {name: getattr(arguments, name.replace("-", "_")) for name in _FORWARDED}
         images = {}
         for kernel in arguments.kernel:
             # Names each pair by the kernel it came from, which one file declaring several leaves after the colon.

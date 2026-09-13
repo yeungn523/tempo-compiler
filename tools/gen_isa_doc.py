@@ -68,46 +68,6 @@ _TBLGEN_CANDIDATES: tuple[str, ...] = (
 """Stores the binaries tried in order when LLVM_TBLGEN does not name one."""
 
 
-def main() -> int:
-    """Regenerates every artifact or reports the ones that disagree with the source.
-
-    Returns:
-        Zero when the run succeeds, and one when --check finds a stale artifact or a drifted assembler constant.
-    """
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--write", action="store_true", help="regenerate every artifact")
-    mode.add_argument("--check", action="store_true", help="exit non-zero if any artifact is stale")
-    arguments = parser.parse_args()
-
-    data = _load()
-    artifacts = _artifacts(data)
-    names = ", ".join(str(path.relative_to(_REPO)) for path in artifacts)
-
-    if arguments.write:
-        for path, content in artifacts.items():
-            path.write_text(content)
-        print(f"wrote {names}")
-        return 0
-
-    stale = [path.relative_to(_REPO) for path, content in artifacts.items()
-             if not path.exists() or path.read_text() != content]
-    if stale:
-        for path in stale:
-            print(f"STALE: {path} does not match {_SOURCE.relative_to(_REPO)}", file=sys.stderr)
-        print("run: python3 tools/gen_isa_doc.py --write", file=sys.stderr)
-        return 1
-
-    drift = _check_assembler_constants(data)
-    if drift:
-        for message in drift:
-            print(f"DRIFT: {message}", file=sys.stderr)
-        return 1
-
-    print(f"{names} are in sync with {_SOURCE.relative_to(_REPO)}")
-    return 0
-
-
 def _load() -> dict[str, Any]:
     """Returns the source's records reshaped into the mapping every renderer below reads."""
     records = _records()
@@ -496,6 +456,46 @@ def _check_assembler_constants(data: dict[str, Any]) -> list[str]:
                 problems.append(f"{relative} {name} = {match.group(1)}, but "
                                 f"{_SOURCE.relative_to(_REPO)} {group} resource, {field} = {expected}")
     return problems
+
+
+def main() -> int:
+    """Regenerates every artifact or reports the ones that disagree with the source.
+
+    Returns:
+        Zero when the run succeeds, and one when --check finds a stale artifact or a drifted assembler constant.
+    """
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--write", action="store_true", help="regenerate every artifact")
+    mode.add_argument("--check", action="store_true", help="exit non-zero if any artifact is stale")
+    arguments = parser.parse_args()
+
+    data = _load()
+    artifacts = _artifacts(data)
+    names = ", ".join(str(path.relative_to(_REPO)) for path in artifacts)
+
+    if arguments.write:
+        for path, content in artifacts.items():
+            path.write_text(content)
+        print(f"wrote {names}")
+        return 0
+
+    stale = [path.relative_to(_REPO) for path, content in artifacts.items()
+             if not path.exists() or path.read_text() != content]
+    if stale:
+        for path in stale:
+            print(f"STALE: {path} does not match {_SOURCE.relative_to(_REPO)}", file=sys.stderr)
+        print("run: python3 tools/gen_isa_doc.py --write", file=sys.stderr)
+        return 1
+
+    drift = _check_assembler_constants(data)
+    if drift:
+        for message in drift:
+            print(f"DRIFT: {message}", file=sys.stderr)
+        return 1
+
+    print(f"{names} are in sync with {_SOURCE.relative_to(_REPO)}")
+    return 0
 
 
 if __name__ == "__main__":

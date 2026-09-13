@@ -54,6 +54,13 @@ class FusedFeedForwardTest(unittest.TestCase):
         hidden = {vreg for tile in _RESIDENT_TILES for vreg in range(tile, tile + _TILE_VREGS)}
         self.assertTrue(hidden.isdisjoint(_stored_registers(build_fused_ffn(chunks=2, output_tiles=4))))
 
+    def test_the_output_clear_walks_its_own_loop(self) -> None:
+        """Asserts the stores that clear the output name the loop enclosing them, not the sweep's inner one.
+        """
+        levels = _store_levels(build_fused_ffn(chunks=2, steps=2, output_tiles=4))
+        self.assertEqual(levels[:_TILES], [0] * _TILES)
+        self.assertEqual(set(levels[_TILES:]), {1})
+
     def test_the_output_sweep_rides_a_loop(self) -> None:
         """Asserts a wider output grows the trip count rather than the stores the image carries."""
         narrow, wide = (_counts(build_fused_ffn(chunks=2, output_tiles=tiles)) for tiles in (1, 8))
@@ -177,6 +184,18 @@ def _arrays(*, steps: int, chunks: int):
 def _operands(*, steps: int, chunks: int):
     """Returns the packed operands at the extents the given loop counts cover."""
     return pack_fused_ffn(*_arrays(steps=steps, chunks=chunks))
+
+
+def _store_levels(kernel) -> list[int]:
+    """Returns the loop level each AGU-walked store names, in the order the image issues them."""
+    found = []
+    for word in kernel.image.assemble():
+        if (word >> 127) & 1:
+            continue
+        x = (word >> _X_SHIFT) & ((1 << X_SLOT_W) - 1)
+        if x and (x >> 31) & 1 and (x >> 12) & 1:
+            found.append((x >> 10) & 0x3)
+    return found
 
 
 def _stored_registers(kernel) -> set[int]:

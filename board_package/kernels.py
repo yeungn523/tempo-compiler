@@ -1292,30 +1292,24 @@ def build_fused_ffn(chunks: int, *, steps: int = _STEPS, output_tiles: int = 1) 
             """Merges slots into one bundle so co-issue reads at the call site."""
             bundles.setdefault(slot, {}).update(slots)
 
-        def emit_transfer(pc: int, *, slots: tuple[int, ...], first_row: int, rows: int, pointer: int,
+        def emit_transfer(pc: int, *, slot: int, first_row: int, rows: int, pointer: int,
                           store: bool = False) -> int:
-            """Moves the given rows, splitting them over descriptors and holding one per slot in flight.
+            """Moves the given rows, splitting them over as many descriptors as the row field needs.
 
-            A slot carries one descriptor, so a transfer wider than the row field waits on the slot it reuses
-            rather than on the transfer as a whole. Each pointer advance follows the descriptor that reads it,
-            the scalar unit taking two bundles to write back and interlocking nothing.
+            Each descriptor is waited on before the slot it rides is reused, and each pointer advance follows
+            the descriptor that reads it, the scalar unit taking two bundles to write back and interlocking
+            nothing.
             """
-            moved, outstanding = 0, []
+            moved = 0
             while moved < rows:
                 span = min(rows - moved, _MAX_DESCRIPTOR_ROWS)
-                slot = slots[len(outstanding) % len(slots)] if len(outstanding) < len(slots) else outstanding[0]
-                if slot in outstanding:
-                    bundles[pc] = {"f": minitpu.flush_slot(1 << slot)}; pc += 1
-                    outstanding.remove(slot)
                 descriptor = (minitpu.dma_store if store else minitpu.dma_load)(
                     slot, first_row + moved, span, pointer, 3)
                 bundles[pc] = {"d": descriptor}; pc += 1
                 bundles[pc] = {"s": minitpu.saddi(pointer, pointer, span * _ROW_BYTES)}; pc += 1
                 pc += 1
-                outstanding.append(slot)
-                moved += span
-            for slot in outstanding:
                 bundles[pc] = {"f": minitpu.flush_slot(1 << slot)}; pc += 1
+                moved += span
             return pc
 
         def emit_load_tile(pc: int, first_vreg: int, row: int, *, shift: int = 0, level: int = _INNER_LEVEL) -> int:
@@ -1333,13 +1327,17 @@ def build_fused_ffn(chunks: int, *, steps: int = _STEPS, output_tiles: int = 1) 
                         x=minitpu.vld(first_vreg + vreg, _ROW_ZERO + _NUM_SUBLANES * vreg))
             return pc + len(tiles) * _TILE_VREGS
 
-        def emit_output_tile(pc: int, *, store: bool) -> int:
-            """Moves the output tile this iteration accumulates between VMEM and the registers holding it."""
+        def emit_output_tile(pc: int, *, store: bool, level: int = _INNER_LEVEL) -> int:
+            """Moves the output tile this iteration accumulates between VMEM and the registers holding it.
+
+            The level names the loop the AGU walks with, a clear standing outside the chunk loop riding its own
+            index rather than the sweep's.
+            """
             for group, first_vreg in enumerate(_FFN_OUTPUT_TILES):
                 for vreg in range(_TILE_VREGS):
                     row = row_output + group * _TILE + _NUM_SUBLANES * vreg
                     access = (minitpu.vst if store else minitpu.vld)(
-                        first_vreg + vreg, row, agu=True, shift=_OUTPUT_TILE_SHIFT, level=_INNER_LEVEL)
+                        first_vreg + vreg, row, agu=True, shift=_OUTPUT_TILE_SHIFT, level=level)
                     put(slot=pc, x=access)
                     pc += 1
             return pc
@@ -1356,16 +1354,16 @@ def build_fused_ffn(chunks: int, *, steps: int = _STEPS, output_tiles: int = 1) 
         pc += 1                                                          # scalar writeback latency
 
         # Stages the input once, every hidden chunk contracting the same tokens.
-        pc = emit_transfer(pc, slots=(0, 1), first_row=row_input, rows=input_rows, pointer=0)
+        pc = emit_transfer(pc, slot=0, first_row=row_input, rows=input_rows, pointer=0)
 
         # Clears the output in VMEM, where it accumulates, the register file holding one tile of it at a time.
         pc = emit_clear(pc, _FFN_OUTPUT_TILES)
         bundles[pc] = {"f": minitpu.lbegin(output_tiles)}; pc += 1
-        pc = emit_output_tile(pc, store=True)
+        pc = emit_output_tile(pc, store=True, level=0)
         bundles[pc - 1] = {**bundles[pc - 1], "f": minitpu.loop_end()}
 
         bundles[pc] = {"f": minitpu.lbegin(chunks)}; pc += 1
-        pc = emit_transfer(pc, slots=(0, 1), first_row=row_up, rows=weight_rows, pointer=2)
+        pc = emit_transfer(pc, slot=1, first_row=row_up, rows=weight_rows, pointer=2)
         pc = emit_clear(pc, _RESIDENT_TILES)
 
         # The up projection. One step body serves every contraction tile, the AGU walking its operands, and
@@ -1420,7 +1418,7 @@ def build_fused_ffn(chunks: int, *, steps: int = _STEPS, output_tiles: int = 1) 
         bundles[pc - 1] = {**bundles[pc - 1], "f": minitpu.loop_end()}
         bundles[pc] = {"f": minitpu.loop_end()}; pc += 1
 
-        pc = emit_transfer(pc, slots=(0, 1), first_row=row_output, rows=output_rows, pointer=1, store=True)
+        pc = emit_transfer(pc, slot=0, first_row=row_output, rows=output_rows, pointer=1, store=True)
         bundles[pc] = {"f": minitpu.halt()}; pc += 1
 
         for index in range(pc):

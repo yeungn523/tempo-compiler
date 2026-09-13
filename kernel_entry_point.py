@@ -26,6 +26,7 @@ from bf16 import (  # noqa: E402
     _BLOCK_WEIGHT_BYTES,
     _ELEMENT_BYTES,
     _TILE,
+    fused_ffn_bf16_reference,
     fused_ffn_reference,
     pack_activations,
     pack_fused_ffn,
@@ -141,11 +142,16 @@ def _pack_fused_operands(*, path: pathlib.Path, activations: NDArray[np.float32]
     blocks = [pack_fused_ffn(activations[token:token + _BLOCK_TOKENS], up_weight, down_weight)
               for token in range(0, activations.shape[0], _BLOCK_TOKENS)]
     staged, weights = np.stack([block[0] for block in blocks]), blocks[0][1]
+    expected = fused_ffn_reference(activations, up_weight, down_weight).astype(np.float32)
+    modelled = fused_ffn_bf16_reference(activations, up_weight, down_weight)
     np.savez(
         path,
         activations=staged,
         weights=weights,
-        expected=fused_ffn_reference(activations, up_weight, down_weight).astype(np.float32),
+        expected=expected,
+        # The bar a launch is held to, since BF16 over a contraction this deep costs more than the tolerance a
+        # single product is allowed and the board is too slow a core to derive it there.
+        format_cost=float(np.abs(modelled - expected).max() / max(float(np.abs(expected).max()), 1e-9)),
         activation_bytes=staged[0].nbytes,
         weight_bytes=weights.nbytes,
         drain_words=drain.words,

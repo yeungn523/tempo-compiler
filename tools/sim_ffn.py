@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import pathlib
 import sys
 
@@ -26,8 +25,8 @@ from bf16 import (  # noqa: E402
     _ELEMENT_BYTES,
     _TILE,
     _ZERO_TILE_WORDS,
-    as_bf16_words,
     from_bf16_words,
+    fused_ffn_bf16_reference,
     fused_ffn_reference,
     pack_fused_ffn,
 )
@@ -82,39 +81,9 @@ def simulate(*, build_dir: str | None = None, max_cycles: int = _MAX_CYCLES) -> 
 
     expected = fused_ffn_reference(activations, up_weight, down_weight)
     scale = max(float(np.abs(expected).max()), 1e-9)
-    modelled = _bf16_model(activations, up_weight, down_weight)
+    modelled = fused_ffn_bf16_reference(activations, up_weight, down_weight)
     return (float(np.abs(product - expected).max() / scale),
             float(np.abs(modelled - expected).max() / scale))
-
-
-def _bf16_model(activations: NDArray[np.float32], up_weight: NDArray[np.float32],
-                down_weight: NDArray[np.float32]) -> NDArray[np.float32]:
-    """Returns the layer computed as the kernel computes it, rounded at every point it writes a VREG.
-
-    Holding the drained layer against this separates what the image got wrong from what BF16 costs over the
-    contraction, one number against float64 leaving the two indistinguishable.
-    """
-    def held(values: NDArray[np.float32]) -> NDArray[np.float32]:
-        """Returns the values as one BF16 container each, which is what a VREG holds."""
-        return from_bf16_words(words=as_bf16_words(values=np.asarray(values, dtype=np.float32)))
-
-    tokens, depth = activations.shape
-    out = np.zeros((tokens, down_weight.shape[1]), dtype=np.float32)
-    for chunk in range(0, up_weight.shape[1], _TILE):
-        hidden = np.zeros((tokens, _TILE), dtype=np.float32)
-        for step in range(0, depth, _TILE):
-            hidden = held(hidden + held(activations[:, step:step + _TILE]
-                                        @ up_weight[step:step + _TILE, chunk:chunk + _TILE]))
-        hidden = held(0.5 * hidden * (1.0 + _erf(hidden / math.sqrt(2.0))))
-        for tile in range(0, down_weight.shape[1], _TILE):
-            piece = held(hidden @ down_weight[chunk:chunk + _TILE, tile:tile + _TILE])
-            out[:, tile:tile + _TILE] = held(out[:, tile:tile + _TILE] + piece)
-    return out
-
-
-def _erf(values: NDArray[np.float32]) -> NDArray[np.float32]:
-    """Returns the error function of each value, which the exact GELU is written in."""
-    return np.vectorize(math.erf, otypes=[np.float32])(values)
 
 
 def _operands() -> tuple[NDArray[np.float32], ...]:

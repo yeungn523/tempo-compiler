@@ -38,6 +38,11 @@ token row the product holds."""
 _SEED: int = 0
 """Draw the operands are generated from, fixed so two runs compile the same numbers."""
 
+_PROJECTION_SCALE: float = 0.02
+"""Deviation the feed-forward projections are drawn at, being the one GPT-2 initialises its own weights to. A
+layer contracts twice and activates between, so weights drawn at unit deviation leave an intermediate two
+orders of magnitude above anything a trained layer holds, which the BF16 chain carries far less accurately."""
+
 _ROOT_TWO: tl.constexpr = tl.constexpr(1.4142135623730951)
 """Divisor the exact GELU scales its argument by before the error function reads it. Triton reaches a global from
 a decorated function only where the value is a constexpr instance, so the annotation alone would not carry it."""
@@ -337,8 +342,9 @@ def main() -> int:
     left, right = build_operands(_ROWS, _DEPTH, _COLUMNS, kind="varying", seed=_SEED)
     # The down projection contracts the hidden width back to the model width, which is what the layer drains.
     _, down = build_operands(_ROWS, _COLUMNS, _DEPTH, kind="varying", seed=_SEED + 1)
+    projections = [(operand * _PROJECTION_SCALE).astype(np.float32) for operand in (right, down)]
     for name, operand in (("activations.npy", left), ("weights.npy", right),
-                          ("up_weight.npy", right), ("down_weight.npy", down)):
+                          ("up_weight.npy", projections[0]), ("down_weight.npy", projections[1])):
         np.save(written / name, operand)
         print(f"wrote {written / name}  {operand.shape} {operand.dtype}")
     return 0

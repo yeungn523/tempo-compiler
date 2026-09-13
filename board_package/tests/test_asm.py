@@ -25,7 +25,16 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_HERE))
 
 import asm  # noqa: E402
-from asm import AsmBuilder, _delay_of, mxu_output_fifo, schedule  # noqa: E402
+from asm import (  # noqa: E402
+    _E_SHIFT,
+    _M_SHIFT,
+    E_SLOT_W,
+    M_SLOT_W,
+    AsmBuilder,
+    _delay_of,
+    mxu_output_fifo,
+    schedule,
+)
 from bf16 import _VMEM_ENTRIES_PER_LANE  # noqa: E402
 from isa_model import PROFILE  # noqa: E402
 
@@ -91,39 +100,106 @@ class SchedulingTest(unittest.TestCase):
 
 
 class PortAExclusivityTest(unittest.TestCase):
-    """Verifies that VREG read port A is claimed by one reader per bundle.
+    """Verifies which VREG read port A consumers may share one bundle.
 
-    No delay field separates two consumers inside one bundle, so co-issue is rejected at assembly time rather than
-    reading the wrong register on silicon.
+    A matrix command claims the port from the cycle after issue, leaving the issue cycle to one other consumer.
     """
 
-    def test_sfu_co_issued_with_vmatpush_is_rejected(self) -> None:
-        """Verifies that an SFU operation co-issued with a vmatpush raises."""
+    def test_sfu_co_issues_with_a_vmatpush(self) -> None:
+        """Verifies that an SFU operation shares a bundle with the push that launches beside it."""
         def body(builder: AsmBuilder) -> None:
             builder.bundle(m=builder.vmatpush(vreg=12), e=builder.vgelu(vd=16, va=16))
             builder.bundle(f=builder.halt())
 
-        with self.assertRaisesRegex(ValueError, "read VREG port A"):
-            _image(body)
+        self.assertGreaterEqual(len(_image(body)), 2)
 
-    def test_vst_co_issued_with_vmatload_is_rejected(self) -> None:
-        """Verifies that a store co-issued with a vmatload raises."""
+    def test_sfu_co_issues_with_a_vmatload(self) -> None:
+        """Verifies that an SFU operation shares a bundle with a weight load."""
+        def body(builder: AsmBuilder) -> None:
+            builder.bundle(m=builder.vmatload(vreg=24), e=builder.vgelu(vd=16, va=16))
+            builder.bundle(f=builder.halt())
+
+        self.assertGreaterEqual(len(_image(body)), 2)
+
+    def test_the_fused_activation_rides_its_launch_bundles(self) -> None:
+        """Verifies the published fused GEMM's activation keeps all seven of its launch-bundle rides."""
+        def body(builder: AsmBuilder) -> None:
+            builder.bundle(e=builder.vgelu(vd=0, va=0))
+            builder.bundle(e=builder.vgelu(vd=1, va=1), m=builder.vmatload(vreg=24))
+            for tile in range(2, 8):
+                builder.bundle(e=builder.vgelu(vd=tile, va=tile), m=builder.vmatpush(vreg=tile - 2))
+            builder.bundle(m=builder.vmatpush(vreg=6))
+            builder.bundle(m=builder.vmatpush(vreg=7))
+            builder.bundle(f=builder.halt())
+
+        self.assertEqual(sum(1 for word in _image(body) if _carries_e_beside_m(word)), 7)
+
+    def test_vst_co_issues_with_a_vmatload(self) -> None:
+        """Verifies that a store shares a bundle with a weight load, which claims no issue cycle."""
         def body(builder: AsmBuilder) -> None:
             builder.bundle(m=builder.vmatload(vreg=24), x=builder.vst(vreg=0, row=0))
             builder.bundle(f=builder.halt())
 
-        with self.assertRaisesRegex(ValueError, "read VREG port A"):
+        self.assertGreaterEqual(len(_image(body)), 2)
+
+    def test_vld_claims_no_issue_cycle(self) -> None:
+        """Verifies that a VMEM load shares a bundle with a push, reading VMEM rather than port A."""
+        def body(builder: AsmBuilder) -> None:
+            builder.bundle(m=builder.vmatpush(vreg=12), x=builder.vld(vreg=0, row=0))
+            builder.bundle(f=builder.halt())
+
+        self.assertGreaterEqual(len(_image(body)), 2)
+
+    def test_vst_co_issued_with_an_sfu_operation_is_rejected(self) -> None:
+        """Verifies that a store co-issued with an E-slot operand raises, both claiming the issue cycle."""
+        def body(builder: AsmBuilder) -> None:
+            builder.bundle(x=builder.vst(vreg=0, row=0), e=builder.vgelu(vd=16, va=16))
+            builder.bundle(f=builder.halt())
+
+        with self.assertRaisesRegex(ValueError, "read port A"):
             _image(body)
 
-    def test_vld_and_vmatpop_are_not_port_a_readers(self) -> None:
-        """Verifies that a VMEM load and a vmatpop co-issue with matrix operations."""
+
+class PopWriteWindowTest(unittest.TestCase):
+    """Verifies that a vmatpop keeps its writeback cycles to itself.
+
+    The board reported a writer sharing a pop's bundle as whole output rows reading back un-activated.
+    """
+
+    def test_an_alu_write_beside_a_vmatpop_is_rejected(self) -> None:
+        """Verifies that an accumulate co-issued with a pop raises."""
         def body(builder: AsmBuilder) -> None:
-            # vld reads VMEM and vmatpop only writes, so neither claims port A.
-            builder.bundle(m=builder.vmatpush(vreg=12), x=builder.vld(vreg=0, row=0))
             builder.bundle(m=builder.vmatpop(vreg=28), e=builder.vadd(vd=1, va=2, vb=3))
             builder.bundle(f=builder.halt())
 
-        self.assertGreaterEqual(len(_image(body)), 3)
+        with self.assertRaisesRegex(ValueError, "writes a VREG beside a vmatpop"):
+            _image(body)
+
+    def test_an_activation_beside_a_vmatpop_is_rejected(self) -> None:
+        """Verifies that an SFU write co-issued with a pop raises, which is the case the board reported."""
+        def body(builder: AsmBuilder) -> None:
+            builder.bundle(m=builder.vmatpop(vreg=28), e=builder.vgelu(vd=3, va=3))
+            builder.bundle(f=builder.halt())
+
+        with self.assertRaisesRegex(ValueError, "writes a VREG beside a vmatpop"):
+            _image(body)
+
+    def test_a_load_beside_a_vmatpop_is_rejected(self) -> None:
+        """Verifies that a VMEM load co-issued with a pop raises, its writeback landing in the window."""
+        def body(builder: AsmBuilder) -> None:
+            builder.bundle(m=builder.vmatpop(vreg=28), x=builder.vld(vreg=0, row=0))
+            builder.bundle(f=builder.halt())
+
+        with self.assertRaisesRegex(ValueError, "writes a VREG beside a vmatpop"):
+            _image(body)
+
+    def test_a_store_beside_a_vmatpop_is_kept(self) -> None:
+        """Verifies that a store shares a bundle with a pop, since it writes no VREG to collide with."""
+        def body(builder: AsmBuilder) -> None:
+            builder.bundle(m=builder.vmatpop(vreg=28), x=builder.vst(vreg=0, row=0))
+            builder.bundle(f=builder.halt())
+
+        self.assertGreaterEqual(len(_image(body)), 2)
 
 
 class MatrixFifoTest(unittest.TestCase):
@@ -376,6 +452,13 @@ def _image(body: Callable[[AsmBuilder], None]) -> tuple[int, ...]:
     builder = AsmBuilder()
     body(builder)
     return tuple(schedule(list(builder.bundles)))
+
+
+def _carries_e_beside_m(word: int) -> bool:
+    """Returns whether one bundle issues an E-slot operation and a matrix command together."""
+    if (word >> 127) & 1:
+        return False
+    return bool((word >> _E_SHIFT) & ((1 << E_SLOT_W) - 1)) and bool((word >> _M_SHIFT) & ((1 << M_SLOT_W) - 1))
 
 
 def _fifo_capacity() -> int:

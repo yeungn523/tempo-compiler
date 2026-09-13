@@ -271,9 +271,9 @@ class UdmabufBuffer:
             try:
                 self._nodes[name] = os.open(self._sysfs / name, os.O_WRONLY)
             except OSError:
-                # An ABSENT node leaves the driver's whole-buffer default in force, which is safe. A node that
-                # EXISTS and is merely unwritable does not: it is sticky state some other account last wrote, so
-                # the default is not what is in force. The two are recorded apart and judged below.
+                # A missing node leaves the driver's whole-buffer default in force, which is safe. A node that exists
+                # and rejects the write holds sticky state another account last set, so that account's range is what
+                # every sync consumes. The two are recorded apart and judged below.
                 if (self._sysfs / name).exists():
                     self._unwritable.append(name)
         self._check_window_is_ours()

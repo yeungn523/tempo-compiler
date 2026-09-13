@@ -146,6 +146,84 @@ def _run_on_device(*, image: bytes,
     return product, Measurement(launches=len(issued), cycles=cycles, bundles=bundles, seconds=elapsed)
 
 
+def _run_fused_on_device(*, image: bytes,
+                         operands: np.lib.npyio.NpzFile) -> tuple[NDArray[np.float32], Measurement]:
+    """Copies a fused layer's three operands to the device, launches the image per token block, and reads back.
+
+    The weights are copied once, the image walking every hidden chunk of them itself and rewinding its pointer
+    at each launch, so only the token block changes between launches.
+
+    Args:
+        image: The kernel image the host compiler produced, already padded to the loader's boundary.
+        operands: The packed operands and the sizes the host derived for them.
+
+    Returns:
+        The float32 layer output and what the run cost.
+    """
+    activations = operands["activations"]
+    weights = operands["weights"]
+    drain_bytes = int(operands["drain_bytes"])
+    zero_tile_words = int(operands["zero_tile_words"])
+    drain_words = int(operands["drain_words"])
+    _, _, output_tiles, block_tokens, tile = (int(extent) for extent in operands["drain_shape"])
+    columns = int(operands["output_columns"])
+    blocks = activations.shape[0]
+    product = np.empty((blocks * block_tokens, columns), dtype=np.float32)
+
+    minitpuSetDevice("minitpu")
+    minitpuHostReset()
+    owned: list[int] = []
+    cycles = bundles = 0
+    try:
+        host_image = minitpuHostAlloc(len(image))
+        host_image.view[: len(image) // 4] = np.frombuffer(image, dtype="<u4")
+        device_image = minitpuMalloc(len(image))
+        owned.append(device_image)
+        minitpuMemcpy(device_image, host_image, len(image), MemcpyKind.HostToDevice)
+
+        host_weights = minitpuHostAlloc(weights.nbytes)
+        host_weights.view.view("<u2")[: weights.size] = weights
+        device_weights = minitpuMalloc(int(operands["weight_bytes"]))
+        owned.append(device_weights)
+        minitpuMemcpy(device_weights, host_weights, weights.nbytes, MemcpyKind.HostToDevice)
+
+        host_drain = minitpuHostAlloc(drain_bytes)
+        device_drain = minitpuMalloc(drain_bytes)
+        owned.append(device_drain)
+
+        host_activations = minitpuHostAlloc(activations[0].nbytes)
+        device_activations = minitpuMalloc(int(operands["activation_bytes"]))
+        owned.append(device_activations)
+
+        opened = time.perf_counter()
+        for token in range(blocks):
+            block = activations[token]
+            host_activations.view.view("<u2")[: block.size] = block
+            minitpuMemcpy(device_activations, host_activations, block.nbytes, MemcpyKind.HostToDevice)
+            # The image reads its clearing tile from the drain pointer, so every launch is handed zeros.
+            host_drain.view.view("<u2")[:drain_words] = 0
+            minitpuMemcpy(device_drain, host_drain, drain_bytes, MemcpyKind.HostToDevice)
+
+            minitpuLaunchKernel(device_image, len(image),
+                                args=[device_activations, device_weights, device_drain])
+            minitpuMemcpy(host_drain, device_drain, drain_bytes, MemcpyKind.DeviceToHost)
+
+            sample = read_perf()
+            cycles += sample.cycles
+            bundles += sample.instrs
+
+            # The sweep drains tile by tile, each one a token block, which the layer's rows read back from.
+            drained = from_bf16_words(words=host_drain.view.view("<u2")[zero_tile_words:drain_words])
+            product[token * block_tokens : (token + 1) * block_tokens] = drained.reshape(
+                output_tiles, block_tokens, tile).transpose(1, 0, 2).reshape(block_tokens, columns)
+        elapsed = time.perf_counter() - opened
+    finally:
+        for address in owned:
+            minitpuFree(address)
+        minitpuHostReset()
+    return product, Measurement(launches=blocks, cycles=cycles, bundles=bundles, seconds=elapsed)
+
+
 def main() -> int:
     """Launches the compiled image and reports its error against the reference the host computed.
 
@@ -170,11 +248,18 @@ def main() -> int:
     expected: NDArray[np.float32] = operands["expected"]
 
     print(f"image    {len(image)} bytes, {len(image) // 16} bundles")
-    blocks, groups, output_tiles = (int(extent) for extent in operands["drain_shape"][:3])
-    print(f"product  {expected.shape[0]} by {expected.shape[1]}, {blocks * output_tiles} column tiles in "
-          f"{blocks} blocks, draining {groups} each")
+    # A fused layer states the width it drains, a plain product the tiles and partials it leaves.
+    fused = "output_columns" in operands.files
+    if fused:
+        print(f"layer    {expected.shape[0]} by {expected.shape[1]}, both projections and the activation "
+              f"between them in one image")
+    else:
+        blocks, groups, output_tiles = (int(extent) for extent in operands["drain_shape"][:3])
+        print(f"product  {expected.shape[0]} by {expected.shape[1]}, {blocks * output_tiles} column tiles in "
+              f"{blocks} blocks, draining {groups} each")
 
-    product, measured = _run_on_device(image=image, operands=operands)
+    run = _run_fused_on_device if fused else _run_on_device
+    product, measured = run(image=image, operands=operands)
     error = float(np.abs(product - expected).max() / np.abs(expected).max())
     verdict = "PASS" if error <= 0.02 else "FAIL"
     print(f"device   {verdict}, relative error {error * 100:.4f}%")

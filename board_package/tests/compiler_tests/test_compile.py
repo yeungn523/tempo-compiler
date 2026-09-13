@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import pathlib
 import sys
 import unittest
@@ -21,8 +22,9 @@ import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
 import kernels  # noqa: E402
-from bf16 import _TILE  # noqa: E402
+from bf16 import _BLOCK_DEPTH, _BLOCK_TOKENS, _TILE  # noqa: E402
 from compiler import ProgramError, compile_launch, plan, read_program, signature_of  # noqa: E402
+from compiler.compile import FusedLaunch  # noqa: E402
 from compiler_tests.test_layout import renaming_onto  # noqa: E402
 from layout import register_map  # noqa: E402
 
@@ -31,6 +33,9 @@ _OPERANDS: dict[str, str] = {"ap": "*bf16", "wp": "*bf16", "op": "*fp32"}
 
 _STRIDE_NAMES: tuple[str, ...] = ("stride_am", "stride_ak", "stride_bk", "stride_bn", "stride_cm", "stride_cn")
 """The stride parameters every kernel below declares, in the order it declares them."""
+
+_ROOT_TWO: tl.constexpr = tl.constexpr(1.4142135623730951)
+"""Divisor the exact GELU scales its argument by, which Triton reaches from a kernel only as a constexpr."""
 
 
 class ProgramReaderTest(unittest.TestCase):
@@ -71,6 +76,35 @@ class ProgramReaderTest(unittest.TestCase):
         with self.assertRaises(ProgramError):
             compile_one(gemm_folded_reduction)
 
+    def test_the_transform_ahead_of_the_matmul_is_recovered(self) -> None:
+        """Asserts the operations standing between the left operand's load and the matmul are read as its prologue."""
+        matmul = compile_one(gemm_activated)[0][0]
+        self.assertEqual(matmul.prologue, frozenset({"arith.addf", "arith.divf", "arith.mulf", "math.erf"}))
+        self.assertEqual(matmul.epilogue, frozenset())
+        self.assertIsNone(matmul.left_source)
+
+    def test_a_transform_leaves_the_operand_addressable(self) -> None:
+        """Asserts a transform standing ahead of the matmul is walked through to the load the addressing lies in.
+
+        A reader stopping at the transform recovers no activation pointer, which leaves every stride, mask and
+        loop axis the plan plans from reading as though the operand came from nowhere.
+        """
+        plain, activated = compile_one(gemm)[0][0], compile_one(gemm_activated)[0][0]
+        self.assertEqual(activated.accesses["activation"], plain.accesses["activation"])
+        self.assertEqual(activated.nest, plain.nest)
+        self.assertEqual(tuple(loop.axis for loop in activated.tile_loops),
+                         tuple(loop.axis for loop in plain.tile_loops))
+
+    def test_a_width_cast_alone_is_no_transform(self) -> None:
+        """Asserts the widening around an activation is left out of the prologue the arithmetic states.
+
+        The machine stages one width whatever width the kernel wrote its arithmetic in, so recording the casts
+        would key one fused transform under as many sets as there are ways to spell its precision.
+        """
+        matmul = compile_one(gemm_activated)[0][0]
+        self.assertNotIn("arith.extf", matmul.prologue)
+        self.assertNotIn("arith.truncf", matmul.prologue)
+
 
 class PlannerTest(unittest.TestCase):
     """Covers the launches `plan` derives from a matmul."""
@@ -88,6 +122,81 @@ class PlannerTest(unittest.TestCase):
         self.assertEqual(planned.issued_over_useful, 1.0)
         self.assertEqual(planned.padding, ())
         self.assertEqual(planned.repack, ())
+
+    def test_a_transform_ahead_of_the_matmul_activates_the_launch(self) -> None:
+        """Asserts the transform the kernel writes ahead of its matmul is what sets the launch's activation.
+
+        Every other field holds the plain product's value, since the transform rides the staging of the tile
+        entering the array and changes neither the blocks the launch covers nor the drain it leaves.
+        """
+        plain, activated = compile_one(gemm)[1].launches[0], compile_one(gemm_activated)[1].launches[0]
+        self.assertTrue(activated.activate)
+        self.assertFalse(plain.activate)
+        self.assertEqual(dataclasses.replace(activated, activate=False), plain)
+
+    def test_a_transform_the_staging_cannot_run_is_refused(self) -> None:
+        """Asserts a prologue naming operations the staging holds none for is refused rather than dropped."""
+        with self.assertRaises(ProgramError):
+            compile_one(gemm_unfusable_prologue)
+
+    def test_the_feed_forward_layer_plans_as_a_plain_launch_and_an_activated_one(self) -> None:
+        """Asserts a kernel writing both projections plans the GELU onto the launch consuming the intermediate."""
+        matmuls, planned = compile_ffn()
+        self.assertEqual(matmuls[1].left_source, 0)
+        self.assertEqual([launch.activate for launch in planned.launches], [False, True])
+        self.assertTrue(all(launch.fuse_groups for launch in planned.launches))
+
+    def test_the_feed_forward_launches_meet_at_the_hidden_width(self) -> None:
+        """Asserts the up projection's columns and the down projection's reduction cover the same width."""
+        _, planned = compile_ffn()
+        produced, consumed = planned.launches
+        self.assertEqual(produced.column_tiles * _TILE, consumed.groups * consumed.loop_blocks * _BLOCK_DEPTH)
+
+    def test_a_chained_matmul_reading_another_width_is_refused(self) -> None:
+        """Asserts a product staged at a width its producer does not leave is refused rather than mispaired."""
+        matmuls, _ = compile_ffn()
+        narrowed = dataclasses.replace(matmuls[1], reduction=matmuls[1].reduction // 2)
+        with self.assertRaises(ProgramError):
+            plan((matmuls[0], narrowed), strides=dict(stride_am=192, stride_ak=1, stride_uk=192, stride_un=1,
+                                                      stride_dk=16, stride_dn=1, stride_cm=16, stride_cn=1),
+                 dims=({"m": 32}, {"m": 32, "n": 16}))
+
+    def test_a_pair_one_image_holds_plans_as_one_launch(self) -> None:
+        """Asserts a kernel at the shape one image runs plans the pair as a single fused launch."""
+        launches = compile_fused().launches
+        self.assertEqual(len(launches), 1)
+        fused = launches[0]
+        self.assertIsInstance(fused, FusedLaunch)
+        self.assertEqual((fused.chunks, fused.steps, fused.produces, fused.consumes), (4, 8, 0, 1))
+
+    def test_a_fused_launch_compiles_to_an_image(self) -> None:
+        """Asserts the fused launch reaches an image and states the block that image drains."""
+        image, staging = compile_launch(compile_fused().launches[0])
+        self.assertGreater(len(image), 0)
+        self.assertEqual((staging.rows, staging.columns), (_BLOCK_TOKENS, _TILE))
+
+    def test_a_wider_hidden_chunk_plans_as_two_launches(self) -> None:
+        """Asserts a pair whose chunk the registers cannot hold keeps the two launches it needs."""
+        launches = compile_ffn()[1].launches
+        self.assertEqual(len(launches), 2)
+        self.assertFalse(any(isinstance(launch, FusedLaunch) for launch in launches))
+
+    def test_a_single_matmul_is_the_same_plan_either_way(self) -> None:
+        """Asserts the fusion flag leaves a kernel stating one matmul untouched, there being no pair to find."""
+        matmuls = compile_one(gemm)[0]
+        strides = dict(zip(_STRIDE_NAMES, (matmuls[0].reduction, 1, 48, 1, 48, 1), strict=True))
+        self.assertEqual(plan(matmuls, strides=strides, fuse=True),
+                         plan(matmuls, strides=strides, fuse=False))
+
+    def test_a_transform_behind_the_matmul_is_refused(self) -> None:
+        """Asserts a transform the kernel writes after its matmul is refused rather than left out of the image.
+
+        The staging is the one place this machine runs a transform, and it holds the tile going in rather than
+        the product coming out, so a launch is the whole of what a kernel wrote only when nothing follows its
+        matmul. Planning one that activates nothing would emit the plain product and drop the transform.
+        """
+        with self.assertRaises(ProgramError):
+            compile_one(gemm_gelu_epilogue)
 
     def test_the_drain_matches_the_partials_the_launch_leaves(self) -> None:
         """Asserts the drain covers one partial per block, which is what summing the groups on the device leaves."""
@@ -129,7 +238,6 @@ class PipelineTest(unittest.TestCase):
         A field the emitter never reads leaves the image the plan's own value would have produced, which every
         other check passes over because the image it compares is still self consistent.
         """
-        import dataclasses  # noqa: PLC0415  -- used only here
 
         # Covers a whole number of two tile blocks, so widening the block stays legal.
         base = dataclasses.replace(compile_one(gemm)[1].launches[0], column_tiles=4)
@@ -142,7 +250,6 @@ class PipelineTest(unittest.TestCase):
 
     def test_the_launch_count_stays_off_the_image(self) -> None:
         """Asserts `row_blocks` leaves the image alone, since it counts the launches a host issues."""
-        import dataclasses  # noqa: PLC0415  -- used only here
 
         base = dataclasses.replace(compile_one(gemm)[1].launches[0], column_tiles=4)
         self.assertEqual(compile_launch(dataclasses.replace(base, row_blocks=4))[0],
@@ -169,7 +276,6 @@ class PipelineTest(unittest.TestCase):
         A spilled tile drains once per VMEM bank, since consecutive blocks fold into opposite banks. A plan
         missing that doubling sizes the buffer at half what the image writes.
         """
-        import dataclasses  # noqa: PLC0415  -- used only here
 
         base = compile_one(gemm)[1].launches[0]
         launch = dataclasses.replace(base, column_tiles=4, block_n=4 * _TILE)
@@ -181,7 +287,6 @@ class PipelineTest(unittest.TestCase):
 
     def test_a_launch_that_activates_is_refused(self) -> None:
         """Asserts a launch carrying an epilogue raises, since the emitter places the plain product only."""
-        import dataclasses  # noqa: PLC0415  -- used only here
 
         base = compile_one(gemm)[1].launches[0]
         with self.assertRaises(NotImplementedError):
@@ -343,6 +448,146 @@ def gemm_short_rows(ap, wp, op, stride_am, stride_ak, stride_bk, stride_bn, stri
                 a += BLOCK_K * stride_ak
                 b += BLOCK_K * stride_bk
             tl.store(op + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, accumulator)
+
+
+@triton.jit
+def gemm_activated(ap, wp, op, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+                   M: tl.constexpr = 64, N: tl.constexpr = 48, K: tl.constexpr = 192,
+                   BLOCK_M: tl.constexpr = 32, BLOCK_N: tl.constexpr = 16, BLOCK_K: tl.constexpr = 64):
+    """Multiplies `gemm`'s product with the exact GELU standing between the left operand's load and the matmul."""
+    offs_k = tl.arange(0, BLOCK_K)
+    for block in range(0, M, BLOCK_M):
+        offs_m = block + tl.arange(0, BLOCK_M)
+        for tile in range(0, N, BLOCK_N):
+            offs_n = tile + tl.arange(0, BLOCK_N)
+            a = ap + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+            b = wp + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+            accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for _ in range(0, K, BLOCK_K):
+                widened = tl.load(a).to(tl.float32)
+                activated = (0.5 * widened * (1.0 + tl.math.erf(widened / _ROOT_TWO))).to(tl.bfloat16)
+                accumulator += tl.dot(activated, tl.load(b))
+                a += BLOCK_K * stride_ak
+                b += BLOCK_K * stride_bk
+            tl.store(op + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, accumulator)
+
+
+@triton.jit
+def gemm_unfusable_prologue(ap, wp, op, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+                            M: tl.constexpr = 64, N: tl.constexpr = 48, K: tl.constexpr = 192,
+                            BLOCK_M: tl.constexpr = 32, BLOCK_N: tl.constexpr = 16,
+                            BLOCK_K: tl.constexpr = 64):
+    """Multiplies with a transform ahead of the matmul that the staging holds no operation for."""
+    offs_k = tl.arange(0, BLOCK_K)
+    for block in range(0, M, BLOCK_M):
+        offs_m = block + tl.arange(0, BLOCK_M)
+        for tile in range(0, N, BLOCK_N):
+            offs_n = tile + tl.arange(0, BLOCK_N)
+            a = ap + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+            b = wp + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+            accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for _ in range(0, K, BLOCK_K):
+                accumulator += tl.dot(tl.exp(tl.load(a).to(tl.float32)).to(tl.bfloat16), tl.load(b))
+                a += BLOCK_K * stride_ak
+                b += BLOCK_K * stride_bk
+            tl.store(op + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, accumulator)
+
+
+@triton.jit
+def gemm_gelu_epilogue(ap, wp, op, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+                       M: tl.constexpr = 64, N: tl.constexpr = 48, K: tl.constexpr = 192,
+                       BLOCK_M: tl.constexpr = 32, BLOCK_N: tl.constexpr = 16, BLOCK_K: tl.constexpr = 64):
+    """Stores the exact GELU of the product, which stands after the matmul rather than ahead of it."""
+    offs_k = tl.arange(0, BLOCK_K)
+    for block in range(0, M, BLOCK_M):
+        offs_m = block + tl.arange(0, BLOCK_M)
+        for tile in range(0, N, BLOCK_N):
+            offs_n = tile + tl.arange(0, BLOCK_N)
+            a = ap + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+            b = wp + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+            accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for _ in range(0, K, BLOCK_K):
+                accumulator += tl.dot(tl.load(a), tl.load(b))
+                a += BLOCK_K * stride_ak
+                b += BLOCK_K * stride_bk
+            activated = 0.5 * accumulator * (1.0 + tl.math.erf(accumulator / _ROOT_TWO))
+            tl.store(op + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, activated)
+
+
+@triton.jit
+def ffn_chunked(ap, up, dp, op, stride_am, stride_ak, stride_uk, stride_un, stride_dk, stride_dn,
+                stride_cm, stride_cn,
+                M: tl.constexpr = 32, K: tl.constexpr = 192, H: tl.constexpr = 192, N: tl.constexpr = 16,
+                BLOCK_M: tl.constexpr = 32, BLOCK_K: tl.constexpr = 64, BLOCK_H: tl.constexpr = 64,
+                BLOCK_N: tl.constexpr = 16):
+    """Runs both projections of a feed-forward layer, chunking the hidden width the GELU stands in the middle of."""
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_h = tl.arange(0, BLOCK_H)
+    offs_n = tl.arange(0, BLOCK_N)
+    out = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for chunk in range(0, H, BLOCK_H):
+        a = ap + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        u = up + offs_k[:, None] * stride_uk + (chunk + offs_h)[None, :] * stride_un
+        hidden = tl.zeros((BLOCK_M, BLOCK_H), dtype=tl.float32)
+        for _ in range(0, K, BLOCK_K):
+            hidden += tl.dot(tl.load(a), tl.load(u))
+            a += BLOCK_K * stride_ak
+            u += BLOCK_K * stride_uk
+        widened = hidden.to(tl.bfloat16).to(tl.float32)
+        activated = (0.5 * widened * (1.0 + tl.math.erf(widened / _ROOT_TWO))).to(tl.bfloat16)
+        d = dp + (chunk + offs_h)[:, None] * stride_dk + offs_n[None, :] * stride_dn
+        out += tl.dot(activated, tl.load(d))
+    tl.store(op + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, out)
+
+
+@triton.jit
+def ffn_fused(ap, up, dp, op, stride_am, stride_ak, stride_uk, stride_un, stride_dk, stride_dn,
+              stride_cm, stride_cn,
+              M: tl.constexpr = 32, K: tl.constexpr = 128, H: tl.constexpr = 64, N: tl.constexpr = 16,
+              BLOCK_M: tl.constexpr = 32, BLOCK_K: tl.constexpr = 64, BLOCK_H: tl.constexpr = 16,
+              BLOCK_N: tl.constexpr = 16):
+    """Runs both projections at the shape one image holds, the hidden width walked one tile per chunk."""
+    offs_m, offs_k = tl.arange(0, BLOCK_M), tl.arange(0, BLOCK_K)
+    offs_h, offs_n = tl.arange(0, BLOCK_H), tl.arange(0, BLOCK_N)
+    out = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for chunk in range(0, H, BLOCK_H):
+        a = ap + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        u = up + offs_k[:, None] * stride_uk + (chunk + offs_h)[None, :] * stride_un
+        hidden = tl.zeros((BLOCK_M, BLOCK_H), dtype=tl.float32)
+        for _ in range(0, K, BLOCK_K):
+            hidden += tl.dot(tl.load(a), tl.load(u))
+            a += BLOCK_K * stride_ak
+            u += BLOCK_K * stride_uk
+        widened = hidden.to(tl.bfloat16).to(tl.float32)
+        activated = (0.5 * widened * (1.0 + tl.math.erf(widened / _ROOT_TWO))).to(tl.bfloat16)
+        d = dp + (chunk + offs_h)[:, None] * stride_dk + offs_n[None, :] * stride_dn
+        out += tl.dot(activated, tl.load(d))
+    tl.store(op + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, out)
+
+
+def compile_fused(*, fuse: bool = True):
+    """Returns the plan the fused-shaped feed-forward kernel makes, with fusion on or off."""
+    operands = {"ap": "*bf16", "up": "*bf16", "dp": "*bf16", "op": "*fp32"}
+    constexprs = {parameter.name: parameter.default for parameter in ffn_fused.params
+                  if parameter.is_constexpr}
+    matmuls = read_program(ffn_fused, signature=signature_of(ffn_fused, operands=operands),
+                           constexprs=constexprs)
+    strides = dict(stride_am=128, stride_ak=1, stride_uk=64, stride_un=1, stride_dk=16, stride_dn=1,
+                   stride_cm=16, stride_cn=1)
+    return plan(matmuls, strides=strides, dims=({"m": 32}, {"m": 32, "n": 16}), fuse=fuse)
+
+
+def compile_ffn():
+    """Returns the matmuls the chunked feed-forward kernel states and the launches a plan makes of them."""
+    operands = {"ap": "*bf16", "up": "*bf16", "dp": "*bf16", "op": "*fp32"}
+    constexprs = {parameter.name: parameter.default for parameter in ffn_chunked.params
+                  if parameter.is_constexpr}
+    matmuls = read_program(ffn_chunked, signature=signature_of(ffn_chunked, operands=operands),
+                           constexprs=constexprs)
+    strides = dict(stride_am=192, stride_ak=1, stride_uk=192, stride_un=1, stride_dk=16, stride_dn=1,
+                   stride_cm=16, stride_cn=1)
+    return matmuls, plan(matmuls, strides=strides, dims=({"m": 32}, {"m": 32, "n": 16}))
 
 
 def compile_one(kernel, *, dims: tuple[dict[str, int], ...] = ()):

@@ -96,16 +96,17 @@ so each one runs from the repository root with no `PYTHONPATH` export.
 | Entry point             | Purpose                                                                          |
 |-------------------------|----------------------------------------------------------------------------------|
 | `kernel_entry_point.py` | Reads any Triton kernel into the compiler and emits its image                    |
-| `sample_gemm.py`        | Holds a GEMM kernel per loop order, and writes the operands they share           |
+| `sample_triton.py`      | Holds a GEMM kernel per loop order and a whole feed-forward layer                |
 | `tools/sim_gemm.py`     | Runs an emitted GEMM image against the RTL and reports its error                 |
+| `tools/sim_ffn.py`      | Runs the fused feed-forward image against the RTL and reports its error          |
 | `tools/gen_isa_doc.py`  | Regenerates or checks every artifact derived from the ISA source                 |
 | `tools/run_on_board.py` | Compiles one kernel or several and runs them over a single SSH session           |
 
 ### Compiling and Checking a Kernel
 
 ```sh
-python3 sample_gemm.py build/e2e
-python3 kernel_entry_point.py --kernel sample_gemm.py:matmul_kernel \
+python3 sample_triton.py build/e2e
+python3 kernel_entry_point.py --kernel sample_triton.py:matmul_kernel \
     --operands activation_pointer=*bf16,weight_pointer=*bf16,output_pointer=*fp32 \
     --output build/e2e --activations build/e2e/activations.npy --weights build/e2e/weights.npy
 python3 tools/sim_gemm.py --image build/e2e/matmul_0.bin --operands build/e2e/matmul_0_operands.npz
@@ -124,11 +125,13 @@ prints every axis the plan pads and every operand it repacks. `--operands` says 
 for, which Triton has no syntax for a kernel to state. A kernel declaring its extents and strides as `tl.constexpr`
 states the rest itself, and `--dims`, `--constexprs` and `--strides` bind whichever of them it leaves open.
 
-`sample_gemm.py` declares one kernel per order its loops walk, named for that order after the colon. Every one of
-them covers the same token rows, being what the register file stages at once. A kernel walking its output tiles
+`sample_triton.py` declares one GEMM kernel per order its loops walk, named for that order after the colon. Every one
+of them covers the same token rows, being what the register file stages at once. A kernel walking its output tiles
 inside the reduction holds every one of them live until the contraction ends, so it covers the columns one image
 stages rather than the whole width, which is what its own constants state. Such a kernel computes a narrower product
-than the rest, so a comparison across the orders divides each figure by the output it covered.
+than the rest, so a comparison across the orders divides each figure by the output it covered. `fused_ffn_kernel`
+states a whole feed-forward layer instead, both projections and the GELU between them, which the compiler plans as a
+single image rather than a launch per matmul.
 
 `tools/sim_gemm.py` also emits an image from dimensions alone, through `--rows`, `--depth` and `--columns`, which
 checks the emitter without a kernel in front of it. `--build-dir` keeps the simulation build across runs, which is
@@ -164,9 +167,9 @@ Checking an emitted image against the board runs through `tools/run_on_board.py`
 and launches it there over a single SSH session.
 
 ```sh
-python3 sample_gemm.py build/e2e
+python3 sample_triton.py build/e2e
 python3 tools/run_on_board.py --octet 187 --program \
-    --kernel sample_gemm.py:matmul_kernel \
+    --kernel sample_triton.py:matmul_kernel \
     --operands activation_pointer=*bf16,weight_pointer=*bf16,output_pointer=*fp32 \
     --activations build/e2e/activations.npy --weights build/e2e/weights.npy
 ```
@@ -176,14 +179,14 @@ The first line writes the operands the second packs beside the image. A compile 
 the board, including a run `--make` points at a target instead.
 
 `--kernel` repeats, which compiles several kernels and runs them in turn inside the one session, so a sweep over
-the orders `sample_gemm.py` declares sends the package once and asks for the sudo password once. A kernel that fails
+the orders `sample_triton.py` declares sends the package once and asks for the sudo password once. A kernel that fails
 leaves the rest of the sweep measured and the session exits non-zero.
 
 ```sh
 python3 tools/run_on_board.py --octet 187 \
-    --kernel sample_gemm.py:matmul_kernel --kernel sample_gemm.py:matmul_n_m_k \
-    --kernel sample_gemm.py:matmul_m_k_n --kernel sample_gemm.py:matmul_n_k_m \
-    --kernel sample_gemm.py:matmul_k_m_n --kernel sample_gemm.py:matmul_k_n_m \
+    --kernel sample_triton.py:matmul_kernel --kernel sample_triton.py:matmul_n_m_k \
+    --kernel sample_triton.py:matmul_m_k_n --kernel sample_triton.py:matmul_n_k_m \
+    --kernel sample_triton.py:matmul_k_m_n --kernel sample_triton.py:matmul_k_n_m \
     --operands activation_pointer=*bf16,weight_pointer=*bf16,output_pointer=*fp32 \
     --activations build/e2e/activations.npy --weights build/e2e/weights.npy
 ```

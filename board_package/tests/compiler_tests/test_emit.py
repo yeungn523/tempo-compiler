@@ -330,5 +330,29 @@ def _scalar_addend(word: int) -> int:
     return immediate - 0x10000 if immediate & 0x8000 else immediate
 
 
+class FusedFeedForwardEmitterTest(unittest.TestCase):
+    """Holds the emitted fused layer against the hand-written kernel it was ported from."""
+
+    def test_the_emitted_layer_matches_the_hand_written_builder(self) -> None:
+        """Asserts the emitter places the bundle stream `build_fused_ffn` assembles, under a renaming.
+
+        The two allocate their registers apart, the emitter laying its regions end to end from register zero
+        and the hand kernel claiming what the plain GEMM leaves free, so the streams agree up to which register
+        holds which tile.
+        """
+        for chunks, steps, output_tiles in ((2, 2, 1), (4, 3, 1), (2, 2, 4), (8, 4, 2)):
+            with self.subTest(chunks=chunks, steps=steps, output_tiles=output_tiles):
+                emitted, _ = emit.fused_ffn_stream(chunks=chunks, steps=steps, output_tiles=output_tiles)
+                hand = kernels.build_fused_ffn(chunks=chunks, steps=steps,
+                                               output_tiles=output_tiles).image.assemble()
+                self.assertIsNotNone(renaming_onto(tuple(emitted), tuple(hand)))
+
+    def test_the_emitted_layer_states_the_block_it_drains(self) -> None:
+        """Asserts the staging names the token block and the width the layer's output covers."""
+        _, staging = emit.fused_ffn_stream(chunks=2, steps=2, output_tiles=4)
+        self.assertEqual((staging.rows, staging.columns), (bf16._BLOCK_TOKENS, 4 * bf16._TILE))
+        self.assertEqual(staging.drain_rows, bf16._BLOCK_TOKENS * 4)
+
+
 if __name__ == "__main__":
     unittest.main()

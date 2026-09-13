@@ -389,6 +389,91 @@ def pack_weights(weights: NDArray[np.float32]) -> NDArray[np.uint16]:
     ordered = words.reshape(depth // _BLOCK_DEPTH, _BLOCK_DEPTH, columns // _TILE, _TILE).transpose(2, 0, 1, 3)
     return np.ascontiguousarray(ordered).reshape(-1)
 
+def pack_fused_ffn(activations: NDArray[np.float32], up_weight: NDArray[np.float32],
+                   down_weight: NDArray[np.float32]) -> tuple[NDArray[np.uint16], NDArray[np.uint16]]:
+    """Lays the fused feed-forward layer's operands out in the order its kernel visits them.
+
+    Both weights ride one buffer because the kernel holds three pointers in the four scalar registers the machine
+    has, so a chunk's up projection is followed by the down projection rows that same chunk contracts.
+
+    Args:
+        activations: The layer input, whose rows are tokens and columns the up projection's contraction.
+        up_weight: The up projection, whose rows are that contraction and columns the hidden width.
+        down_weight: The down projection, whose rows are the hidden width and columns the layer's output.
+
+    Returns:
+        The input words, contraction tile outermost, and the weight words, one hidden chunk at a time with
+        that chunk's down projection laid out tile by tile.
+
+    Raises:
+        ValueError: If a dimension is not a whole number of tiles, if the two weights disagree on the hidden
+            width, or if the shape is not the one block the kernel covers.
+    """
+    tokens, depth = activations.shape
+    if tokens != _BLOCK_TOKENS or depth % _TILE:
+        message = (
+            f"Unable to pack an input of shape [{tokens},{depth}]. One launch covers {_BLOCK_TOKENS} token rows "
+            f"and a whole number of {_TILE} wide contraction tiles."
+        )
+        raise ValueError(message)
+    if up_weight.shape[0] != depth:
+        message = (
+            f"Unable to contract a [{tokens},{depth}] input against an up projection of shape "
+            f"{up_weight.shape}. Its rows are the contraction the input's columns walk."
+        )
+        raise ValueError(message)
+
+    hidden = up_weight.shape[1]
+    if hidden % _TILE or down_weight.shape[0] != hidden:
+        message = (
+            f"Unable to pass a hidden width of {hidden} to a down projection of shape {down_weight.shape}. The "
+            f"width must be a whole number of {_TILE} and the two projections must state the same one."
+        )
+        raise ValueError(message)
+    if down_weight.shape[1] % _TILE:
+        message = (
+            f"Unable to drain a down projection {down_weight.shape[1]} columns wide. The layer sweeps its "
+            f"output a {_TILE} wide tile at a time, so its width is a whole number of them."
+        )
+        raise ValueError(message)
+
+    # Walks the contraction tile by tile, each one every token row of that tile's columns, which is the order the
+    # kernel's loads step through after one descriptor has staged the whole input.
+    words = as_bf16_words(values=activations)
+    staged = np.ascontiguousarray(words.reshape(tokens, depth // _TILE, _TILE).transpose(1, 0, 2)).reshape(-1)
+
+    # Lays each chunk's down projection out tile by tile, which is the order its sweep loads them in.
+    tiles = down_weight.shape[1] // _TILE
+    chunks = []
+    for first in range(0, hidden, _TILE):
+        rows = as_bf16_words(values=down_weight[first:first + _TILE])
+        swept = np.ascontiguousarray(rows.reshape(_TILE, tiles, _TILE).transpose(1, 0, 2)).reshape(-1)
+        chunks.append(np.concatenate((as_bf16_words(values=up_weight[:, first:first + _TILE]).reshape(-1),
+                                      swept)))
+    return staged, np.concatenate(chunks)
+
+
+def fused_ffn_reference(activations: NDArray[np.float32], up_weight: NDArray[np.float32],
+                        down_weight: NDArray[np.float32]) -> NDArray[np.float64]:
+    """Returns the layer the fused kernel computes, in float64, for a drained image to be held against.
+
+    Args:
+        activations: The layer input, whose rows are tokens.
+        up_weight: The up projection, contracted against the input's columns.
+        down_weight: The down projection, contracted against the hidden width.
+
+    Returns:
+        The layer output, with one row per input token.
+    """
+    hidden = np.asarray(activations, dtype=np.float64) @ np.asarray(up_weight, dtype=np.float64)
+    activated = 0.5 * hidden * (1.0 + _erf(hidden / math.sqrt(2.0)))
+    return activated @ np.asarray(down_weight, dtype=np.float64)
+
+
+def _erf(values: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Returns the error function of each value, which the exact GELU is written in."""
+    return np.vectorize(math.erf, otypes=[np.float64])(values)
+
 
 def _reordered(rng: np.random.Generator, count: int) -> NDArray[np.intp] | None:
     """Returns a permutation of the given positions that moves at least one of them.

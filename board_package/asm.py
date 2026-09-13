@@ -707,10 +707,11 @@ def schedule(words: list[int]) -> list[int]:
         The stream carrying legal delays, which is longer than the input where fillers were needed.
 
     Raises:
-        ValueError: If a bundle co-issues two port-A consumers, a vmatpush overflows the MXU output FIFO, a
-            descriptor reuses a slot another still holds, or the delay fixpoint fails to converge.
+        ValueError: If a bundle co-issues two port-A consumers, writes a VREG beside a vmatpop, overflows the
+            MXU output FIFO, reuses a descriptor slot another still holds, or fails to converge on its delays.
     """
     _check_port_a_exclusive(words=words)
+    _check_pop_write_window(words=words)
     _check_matrix_fifo(words=words)
     _check_flush_slots(words=words)
     _check_slot_reuse(words=words)
@@ -1175,11 +1176,12 @@ def _decode(word: int) -> dict:
 
 
 def _port_a_readers(word: int) -> list[str]:
-    """Returns every VREG read-port-A consumer one bundle issues, empty for a DMA bundle.
+    """Returns every consumer one bundle issues that claims VREG read port A on its own issue cycle.
 
     Notes:
-        vpu.sv's `effective_raddr_a` is one physical port behind a static-priority mux the matrix controller wins,
-        so two consumers issued together leave the loser silently reading the winner's address.
+        vpu.sv's `effective_raddr_a` is one physical port, and a consumer losing it reads the winner's register
+        rather than waiting. A matrix command claims the port from the cycle after issue, so it claims none here
+        and `schedule` holds the port over its occupancy instead.
 
     Args:
         word: The bundle word to inspect.
@@ -1195,12 +1197,6 @@ def _port_a_readers(word: int) -> list[str]:
     x = (word >> _X_SHIFT) & ((1 << X_SLOT_W) - 1)
     if x and (x >> 31) & 1:
         readers.append("X:vst")
-    m = (word >> _M_SHIFT) & ((1 << M_SLOT_W) - 1)
-    m_op = (m >> 5) & 0x3 if m else 0
-    if m_op == 1:
-        readers.append("M:vmatload")
-    elif m_op == 2:
-        readers.append("M:vmatpush")
     return readers
 
 
@@ -1398,23 +1394,48 @@ def _check_slot_reuse(words: list[int]) -> None:
         occupied[slot] = index
 
 
-def _check_port_a_exclusive(words: list[int]) -> None:
-    """Raises when one bundle co-issues two VREG read-port-A consumers.
+def _check_pop_write_window(words: list[int]) -> None:
+    """Raises when one bundle writes a VREG beside a vmatpop.
+
+    A pop's write window slides with how far ahead of its rows it issued and the sequencer reserves the unslid
+    window alone, so a writer sharing the bundle is neither held nor moved and the wired-OR writeback drops it.
 
     Args:
         words: The bundle stream to check, in program order.
 
     Raises:
-        ValueError: If a bundle carries more than one port-A consumer.
+        ValueError: If a bundle carries a vmatpop and any other writer.
+    """
+    for index, word in enumerate(words):
+        decoded = _decode(word)
+        if decoded["m_op"] != _OPCODES["vmatpop"] or len(decoded["writes"]) < 2:
+            continue
+        message = (
+            f"Unable to schedule bundle {index}, which writes a VREG beside a vmatpop. A pop's write window "
+            f"slides with how far ahead of its rows it issued, and the sequencer reserves the unslid window "
+            f"alone, so no interlock separates the two and the wired-OR writeback drops the other write. The "
+            f"writer must take a bundle of its own. A vst is the one companion a pop keeps, writing no VREG."
+        )
+        raise ValueError(message)
+
+
+def _check_port_a_exclusive(words: list[int]) -> None:
+    """Raises when one bundle co-issues VREG read-port-A consumers that claim the same cycle.
+
+    Args:
+        words: The bundle stream to check, in program order.
+
+    Raises:
+        ValueError: If a bundle carries consumers whose port-A claims overlap.
     """
     for index, word in enumerate(words):
         readers = _port_a_readers(word)
         if len(readers) > 1:
             message = (
-                f"Unable to schedule bundle {index}, which co-issues {readers}. Those all read VREG port A, a "
-                f"single physical read behind a static-priority mux the matrix controller wins, so the losing "
-                f"consumer silently reads the winner's register. No interlock covers it and no delay repairs it, "
-                f"so the consumers must be split across bundles."
+                f"Unable to schedule bundle {index}, which co-issues {readers}. Those claim VREG read port A on "
+                f"the same cycle, a single physical read behind a static-priority mux, so the losing consumer "
+                f"silently reads the winner's register. No interlock covers it and no delay repairs it, so the "
+                f"consumers must be split across bundles."
             )
             raise ValueError(message)
 

@@ -50,9 +50,9 @@ a decorated function only where the value is a constexpr instance, so the annota
 
 @triton.jit
 def matmul_kernel(
-    activation_pointer,
-    weight_pointer,
-    output_pointer,
+    activation_pointer: "*bf16",
+    weight_pointer: "*bf16",
+    output_pointer: "*fp32",
     stride_am: tl.constexpr = _DEPTH,
     stride_ak: tl.constexpr = 1,
     stride_bk: tl.constexpr = _COLUMNS,
@@ -93,9 +93,9 @@ def matmul_kernel(
 
 @triton.jit
 def matmul_n_m_k(
-    activation_pointer,
-    weight_pointer,
-    output_pointer,
+    activation_pointer: "*bf16",
+    weight_pointer: "*bf16",
+    output_pointer: "*fp32",
     stride_am: tl.constexpr = _DEPTH,
     stride_ak: tl.constexpr = 1,
     stride_bk: tl.constexpr = _COLUMNS,
@@ -129,9 +129,9 @@ def matmul_n_m_k(
 
 @triton.jit
 def matmul_m_k_n(
-    activation_pointer,
-    weight_pointer,
-    output_pointer,
+    activation_pointer: "*bf16",
+    weight_pointer: "*bf16",
+    output_pointer: "*fp32",
     stride_am: tl.constexpr = _DEPTH,
     stride_ak: tl.constexpr = 1,
     stride_bk: tl.constexpr = _COLUMNS,
@@ -164,9 +164,9 @@ def matmul_m_k_n(
 
 @triton.jit
 def matmul_n_k_m(
-    activation_pointer,
-    weight_pointer,
-    output_pointer,
+    activation_pointer: "*bf16",
+    weight_pointer: "*bf16",
+    output_pointer: "*fp32",
     stride_am: tl.constexpr = _DEPTH,
     stride_ak: tl.constexpr = 1,
     stride_bk: tl.constexpr = _COLUMNS,
@@ -199,9 +199,9 @@ def matmul_n_k_m(
 
 @triton.jit
 def matmul_k_m_n(
-    activation_pointer,
-    weight_pointer,
-    output_pointer,
+    activation_pointer: "*bf16",
+    weight_pointer: "*bf16",
+    output_pointer: "*fp32",
     stride_am: tl.constexpr = _DEPTH,
     stride_ak: tl.constexpr = 1,
     stride_bk: tl.constexpr = _COLUMNS,
@@ -234,9 +234,9 @@ def matmul_k_m_n(
 
 @triton.jit
 def matmul_k_n_m(
-    activation_pointer,
-    weight_pointer,
-    output_pointer,
+    activation_pointer: "*bf16",
+    weight_pointer: "*bf16",
+    output_pointer: "*fp32",
     stride_am: tl.constexpr = _DEPTH,
     stride_ak: tl.constexpr = 1,
     stride_bk: tl.constexpr = _COLUMNS,
@@ -277,10 +277,10 @@ def gelu(value):
 
 @triton.jit
 def fused_ffn_kernel(
-    activation_pointer,
-    up_weight_pointer,
-    down_weight_pointer,
-    output_pointer,
+    activation_pointer: "*bf16",
+    up_weight_pointer: "*bf16",
+    down_weight_pointer: "*bf16",
+    output_pointer: "*fp32",
     stride_am: tl.constexpr = _DEPTH,
     stride_ak: tl.constexpr = 1,
     stride_uk: tl.constexpr = _COLUMNS,

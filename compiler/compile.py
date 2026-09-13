@@ -374,324 +374,6 @@ class Plan:
     issued_over_useful: float
 
 
-def signature_of(kernel: JITFunction, *, operands: dict[str, str]) -> dict[str, str]:
-    """Returns the signature a kernel is compiled against, in the order the kernel declares its parameters.
-
-    Args:
-        kernel: The function the triton.jit decorator returned.
-        operands: Triton type string for each parameter a buffer is passed for, keyed by parameter name.
-
-    Returns:
-        The signature.
-
-    Raises:
-        ProgramError: If a named operand is not a runtime parameter of the kernel.
-    """
-    declared = {parameter.name: parameter.is_constexpr for parameter in kernel.params}
-    unknown = {name for name in operands if declared.get(name, True)}
-    if unknown:
-        message = (
-            f"Unable to type {', '.join(sorted(unknown))} as an operand of {kernel.__name__}. Every named operand "
-            f"must be one of its runtime parameters, which are "
-            f"{', '.join(name for name, constexpr in declared.items() if not constexpr)}."
-        )
-        raise ProgramError(message)
-    return {name: "constexpr" if constexpr else operands.get(name, "i32")
-            for name, constexpr in declared.items()}
-
-
-def read_program(kernel: JITFunction, *, signature: dict[str, str],
-                 constexprs: dict[str, int]) -> tuple[MatMul, ...]:
-    """Reads every matmul a kernel computes, in program order.
-
-    Args:
-        kernel: The function the triton.jit decorator returned.
-        signature: Parameter name to Triton type string, in declaration order.
-        constexprs: Values of the constexpr parameters, which fix the tiles.
-
-    Returns:
-        The matmuls.
-
-    Raises:
-        ProgramError: If the grid carries independent products, a matmul sits outside every loop, or its loops
-            leave the reduction ambiguous.
-    """
-    graph = _Graph(compile_to_ttir(kernel, signature=signature, constexprs=constexprs), signature=signature)
-    axes = {operation.get_int_attr("axis") for operation in graph.by_name("tt.get_program_id")}
-    if axes - {0, 1}:
-        message = (
-            f"Unable to read a grid using axes {sorted(axes)}. Two axes carry the output tile and a third carries "
-            f"independent products, whose launch needs the distance the activation pointer moves between them. "
-            f"Recovering that distance needs the operand's strides, which this reader does not follow."
-        )
-        raise ProgramError(message)
-
-    dots = graph.by_name("tt.dot")
-    stores = graph.by_name("tt.store")
-    consumers = [*dots[1:], *stores]
-    accumulators = graph.accumulator_elements()
-
-    matmuls = []
-    for index, dot in enumerate(dots):
-        loops = graph.enclosing_loops(dot)
-        if not loops:
-            message = (
-                f"Unable to read matmul {index} from no enclosing loop. A dot walks its reduction in a loop, "
-                f"because the group that loop accumulates is what the builder's block count comes from."
-            )
-            raise ProgramError(message)
-
-        rows, columns = dot.get_result(0).get_shape()
-        steps = [graph.constant(loop.get_operand(2)) for loop in loops]
-        if any(step is None for step in steps):
-            message = f"Unable to read the step of matmul {index}'s loops. Each must be a compile time constant."
-            raise ProgramError(message)
-
-        pointers = {role: (None if operation is None else operation.get_operand(0))
-                    for role, (operation, _) in (("activation", graph._load_behind(dot.get_operand(0))),
-                                                 ("weight", graph._load_behind(dot.get_operand(1))))}
-        source, prologue = graph.trace(dot.get_operand(0), among=dots)
-        at = _reduction_position(index=index, graph=graph, loops=loops, steps=steps, pointers=pointers,
-                                 rows=rows, columns=columns, source=source)
-        consumer = consumers[index] if index < len(consumers) else None
-        epilogue = frozenset() if consumer is None else graph.trace(
-            consumer.get_operand(1 if consumer.get_name() == "tt.store" else 0), among=dots)[1]
-
-        def walked(among) -> tuple[TileLoop, ...]:
-            """Reads each of the given loops as a tile loop, dropping any whose bounds are runtime values."""
-            read = (graph.tile_loop(other, axis=graph.axis_of_loop(other, pointers=pointers)) for other in among)
-            return tuple(loop for loop in read if loop is not None)
-
-        matmuls.append(MatMul(
-            rows=rows, columns=columns, depth=steps[at],
-            accumulator=accumulators[index] if index < len(accumulators) else _ASSUMED_ACCUMULATOR_ELEMENT,
-            epilogue=epilogue,
-            prologue=prologue,
-            left_source=dots.index(source) if source is not None else None,
-            reduction=graph.constant(loops[at].get_operand(1)),
-            tile_loops=walked([*loops[:at], *loops[at + 1:]]),
-            nest=tuple(_REDUCTION_AXIS if position == at else graph.axis_of_loop(loop, pointers=pointers)
-                       for position, loop in enumerate(loops)
-                       if position == at or graph.axis_of_loop(loop, pointers=pointers) is not None),
-            accesses=graph.accesses_of(dot=dot, store=stores[index] if index < len(stores) else None),
-            # A store the reduction encloses sits deeper than the reduction itself, which is the
-            # accumulator the kernel keeps in memory rather than in registers.
-            stores_inside_reduction=(index < len(stores)
-                                     and len(graph.enclosing_loops(stores[index])) > at),
-        ))
-    return tuple(matmuls)
-
-
-def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
-         dims: tuple[dict[str, int], ...] = (), fuse: bool = True) -> Plan:
-    """Plans the launches this machine runs for each matmul, with the padding and repacking they need.
-
-    Notes:
-        A problem extent is data the host lays out, so an axis leaving a partial block is padded. A tile is what
-        the kernel asked for, so one the array does not compute is refused instead.
-
-    Args:
-        matmuls: The matmuls a kernel computes, in program order.
-        strides: Value of each stride parameter at the launch, which is where an operand's layout becomes a
-            number the machine can judge.
-        dims: Extent of each matmul's problem, keyed "m", "n" and "k" for whichever the module leaves open,
-            which is an axis put on the grid or a reduction bounded by a runtime argument.
-        fuse: Determines whether a matmul pair one image can run is planned as one launch. Clearing it plans
-            every matmul on its own, which is the same pair passing its intermediate through memory.
-
-    Returns:
-        The plan.
-
-    Raises:
-        ProgramError: If a tile, a prologue or an epilogue is one this machine cannot run, a stride is unbound,
-            an axis is stated by nothing or by two sources that disagree, or a chained matmul reads a width
-            its producer does not leave.
-    """
-    dims = dims or ({},) * len(matmuls)
-    if len(dims) != len(matmuls):
-        message = f"Unable to plan {len(matmuls)} matmuls against {len(dims)} problem shapes."
-        raise ProgramError(message)
-    _check_strides_bound(matmuls, strides=strides)
-
-    # Reads the pairs before planning, a consumer reading registers being one no plain launch describes. A
-    # kernel stating one matmul leaves this empty, so its plan is the loop below and nothing else.
-    pairs = _fusable_pairs(matmuls) if fuse else {}
-    absorbed = _epilogues_absorbed(matmuls)
-
-    launches: list[Launch | FusedLaunch] = []
-    drains: list[Drain] = []
-    padding: list[Padding] = []
-    repack: list[Repack] = []
-    masks_covered: list[str] = []
-    covered_by_index: dict[int, dict[str, int]] = {}
-    planned_at: dict[int, int] = {}
-    ratio = 1.0
-    consumed = set(pairs.values())
-    for index, (matmul, extent) in enumerate(zip(matmuls, dims, strict=True)):
-        if index in consumed:
-            # Planned with the matmul it is fused onto, whose image already covers this one's contraction.
-            continue
-        if matmul.epilogue not in _EPILOGUES and {matmul.epilogue} != absorbed.get(index, set()):
-            message = (
-                f"Unable to fuse an epilogue running {', '.join(sorted(matmul.epilogue))} after matmul "
-                f"{index}. The drain writes the product as the array left it, so an epilogue is a further launch "
-                f"reading it where it lies. A GELU reaches the array only where the matmul consuming this "
-                f"product writes it ahead of itself, which that launch's staging fuses."
-            )
-            raise ProgramError(message)
-
-        if matmul.prologue not in _PROLOGUES:
-            message = (
-                f"Unable to fuse a transform running {', '.join(sorted(matmul.prologue))} ahead of matmul "
-                f"{index}. The staging fuses a GELU activation and nothing else, so any other transform is a "
-                f"further launch writing the tile this one reads."
-            )
-            raise ProgramError(message)
-
-        blocks = _machine_tile(index=index, matmul=matmul)
-        repack.extend(_repacking_needed(index=index, matmul=matmul, strides=strides))
-        walked = _tiles_walked(index=index, matmul=matmul)
-        stated: dict[str, dict[str, int]] = {}
-        for axis, value in (("k", matmul.reduction), *walked.items()):
-            if value is not None:
-                stated.setdefault(axis, {})["its own loop"] = value
-        for axis, value in extent.items():
-            stated.setdefault(axis, {})["its caller"] = value
-        for role, access in matmul.accesses.items():
-            for position, guard in enumerate(access.guards):
-                masks_covered.append(f"matmul {index} {role} holds {guard.axis} under {guard.bound}")
-                if isinstance(guard.bound, int):
-                    # Names each conjunct apart, so two bounds on one axis reach `_stated_extent` as two
-                    # sources rather than one.
-                    name = f"its {role} mask" if position == 0 else f"its {role} mask ({position + 1})"
-                    stated.setdefault(guard.axis, {})[name] = guard.bound
-                elif guard.axis not in extent:
-                    message = (
-                        f"Unable to read the {guard.axis} extent matmul {index} covers from a {role} mask bounded "
-                        f"by {guard.bound}, which is a runtime argument. The padding that stands in for the mask "
-                        f"is laid out before the launch, so its extent has to be known here: declare the bound a "
-                        f"tl.constexpr, or state that axis at the plan."
-                    )
-                    raise ProgramError(message)
-
-        covered, asked = {}, {}
-        # Pads the columns to a whole block rather than a whole tile, since the emitter cannot place a partial
-        # block.
-        for axis, unit in (("m", matmul.rows), ("n", matmul.columns), ("k", blocks * _BLOCK_DEPTH)):
-            asked[axis] = _stated_extent(index=index, axis=axis, unit=unit, sources=stated.get(axis, {}))
-            covered[axis] = unit * -(-asked[axis] // unit)
-            if covered[axis] != asked[axis]:
-                padding.append(Padding(matmul=index, axis=axis, extent=asked[axis], padded=covered[axis]))
-            ratio *= covered[axis] / asked[axis]
-        if matmul.left_source is not None:
-            _check_dimensions_match(index=index, matmul=matmul, covered=covered,
-                                    produced=covered_by_index[matmul.left_source])
-        covered_by_index[index] = covered
-        live = _resident_blocks(index=index, matmul=matmul, covered=covered)
-        block_m, block_n = live["m"] * matmul.rows, live["n"] * matmul.columns
-
-        launch = Launch(
-            row_blocks=covered["m"] // block_m,
-            column_tiles=covered["n"] // _TILE,
-            groups=covered["k"] // (blocks * _BLOCK_DEPTH),
-            loop_blocks=blocks,
-            activate=_PROLOGUES[matmul.prologue] == "gelu",
-            # Places the accumulator where the kernel put it, summing the groups on the device for one it
-            # carries across the reduction and draining a partial each for one it writes to memory per step.
-            fuse_groups=not matmul.stores_inside_reduction,
-            # Covers every block the nest keeps live, which is what a tile loop inside the reduction asks for
-            # and the kernel's own tile otherwise.
-            block_m=block_m,
-            block_n=block_n,
-            # Places an axis whose loop was folded outermost, where a single trip leaves the order it walks
-            # indistinguishable from any other.
-            nest=(*(axis for axis in _EMITTED_NEST if axis not in matmul.nest), *matmul.nest),
-        )
-        planned_at[index] = len(launches)
-        launches.append(launch)
-        # Measures the drain in the block the launch states, since a narrower one drains fewer rows.
-        shape = (launch.image_blocks, launch.partials, launch.output_tiles, launch.block_m, _TILE)
-        drains.append(Drain(
-            zero_tile_words=_ZERO_TILE_WORDS,
-            words=_ZERO_TILE_WORDS + math.prod(shape),
-            shape=shape,
-        ))
-    for produces, consumes in pairs.items():
-        _check_fused_width(produces=produces, consumes=consumes, matmuls=matmuls,
-                           covered=covered_by_index[produces])
-        position = planned_at[produces]
-        launches[position] = FusedLaunch(
-            row_blocks=covered_by_index[produces]["m"] // matmuls[produces].rows,
-            chunks=covered_by_index[produces]["n"] // _TILE,
-            steps=covered_by_index[produces]["k"] // _TILE,
-            output_tiles=_output_tiles_of(matmuls[consumes]),
-            produces=produces, consumes=consumes,
-        )
-        shape = (1, 1, launches[position].output_tiles, _BLOCK_TOKENS, _TILE)
-        drains[position] = Drain(zero_tile_words=_ZERO_TILE_WORDS,
-                                 words=_ZERO_TILE_WORDS + math.prod(shape), shape=shape)
-
-    return Plan(launches=tuple(launches), drains=tuple(drains), padding=tuple(padding), repack=tuple(repack),
-                masks_covered=tuple(masks_covered), issued_over_useful=ratio)
-
-
-def stage(left: NDArray[np.float32], right: NDArray[np.float32], *, matmul: MatMul,
-          launch: Launch) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-    """Pads an operand pair to the extent its launch covers.
-
-    Args:
-        left: The activation operand at the extent the caller holds.
-        right: The weight operand at the extent the caller holds.
-        matmul: The matmul the kernel computes, whose tile gives the covered extents.
-        launch: The planned launch, whose block and trip counts give the covered extents.
-
-    Returns:
-        The staged pair.
-    """
-    rows = launch.row_blocks * launch.block_m
-    depth = launch.groups * matmul.depth
-    columns = launch.column_tiles * _TILE
-    staged = []
-    for operand, shape in ((left, (rows, depth)), (right, (depth, columns))):
-        # Slices before measuring, so an operand larger than its launch covers is cut rather than broadcast.
-        kept = operand[: shape[0], : shape[1]]
-        padded = np.zeros(shape, dtype=operand.dtype)
-        padded[: kept.shape[0], : kept.shape[1]] = kept
-        staged.append(padded)
-    return staged[0], staged[1]
-
-
-def compile_launch(launch: Launch | FusedLaunch) -> tuple[bytes, Staging]:
-    """Returns the image one launch compiles to and what a host stages for it.
-
-    Args:
-        launch: The launch the planner produced.
-
-    Returns:
-        The image bytes padded to the loader's boundary, and the staging the emitter placed them from.
-
-    Raises:
-        NotImplementedError: If a plain launch activates its staged tiles, which the emitter does not place.
-    """
-    if isinstance(launch, FusedLaunch):
-        bundles, staging = fused_ffn_stream(chunks=launch.chunks, steps=launch.steps,
-                                            output_tiles=launch.output_tiles)
-        return AsmKernel(name="fused_ffn", bundles=bundles).to_bytes(pad_to=4), staging
-
-    if launch.activate:
-        message = (
-            "Unable to compile a launch that activates its staged tiles. The emitter places the staging, the "
-            "matrix commands and the drain only, so such a launch comes from `kernels.build_looped_gemm` until "
-            "the activation is placed here too."
-        )
-        raise NotImplementedError(message)
-    counts = dict(column_tiles=launch.image_blocks * launch.output_tiles, groups=launch.groups,
-                  loop_blocks=launch.loop_blocks,
-                  fuse_groups=launch.fuse_groups, block_m=launch.block_m, block_n=launch.block_n)
-    bundles, staging = looped_gemm_stream(**counts)
-    return AsmKernel(name="looped_gemm", bundles=bundles).to_bytes(pad_to=4), staging
-
-
 @dataclass(slots=True)
 class _Expression:
     """Describes a resolved pointer or index expression.
@@ -1219,6 +901,326 @@ class _Graph:
         )
 
 
+def signature_of(kernel: JITFunction, *, operands: dict[str, str]) -> dict[str, str]:
+    """Returns the signature a kernel is compiled against, in the order the kernel declares its parameters.
+
+    Args:
+        kernel: The function the triton.jit decorator returned.
+        operands: Triton type string for each parameter a buffer is passed for, keyed by parameter name, which
+            overrides the annotation that parameter carries.
+
+    Returns:
+        The signature.
+
+    Raises:
+        ProgramError: If a named operand is not a runtime parameter of the kernel.
+    """
+    declared = {parameter.name: parameter.is_constexpr for parameter in kernel.params}
+    unknown = {name for name in operands if declared.get(name, True)}
+    if unknown:
+        message = (
+            f"Unable to type {', '.join(sorted(unknown))} as an operand of {kernel.__name__}. Every named operand "
+            f"must be one of its runtime parameters, which are "
+            f"{', '.join(name for name, constexpr in declared.items() if not constexpr)}."
+        )
+        raise ProgramError(message)
+    return {parameter.name: "constexpr" if parameter.is_constexpr else
+            operands.get(parameter.name, _annotated(parameter.annotation) or "i32")
+            for parameter in kernel.params}
+
+
+def read_program(kernel: JITFunction, *, signature: dict[str, str],
+                 constexprs: dict[str, int]) -> tuple[MatMul, ...]:
+    """Reads every matmul a kernel computes, in program order.
+
+    Args:
+        kernel: The function the triton.jit decorator returned.
+        signature: Parameter name to Triton type string, in declaration order.
+        constexprs: Values of the constexpr parameters, which fix the tiles.
+
+    Returns:
+        The matmuls.
+
+    Raises:
+        ProgramError: If the grid carries independent products, a matmul sits outside every loop, or its loops
+            leave the reduction ambiguous.
+    """
+    graph = _Graph(compile_to_ttir(kernel, signature=signature, constexprs=constexprs), signature=signature)
+    axes = {operation.get_int_attr("axis") for operation in graph.by_name("tt.get_program_id")}
+    if axes - {0, 1}:
+        message = (
+            f"Unable to read a grid using axes {sorted(axes)}. Two axes carry the output tile and a third carries "
+            f"independent products, whose launch needs the distance the activation pointer moves between them. "
+            f"Recovering that distance needs the operand's strides, which this reader does not follow."
+        )
+        raise ProgramError(message)
+
+    dots = graph.by_name("tt.dot")
+    stores = graph.by_name("tt.store")
+    consumers = [*dots[1:], *stores]
+    accumulators = graph.accumulator_elements()
+
+    matmuls = []
+    for index, dot in enumerate(dots):
+        loops = graph.enclosing_loops(dot)
+        if not loops:
+            message = (
+                f"Unable to read matmul {index} from no enclosing loop. A dot walks its reduction in a loop, "
+                f"because the group that loop accumulates is what the builder's block count comes from."
+            )
+            raise ProgramError(message)
+
+        rows, columns = dot.get_result(0).get_shape()
+        steps = [graph.constant(loop.get_operand(2)) for loop in loops]
+        if any(step is None for step in steps):
+            message = f"Unable to read the step of matmul {index}'s loops. Each must be a compile time constant."
+            raise ProgramError(message)
+
+        pointers = {role: (None if operation is None else operation.get_operand(0))
+                    for role, (operation, _) in (("activation", graph._load_behind(dot.get_operand(0))),
+                                                 ("weight", graph._load_behind(dot.get_operand(1))))}
+        source, prologue = graph.trace(dot.get_operand(0), among=dots)
+        at = _reduction_position(index=index, graph=graph, loops=loops, steps=steps, pointers=pointers,
+                                 rows=rows, columns=columns, source=source)
+        consumer = consumers[index] if index < len(consumers) else None
+        epilogue = frozenset() if consumer is None else graph.trace(
+            consumer.get_operand(1 if consumer.get_name() == "tt.store" else 0), among=dots)[1]
+
+        def walked(among) -> tuple[TileLoop, ...]:
+            """Reads each of the given loops as a tile loop, dropping any whose bounds are runtime values."""
+            read = (graph.tile_loop(other, axis=graph.axis_of_loop(other, pointers=pointers)) for other in among)
+            return tuple(loop for loop in read if loop is not None)
+
+        matmuls.append(MatMul(
+            rows=rows, columns=columns, depth=steps[at],
+            accumulator=accumulators[index] if index < len(accumulators) else _ASSUMED_ACCUMULATOR_ELEMENT,
+            epilogue=epilogue,
+            prologue=prologue,
+            left_source=dots.index(source) if source is not None else None,
+            reduction=graph.constant(loops[at].get_operand(1)),
+            tile_loops=walked([*loops[:at], *loops[at + 1:]]),
+            nest=tuple(_REDUCTION_AXIS if position == at else graph.axis_of_loop(loop, pointers=pointers)
+                       for position, loop in enumerate(loops)
+                       if position == at or graph.axis_of_loop(loop, pointers=pointers) is not None),
+            accesses=graph.accesses_of(dot=dot, store=stores[index] if index < len(stores) else None),
+            # A store the reduction encloses sits deeper than the reduction itself, which is the
+            # accumulator the kernel keeps in memory rather than in registers.
+            stores_inside_reduction=(index < len(stores)
+                                     and len(graph.enclosing_loops(stores[index])) > at),
+        ))
+    return tuple(matmuls)
+
+
+def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
+         dims: tuple[dict[str, int], ...] = (), fuse: bool = True) -> Plan:
+    """Plans the launches this machine runs for each matmul, with the padding and repacking they need.
+
+    Notes:
+        A problem extent is data the host lays out, so an axis leaving a partial block is padded. A tile is what
+        the kernel asked for, so one the array does not compute is refused instead.
+
+    Args:
+        matmuls: The matmuls a kernel computes, in program order.
+        strides: Value of each stride parameter at the launch, which is where an operand's layout becomes a
+            number the machine can judge.
+        dims: Extent of each matmul's problem, keyed "m", "n" and "k" for whichever the module leaves open,
+            which is an axis put on the grid or a reduction bounded by a runtime argument.
+        fuse: Determines whether a matmul pair one image can run is planned as one launch. Clearing it plans
+            every matmul on its own, which is the same pair passing its intermediate through memory.
+
+    Returns:
+        The plan.
+
+    Raises:
+        ProgramError: If a tile, a prologue or an epilogue is one this machine cannot run, a stride is unbound,
+            an axis is stated by nothing or by two sources that disagree, or a chained matmul reads a width
+            its producer does not leave.
+    """
+    dims = dims or ({},) * len(matmuls)
+    if len(dims) != len(matmuls):
+        message = f"Unable to plan {len(matmuls)} matmuls against {len(dims)} problem shapes."
+        raise ProgramError(message)
+    _check_strides_bound(matmuls, strides=strides)
+
+    # Reads the pairs before planning, a consumer reading registers being one no plain launch describes. A
+    # kernel stating one matmul leaves this empty, so its plan is the loop below and nothing else.
+    pairs = _fusable_pairs(matmuls) if fuse else {}
+    absorbed = _epilogues_absorbed(matmuls)
+
+    launches: list[Launch | FusedLaunch] = []
+    drains: list[Drain] = []
+    padding: list[Padding] = []
+    repack: list[Repack] = []
+    masks_covered: list[str] = []
+    covered_by_index: dict[int, dict[str, int]] = {}
+    planned_at: dict[int, int] = {}
+    ratio = 1.0
+    consumed = set(pairs.values())
+    for index, (matmul, extent) in enumerate(zip(matmuls, dims, strict=True)):
+        if index in consumed:
+            # Planned with the matmul it is fused onto, whose image already covers this one's contraction.
+            continue
+        if matmul.epilogue not in _EPILOGUES and {matmul.epilogue} != absorbed.get(index, set()):
+            message = (
+                f"Unable to fuse an epilogue running {', '.join(sorted(matmul.epilogue))} after matmul "
+                f"{index}. The drain writes the product as the array left it, so an epilogue is a further launch "
+                f"reading it where it lies. A GELU reaches the array only where the matmul consuming this "
+                f"product writes it ahead of itself, which that launch's staging fuses."
+            )
+            raise ProgramError(message)
+
+        if matmul.prologue not in _PROLOGUES:
+            message = (
+                f"Unable to fuse a transform running {', '.join(sorted(matmul.prologue))} ahead of matmul "
+                f"{index}. The staging fuses a GELU activation and nothing else, so any other transform is a "
+                f"further launch writing the tile this one reads."
+            )
+            raise ProgramError(message)
+
+        blocks = _machine_tile(index=index, matmul=matmul)
+        repack.extend(_repacking_needed(index=index, matmul=matmul, strides=strides))
+        walked = _tiles_walked(index=index, matmul=matmul)
+        stated: dict[str, dict[str, int]] = {}
+        for axis, value in (("k", matmul.reduction), *walked.items()):
+            if value is not None:
+                stated.setdefault(axis, {})["its own loop"] = value
+        for axis, value in extent.items():
+            stated.setdefault(axis, {})["its caller"] = value
+        for role, access in matmul.accesses.items():
+            for position, guard in enumerate(access.guards):
+                masks_covered.append(f"matmul {index} {role} holds {guard.axis} under {guard.bound}")
+                if isinstance(guard.bound, int):
+                    # Names each conjunct apart, so two bounds on one axis reach `_stated_extent` as two
+                    # sources rather than one.
+                    name = f"its {role} mask" if position == 0 else f"its {role} mask ({position + 1})"
+                    stated.setdefault(guard.axis, {})[name] = guard.bound
+                elif guard.axis not in extent:
+                    message = (
+                        f"Unable to read the {guard.axis} extent matmul {index} covers from a {role} mask bounded "
+                        f"by {guard.bound}, which is a runtime argument. The padding that stands in for the mask "
+                        f"is laid out before the launch, so its extent has to be known here: declare the bound a "
+                        f"tl.constexpr, or state that axis at the plan."
+                    )
+                    raise ProgramError(message)
+
+        covered, asked = {}, {}
+        # Pads the columns to a whole block rather than a whole tile, since the emitter cannot place a partial
+        # block.
+        for axis, unit in (("m", matmul.rows), ("n", matmul.columns), ("k", blocks * _BLOCK_DEPTH)):
+            asked[axis] = _stated_extent(index=index, axis=axis, unit=unit, sources=stated.get(axis, {}))
+            covered[axis] = unit * -(-asked[axis] // unit)
+            if covered[axis] != asked[axis]:
+                padding.append(Padding(matmul=index, axis=axis, extent=asked[axis], padded=covered[axis]))
+            ratio *= covered[axis] / asked[axis]
+        if matmul.left_source is not None:
+            _check_dimensions_match(index=index, matmul=matmul, covered=covered,
+                                    produced=covered_by_index[matmul.left_source])
+        covered_by_index[index] = covered
+        live = _resident_blocks(index=index, matmul=matmul, covered=covered)
+        block_m, block_n = live["m"] * matmul.rows, live["n"] * matmul.columns
+
+        launch = Launch(
+            row_blocks=covered["m"] // block_m,
+            column_tiles=covered["n"] // _TILE,
+            groups=covered["k"] // (blocks * _BLOCK_DEPTH),
+            loop_blocks=blocks,
+            activate=_PROLOGUES[matmul.prologue] == "gelu",
+            # Places the accumulator where the kernel put it, summing the groups on the device for one it
+            # carries across the reduction and draining a partial each for one it writes to memory per step.
+            fuse_groups=not matmul.stores_inside_reduction,
+            # Covers every block the nest keeps live, which is what a tile loop inside the reduction asks for
+            # and the kernel's own tile otherwise.
+            block_m=block_m,
+            block_n=block_n,
+            # Places an axis whose loop was folded outermost, where a single trip leaves the order it walks
+            # indistinguishable from any other.
+            nest=(*(axis for axis in _EMITTED_NEST if axis not in matmul.nest), *matmul.nest),
+        )
+        planned_at[index] = len(launches)
+        launches.append(launch)
+        # Measures the drain in the block the launch states, since a narrower one drains fewer rows.
+        shape = (launch.image_blocks, launch.partials, launch.output_tiles, launch.block_m, _TILE)
+        drains.append(Drain(
+            zero_tile_words=_ZERO_TILE_WORDS,
+            words=_ZERO_TILE_WORDS + math.prod(shape),
+            shape=shape,
+        ))
+    for produces, consumes in pairs.items():
+        _check_fused_width(produces=produces, consumes=consumes, matmuls=matmuls,
+                           covered=covered_by_index[produces])
+        position = planned_at[produces]
+        launches[position] = FusedLaunch(
+            row_blocks=covered_by_index[produces]["m"] // matmuls[produces].rows,
+            chunks=covered_by_index[produces]["n"] // _TILE,
+            steps=covered_by_index[produces]["k"] // _TILE,
+            output_tiles=_output_tiles_of(matmuls[consumes]),
+            produces=produces, consumes=consumes,
+        )
+        shape = (1, 1, launches[position].output_tiles, _BLOCK_TOKENS, _TILE)
+        drains[position] = Drain(zero_tile_words=_ZERO_TILE_WORDS,
+                                 words=_ZERO_TILE_WORDS + math.prod(shape), shape=shape)
+
+    return Plan(launches=tuple(launches), drains=tuple(drains), padding=tuple(padding), repack=tuple(repack),
+                masks_covered=tuple(masks_covered), issued_over_useful=ratio)
+
+
+def stage(left: NDArray[np.float32], right: NDArray[np.float32], *, matmul: MatMul,
+          launch: Launch) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    """Pads an operand pair to the extent its launch covers.
+
+    Args:
+        left: The activation operand at the extent the caller holds.
+        right: The weight operand at the extent the caller holds.
+        matmul: The matmul the kernel computes, whose tile gives the covered extents.
+        launch: The planned launch, whose block and trip counts give the covered extents.
+
+    Returns:
+        The staged pair.
+    """
+    rows = launch.row_blocks * launch.block_m
+    depth = launch.groups * matmul.depth
+    columns = launch.column_tiles * _TILE
+    staged = []
+    for operand, shape in ((left, (rows, depth)), (right, (depth, columns))):
+        # Slices before measuring, so an operand larger than its launch covers is cut rather than broadcast.
+        kept = operand[: shape[0], : shape[1]]
+        padded = np.zeros(shape, dtype=operand.dtype)
+        padded[: kept.shape[0], : kept.shape[1]] = kept
+        staged.append(padded)
+    return staged[0], staged[1]
+
+
+def compile_launch(launch: Launch | FusedLaunch) -> tuple[bytes, Staging]:
+    """Returns the image one launch compiles to and what a host stages for it.
+
+    Args:
+        launch: The launch the planner produced.
+
+    Returns:
+        The image bytes padded to the loader's boundary, and the staging the emitter placed them from.
+
+    Raises:
+        NotImplementedError: If a plain launch activates its staged tiles, which the emitter does not place.
+    """
+    if isinstance(launch, FusedLaunch):
+        bundles, staging = fused_ffn_stream(chunks=launch.chunks, steps=launch.steps,
+                                            output_tiles=launch.output_tiles)
+        return AsmKernel(name="fused_ffn", bundles=bundles).to_bytes(pad_to=4), staging
+
+    if launch.activate:
+        message = (
+            "Unable to compile a launch that activates its staged tiles. The emitter places the staging, the "
+            "matrix commands and the drain only, so such a launch comes from `kernels.build_looped_gemm` until "
+            "the activation is placed here too."
+        )
+        raise NotImplementedError(message)
+    counts = dict(column_tiles=launch.image_blocks * launch.output_tiles, groups=launch.groups,
+                  loop_blocks=launch.loop_blocks,
+                  fuse_groups=launch.fuse_groups, block_m=launch.block_m, block_n=launch.block_n)
+    bundles, staging = looped_gemm_stream(**counts)
+    return AsmKernel(name="looped_gemm", bundles=bundles).to_bytes(pad_to=4), staging
+
+
 def _reduction_position(*, index: int, graph: _Graph, loops: list, steps: list[int],
                         pointers: dict[str, object], rows: int, columns: int, source=None) -> int:
     """Returns the position of the loop walking one matmul's contraction.
@@ -1396,6 +1398,22 @@ def _epilogues_absorbed(matmuls: tuple[MatMul, ...]) -> dict[int, set[frozenset[
         if matmul.left_source is not None:
             absorbed.setdefault(matmul.left_source, set()).add(matmul.prologue)
     return absorbed
+
+
+def _annotated(annotation: str) -> str:
+    """Returns the Triton type one parameter's annotation states, unquoted.
+
+    Args:
+        annotation: The annotation the kernel declared, which `from __future__ import annotations` hands over as
+            the source text and so with its quotes still on.
+
+    Returns:
+        The type, or the empty string for a parameter carrying no annotation.
+    """
+    text = annotation.strip()
+    if len(text) > 1 and text[0] == text[-1] and text[0] in "\"'":
+        return text[1:-1]
+    return text
 
 
 def _machine_tile(*, index: int, matmul: MatMul) -> int:

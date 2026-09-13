@@ -22,6 +22,7 @@ import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
 import kernels  # noqa: E402
+import sample_triton  # noqa: E402
 from bf16 import _BLOCK_DEPTH, _BLOCK_TOKENS, _TILE  # noqa: E402
 from compiler import ProgramError, compile_launch, plan, read_program, signature_of  # noqa: E402
 from compiler.compile import FusedLaunch  # noqa: E402
@@ -36,6 +37,32 @@ _STRIDE_NAMES: tuple[str, ...] = ("stride_am", "stride_ak", "stride_bk", "stride
 
 _ROOT_TWO: tl.constexpr = tl.constexpr(1.4142135623730951)
 """Divisor the exact GELU scales its argument by, which Triton reaches from a kernel only as a constexpr."""
+
+
+class SignatureTest(unittest.TestCase):
+    """Covers the signature a kernel is compiled against, and what states it."""
+
+    def test_a_kernel_states_its_own_operands(self) -> None:
+        """Asserts an annotated pointer is typed from the annotation, with nothing passed for it."""
+        for kernel, pointers in ((sample_triton.matmul_kernel, {
+                "activation_pointer": "*bf16", "weight_pointer": "*bf16", "output_pointer": "*fp32"}),
+                (sample_triton.fused_ffn_kernel, {
+                    "activation_pointer": "*bf16", "up_weight_pointer": "*bf16",
+                    "down_weight_pointer": "*bf16", "output_pointer": "*fp32"})):
+            with self.subTest(kernel=kernel.__name__):
+                signature = signature_of(kernel, operands={})
+                self.assertEqual({name: kind for name, kind in signature.items() if kind != "constexpr"},
+                                 pointers)
+
+    def test_an_argument_overrides_the_annotation(self) -> None:
+        """Asserts a named operand wins over what the kernel annotated, which is what the flag is for."""
+        signature = signature_of(sample_triton.matmul_kernel, operands={"weight_pointer": "*fp32"})
+        self.assertEqual(signature["weight_pointer"], "*fp32")
+        self.assertEqual(signature["activation_pointer"], "*bf16")
+
+    def test_an_unannotated_parameter_stays_a_scalar(self) -> None:
+        """Asserts a runtime parameter no annotation and no argument names is typed as an extent."""
+        self.assertEqual(signature_of(gemm, operands={})["ap"], "i32")
 
 
 class ProgramReaderTest(unittest.TestCase):

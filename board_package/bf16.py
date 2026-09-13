@@ -14,8 +14,8 @@ from numpy.typing import NDArray
 HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent
 """The directory holding this package."""
 
-# dsl.py reaches the board runtime through this module rather than inserting the roots itself, so importing bf16
-# has to leave both of them on the path.
+# A module that imports bf16 reaches the board runtime through it rather than inserting the roots itself, so
+# importing bf16 has to leave both of them on the path.
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE / "minitpu_runtime"))
 
@@ -403,7 +403,8 @@ def pack_fused_ffn(activations: NDArray[np.float32], up_weight: NDArray[np.float
 
     Returns:
         The input words, contraction tile outermost, and the weight words, one hidden chunk at a time with
-        that chunk's down projection laid out tile by tile.
+        that chunk's down projection laid out tile by tile, padded by the up projection the last chunk reads
+        ahead into.
 
     Raises:
         ValueError: If a dimension is not a whole number of tiles, if the two weights disagree on the hidden
@@ -450,6 +451,8 @@ def pack_fused_ffn(activations: NDArray[np.float32], up_weight: NDArray[np.float
         swept = np.ascontiguousarray(rows.reshape(_TILE, tiles, _TILE).transpose(1, 0, 2)).reshape(-1)
         chunks.append(np.concatenate((as_bf16_words(values=up_weight[:, first:first + _TILE]).reshape(-1),
                                       swept)))
+    # Pads by one up projection, which the last chunk's sweep reads ahead into having no chunk after it.
+    chunks.append(np.zeros(depth * _TILE, dtype=np.uint16))
     return staged, np.concatenate(chunks)
 
 

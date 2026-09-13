@@ -121,7 +121,8 @@ class FusedFeedForwardPackingTest(unittest.TestCase):
         for steps, chunks in ((2, 2), (3, 4)):
             with self.subTest(steps=steps, chunks=chunks):
                 _, weights = _operands(steps=steps, chunks=chunks)
-                self.assertEqual(weights.size, chunks * (steps * _TILE + _TILE) * _TILE)
+                padded = (chunks * (steps * _TILE + _TILE) + steps * _TILE) * _TILE
+                self.assertEqual(weights.size, padded)
 
     def test_the_input_lands_where_the_loads_read_it(self) -> None:
         """Asserts every token and contraction position sits in the VMEM row and lane its tile's load covers."""

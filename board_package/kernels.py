@@ -527,30 +527,6 @@ def build_tile_transpose(tiles: int, *, load_stride: int, store_stride: int,
 _MAX_SADDI = 0x7FFF
 
 
-def _advance(bundles: dict, pc: int, register: int, delta: int) -> int:
-    """Emits the adds that move a pointer by `delta` bytes, however large it is.
-
-    A displacement past what one signed 16-bit immediate holds is split across several adds, each spaced from the
-    next because the scalar unit takes two bundles to write back and interlocks nothing.
-
-    Args:
-        bundles: The program under construction, keyed by bundle index.
-        pc: Where to start emitting.
-        register: The scalar register to move.
-        delta: The signed byte displacement.
-
-    Returns:
-        The next free bundle index.
-    """
-    remaining = delta
-    while remaining:
-        step = max(-_MAX_SADDI, min(_MAX_SADDI, remaining))
-        bundles[pc] = {"s": minitpu.saddi(register, register, step)}
-        pc += 2                # the scalar writeback, before anything reads it
-        remaining -= step
-    return pc
-
-
 def build_matrix_transpose(down: int, across: int, *, load_stride: int,
                            store_stride: int) -> MinitpuKernel:
     """Assembles a whole [R, C] transpose as ONE launch, over a two-deep loop.
@@ -1076,58 +1052,6 @@ def build_softmax_packed(tokens: int, heads: int, *,
     return minitpu.asm(softmax_packed)
 
 
-def _norm_geometry(width: int) -> tuple[int, int]:
-    """Returns the VMEM rows and VREGs one hidden row of the given width occupies.
-
-    Args:
-        width: Features in the row.
-
-    Returns:
-        The rows and VREGs pair.
-
-    Raises:
-        ValueError: If the width is not a whole number of VREGs, or a row does not fit in one DMA descriptor.
-    """
-    if width <= 0 or width % _VREG_ELEMENTS:
-        message = (
-            f"Unable to normalise a row of {width} features. `vredsum` reduces exactly one VREG, so a row is a "
-            f"whole number of {_VREG_ELEMENTS}."
-        )
-        raise ValueError(message)
-    width_rows = width // _NUM_LANES
-    if width_rows > _MAX_DESCRIPTOR_ROWS:
-        message = (
-            f"Unable to stream a row of {width} features: {width_rows} VMEM rows past the "
-            f"{_MAX_DESCRIPTOR_ROWS} one descriptor covers. Split the row across descriptors, or widen DMA's row "
-            f"field."
-        )
-        raise ValueError(message)
-    return width_rows, width // _VREG_ELEMENTS
-
-
-def _require_norm_fits(*, name: str, width_rows: int, const_rows: int, out_row: int) -> None:
-    """Rejects a width whose staged row and constants would reach the output block.
-
-    Args:
-        name: The kernel the regions belong to, which is what the diagnostic names.
-        width_rows: VMEM rows one hidden row occupies.
-        const_rows: VMEM rows the constants block occupies.
-        out_row: The first VMEM row of the output block.
-
-    Raises:
-        ValueError: If the input row plus the constants block reaches the output row, or the output block runs past
-            the rows a lane holds.
-    """
-    end = width_rows + const_rows
-    if end > out_row or out_row + width_rows > _VMEM_ENTRIES_PER_LANE:
-        message = (
-            f"Unable to place the {name} regions: the staged row and constants occupy rows [0:{end}) and the "
-            f"output block is [{out_row}:{out_row + width_rows}) of {_VMEM_ENTRIES_PER_LANE}. Move the output "
-            f"block, or stage the row in pieces."
-        )
-        raise ValueError(message)
-
-
 def build_layernorm_rows(rows: int, *, packed: bool = False) -> MinitpuKernel:
     """Assembles LayerNorm over several hidden rows, one per loop iteration.
 
@@ -1427,6 +1351,82 @@ def build_fused_ffn(chunks: int, *, steps: int = _STEPS, output_tiles: int = 1) 
     return minitpu.asm(fused_ffn)
 
 
+def _advance(bundles: dict, pc: int, register: int, delta: int) -> int:
+    """Emits the adds that move a pointer by `delta` bytes, however large it is.
+
+    A displacement past what one signed 16-bit immediate holds is split across several adds, each spaced from the
+    next because the scalar unit takes two bundles to write back and interlocks nothing.
+
+    Args:
+        bundles: The program under construction, keyed by bundle index.
+        pc: Where to start emitting.
+        register: The scalar register to move.
+        delta: The signed byte displacement.
+
+    Returns:
+        The next free bundle index.
+    """
+    remaining = delta
+    while remaining:
+        step = max(-_MAX_SADDI, min(_MAX_SADDI, remaining))
+        bundles[pc] = {"s": minitpu.saddi(register, register, step)}
+        pc += 2                # the scalar writeback, before anything reads it
+        remaining -= step
+    return pc
+
+
+def _norm_geometry(width: int) -> tuple[int, int]:
+    """Returns the VMEM rows and VREGs one hidden row of the given width occupies.
+
+    Args:
+        width: Features in the row.
+
+    Returns:
+        The rows and VREGs pair.
+
+    Raises:
+        ValueError: If the width is not a whole number of VREGs, or a row does not fit in one DMA descriptor.
+    """
+    if width <= 0 or width % _VREG_ELEMENTS:
+        message = (
+            f"Unable to normalise a row of {width} features. `vredsum` reduces exactly one VREG, so a row is a "
+            f"whole number of {_VREG_ELEMENTS}."
+        )
+        raise ValueError(message)
+    width_rows = width // _NUM_LANES
+    if width_rows > _MAX_DESCRIPTOR_ROWS:
+        message = (
+            f"Unable to stream a row of {width} features: {width_rows} VMEM rows past the "
+            f"{_MAX_DESCRIPTOR_ROWS} one descriptor covers. Split the row across descriptors, or widen DMA's row "
+            f"field."
+        )
+        raise ValueError(message)
+    return width_rows, width // _VREG_ELEMENTS
+
+
+def _require_norm_fits(*, name: str, width_rows: int, const_rows: int, out_row: int) -> None:
+    """Rejects a width whose staged row and constants would reach the output block.
+
+    Args:
+        name: The kernel the regions belong to, which is what the diagnostic names.
+        width_rows: VMEM rows one hidden row occupies.
+        const_rows: VMEM rows the constants block occupies.
+        out_row: The first VMEM row of the output block.
+
+    Raises:
+        ValueError: If the input row plus the constants block reaches the output row, or the output block runs past
+            the rows a lane holds.
+    """
+    end = width_rows + const_rows
+    if end > out_row or out_row + width_rows > _VMEM_ENTRIES_PER_LANE:
+        message = (
+            f"Unable to place the {name} regions: the staged row and constants occupy rows [0:{end}) and the "
+            f"output block is [{out_row}:{out_row + width_rows}) of {_VMEM_ENTRIES_PER_LANE}. Move the output "
+            f"block, or stage the row in pieces."
+        )
+        raise ValueError(message)
+
+
 def _emit_gemm_step(
     put: Callable[..., None], origin: int, *, activation_row: int, weight_row: int, close_loop: bool
 ) -> int:
@@ -1631,4 +1631,3 @@ def _emit_accumulate(put: Callable[..., None], slot: int, group: int, *, close_l
             put(slot=slot, f=minitpu.loop_end())
         slot += 1
     return slot
-

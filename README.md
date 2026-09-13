@@ -22,7 +22,7 @@ assembler, the kernels, and the runtime that launches them. Nothing registers th
 - [Usage](#usage)
   - [Entry Points](#entry-points)
   - [Compiling and Checking a Kernel](#compiling-and-checking-a-kernel)
-  - [Regenerating the ISA Artifacts](#regenerating-the-isa-artifacts)
+  - [Compiling and Checking the Feed-Forward Layer](#compiling-and-checking-the-feed-forward-layer)
   - [Deploying to the Board](#deploying-to-the-board)
   - [Running the Tests](#running-the-tests)
 - [Authors](#authors)
@@ -107,7 +107,6 @@ so each one runs from the repository root with no `PYTHONPATH` export.
 ```sh
 python3 sample_triton.py build/e2e
 python3 kernel_entry_point.py --kernel sample_triton.py:matmul_kernel \
-    --operands activation_pointer=*bf16,weight_pointer=*bf16,output_pointer=*fp32 \
     --output build/e2e --activations build/e2e/activations.npy --weights build/e2e/weights.npy
 python3 tools/sim_gemm.py --image build/e2e/matmul_0.bin --operands build/e2e/matmul_0_operands.npz
 ```
@@ -121,9 +120,10 @@ the relative error and exits non-zero past the tolerance the BF16 accumulate cha
 check rather than a demonstration.
 
 The middle line writes `matmul_0.bin` and `matmul_0_operands.npz`, one pair per matmul the reader recovered, and
-prints every axis the plan pads and every operand it repacks. `--operands` says which parameters a buffer is passed
-for, which Triton has no syntax for a kernel to state. A kernel declaring its extents and strides as `tl.constexpr`
-states the rest itself, and `--dims`, `--constexprs` and `--strides` bind whichever of them it leaves open.
+prints every axis the plan pads and every operand it repacks. A kernel states its own signature: a pointer annotated
+`activation_pointer: "*bf16"` is typed from that annotation, and extents and strides declared `tl.constexpr` carry
+their own values. `--dims`, `--constexprs` and `--strides` bind whichever it leaves open, and `--operands` overrides
+the annotation on a parameter, or supplies one for a kernel carrying none.
 
 `sample_triton.py` declares one GEMM kernel per order its loops walk, named for that order after the colon. Every one
 of them covers the same token rows, being what the register file stages at once. A kernel walking its output tiles
@@ -136,6 +136,43 @@ single image rather than a launch per matmul.
 `tools/sim_gemm.py` also emits an image from dimensions alone, through `--rows`, `--depth` and `--columns`, which
 checks the emitter without a kernel in front of it. `--build-dir` keeps the simulation build across runs, which is
 what makes a sweep cheap.
+
+Checking every order is the same two lines under a loop, cheapest image first.
+
+```sh
+BUILD=/tmp/minitpu-vbuild
+for k in matmul_k_m_n matmul_k_n_m matmul_m_k_n matmul_kernel matmul_n_m_k matmul_n_k_m; do
+    python3 kernel_entry_point.py --kernel sample_triton.py:$k \
+        --output build/e2e/$k \
+        --activations build/e2e/activations.npy --weights build/e2e/weights.npy
+    python3 tools/sim_gemm.py --image build/e2e/$k/matmul_0.bin \
+        --operands build/e2e/$k/matmul_0_operands.npz --max-cycles 200000000 --build-dir $BUILD
+done
+```
+
+***Warning!*** Every kernel names its image `matmul_0.bin`, so each needs an `--output` directory of its own. A
+shared one overwrites, and the check that follows reads the last image against another's operands. The three orders
+holding their output tiles across the reduction cover 48 or 96 columns and finish in seconds; the rest take about ten
+minutes each.
+
+
+### Compiling and Checking the Feed-Forward Layer
+
+```sh
+python3 sample_triton.py build/e2e
+python3 kernel_entry_point.py --kernel sample_triton.py:fused_ffn_kernel \
+    --output build/e2e/ffn --activations build/e2e/activations.npy \
+    --up-weight build/e2e/up_weight.npy --down-weight build/e2e/down_weight.npy
+python3 tools/sim_ffn.py --build-dir /tmp/minitpu-vbuild
+```
+
+The layer takes a third operand, so it passes its projections through `--up-weight` and `--down-weight` rather than
+through `--weights`. A compile reporting one fused launch rather than a launch per matmul is what says the planner
+took the GELU between the two products as a prologue.
+
+`tools/sim_ffn.py` takes no dimensions, building from the emitter at GPT-2 small's own shape. It reports the layer's
+error and what the BF16 format costs over the same contraction, the second being the bar the verdict allows the layer
+plus a tolerance.
 
 
 ### Deploying to the Board
@@ -159,7 +196,7 @@ own. The Makefile sets the PL clock first, and a board that programs the PL with
 python3 -m unittest discover -s board_package/tests -t board_package/tests -q
 ```
 
-This runs 86 unit tests covering the assembler encodings, the scheduling distances, the operand rule, the address
+This runs 125 unit tests covering the assembler encodings, the scheduling distances, the operand rule, the address
 space, the drain, and the compiler path from a decorated Triton kernel through to the image its plan emits. The
 compiler tests import Triton, so they run on the host rather than on the board.
 
@@ -170,7 +207,6 @@ and launches it there over a single SSH session.
 python3 sample_triton.py build/e2e
 python3 tools/run_on_board.py --octet 187 --program \
     --kernel sample_triton.py:matmul_kernel \
-    --operands activation_pointer=*bf16,weight_pointer=*bf16,output_pointer=*fp32 \
     --activations build/e2e/activations.npy --weights build/e2e/weights.npy
 ```
 
@@ -187,9 +223,21 @@ python3 tools/run_on_board.py --octet 187 \
     --kernel sample_triton.py:matmul_kernel --kernel sample_triton.py:matmul_n_m_k \
     --kernel sample_triton.py:matmul_m_k_n --kernel sample_triton.py:matmul_n_k_m \
     --kernel sample_triton.py:matmul_k_m_n --kernel sample_triton.py:matmul_k_n_m \
-    --operands activation_pointer=*bf16,weight_pointer=*bf16,output_pointer=*fp32 \
     --activations build/e2e/activations.npy --weights build/e2e/weights.npy
 ```
+
+The feed-forward layer runs the same way, its projections riding `--up-weight` and `--down-weight`.
+
+```sh
+python3 tools/run_on_board.py --octet 187 \
+    --kernel sample_triton.py:fused_ffn_kernel \
+    --activations build/e2e/activations.npy \
+    --up-weight build/e2e/up_weight.npy --down-weight build/e2e/down_weight.npy
+```
+
+***Note,*** run the layer twice. VMEM holds what a launch left in it, so an image that fails to clear an accumulator
+reads correct in simulation, which starts VMEM zeroed, and reports an error that climbs run over run on a board.
+Two runs agreeing is what says the image cleared what it accumulates into.
 
 `--octet` selects the board, and the flags describing the launch are the ones `kernel_entry_point.py` takes. One
 session carries the compile, the copy and the launch together because a board erases the home directory and revokes

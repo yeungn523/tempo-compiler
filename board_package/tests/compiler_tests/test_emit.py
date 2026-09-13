@@ -330,22 +330,60 @@ def _scalar_addend(word: int) -> int:
     return immediate - 0x10000 if immediate & 0x8000 else immediate
 
 
+def _loop_opcode(word: int) -> tuple[int, int]:
+    """Returns the F-slot loop opcode one bundle carries and the trip count it names."""
+    field = (word >> asm._F_SHIFT) & ((1 << asm.F_SLOT_W) - 1)
+    return ((field >> (asm.F_SLOT_W - 3)) & 0x7 if field else 0), field & 0xFFFF
+
+
+def _chunk_body(words: tuple[int, ...], *, chunks: int) -> tuple[int, ...]:
+    """Returns the words the fused layer's chunk loop encloses, which is where its weight staging rides."""
+    depth, first = 0, None
+    for at, word in enumerate(words):
+        operation, trips = _loop_opcode(word)
+        if operation == _F_LBEGIN and (first is not None or trips == chunks):
+            depth += 1
+            first = at + 1 if first is None else first
+        elif operation == _F_LOOP_END and first is not None:
+            depth -= 1
+            if not depth:
+                return words[first:at]
+    return ()
+
+
 class FusedFeedForwardEmitterTest(unittest.TestCase):
-    """Holds the emitted fused layer against the hand-written kernel it was ported from."""
+    """Holds the emitted fused layer to the staging its sweeps carry."""
 
-    def test_the_emitted_layer_matches_the_hand_written_builder(self) -> None:
-        """Asserts the emitter places the bundle stream `build_fused_ffn` assembles, under a renaming.
+    def test_the_weight_staging_rides_the_sweeps(self) -> None:
+        """Asserts a sweep never opens with more descriptors outstanding than the slots carrying them."""
+        for steps, output_tiles in ((32, 32), (48, 48)):
+            with self.subTest(steps=steps, output_tiles=output_tiles):
+                words, _ = emit.fused_ffn_stream(chunks=2, steps=steps, output_tiles=output_tiles)
+                outstanding = 0
+                for word in _chunk_body(words, chunks=2):
+                    if _loads(word):
+                        outstanding += 1
+                        self.assertLessEqual(outstanding, asm.DMA_SLOT_COUNT)
+                    elif _loop_opcode(word)[0] == _F_LBEGIN:
+                        outstanding = 0
 
-        The two allocate their registers apart, the emitter laying its regions end to end from register zero
-        and the hand kernel claiming what the plain GEMM leaves free, so the streams agree up to which register
-        holds which tile.
-        """
-        for chunks, steps, output_tiles in ((2, 2, 1), (4, 3, 1), (2, 2, 4), (8, 4, 2)):
-            with self.subTest(chunks=chunks, steps=steps, output_tiles=output_tiles):
-                emitted, _ = emit.fused_ffn_stream(chunks=chunks, steps=steps, output_tiles=output_tiles)
-                hand = kernels.build_fused_ffn(chunks=chunks, steps=steps,
-                                               output_tiles=output_tiles).image.assemble()
-                self.assertIsNotNone(renaming_onto(tuple(emitted), tuple(hand)))
+    def test_the_chunk_stages_exactly_its_weights(self) -> None:
+        """Asserts a chunk's descriptors move its own two weight tiles and no more."""
+        for steps, output_tiles in ((32, 32), (48, 48)):
+            with self.subTest(steps=steps, output_tiles=output_tiles):
+                words, _ = emit.fused_ffn_stream(chunks=2, steps=steps, output_tiles=output_tiles)
+                moved = sum(_descriptor_rows(word) for word in _chunk_body(words, chunks=2)
+                            if _loads(word))
+                self.assertEqual(moved, (steps + output_tiles) * bf16._TILE)
+
+    def test_the_splits_cover_every_tile_of_a_sweep(self) -> None:
+        """Asserts splitting a sweep for its issue points leaves its trip count whole."""
+        for steps, output_tiles in ((32, 32), (48, 48)):
+            with self.subTest(steps=steps, output_tiles=output_tiles):
+                words, _ = emit.fused_ffn_stream(chunks=2, steps=steps, output_tiles=output_tiles)
+                trips = [named for word in _chunk_body(words, chunks=2)
+                         for opcode, named in (_loop_opcode(word),) if opcode == _F_LBEGIN]
+                self.assertEqual(sum(trips), steps + output_tiles)
 
     def test_the_emitted_layer_states_the_block_it_drains(self) -> None:
         """Asserts the staging names the token block and the width the layer's output covers."""

@@ -84,12 +84,6 @@ _INPUT_POINTER: int = 0
 _WEIGHT_POINTER: int = 2
 """Scalar register holding the packed weights' host address, both projections riding one staging."""
 
-_INPUT_SLOT: int = 0
-"""Descriptor slot the input and the drain ride, neither overlapping the other in a launch."""
-
-_WEIGHT_SLOT: int = 1
-"""Descriptor slot the weights ride, kept apart from the input's so a flush names one transfer."""
-
 _MATLOAD_HOLD: int = MATRIX_OCCUPANCY["vmatload"] + 1
 """Offsets a weight load holds the matrix controller, which is where a step's first push becomes legal."""
 
@@ -101,6 +95,7 @@ _TILE_SHIFT: int = _TILE.bit_length() - 1
 
 _BLOCK_SHIFT: int = _BLOCK_TOKENS.bit_length() - 1
 """Shift the AGU walks the input and the output by per iteration, each covering a token block of rows."""
+
 
 @dataclass(frozen=True)
 class LoopLevel:
@@ -189,6 +184,94 @@ class StagedOperand:
     def advance(self) -> int:
         """Returns the bytes the pointer moves once its descriptor has read it."""
         return self.rows * _ROW_BYTES
+
+
+@dataclass(slots=True)
+class _Prefetch:
+    """Hands one transfer's descriptors out a slot at a time, so each rides compute rather than blocking on it.
+
+    Attributes:
+        first_row: First VMEM row the transfer covers.
+        rows: Rows the transfer moves.
+        pointer: Scalar register holding the host address the transfer reads or writes.
+        store: Determines whether the transfer writes host memory rather than reading it.
+        moved: Rows the descriptors handed out so far cover.
+        live: Descriptor slots still carrying one of them.
+    """
+
+    first_row: int
+    rows: int
+    pointer: int
+    store: bool = False
+    moved: int = 0
+    live: tuple[int, ...] = ()
+
+    @property
+    def mask(self) -> int:
+        """Returns the descriptor slots this transfer lands on, which is what a flush for it names.
+
+        Returns:
+            One bit per slot. Only a descriptor asserts a slot's done bit, so a flush naming a slot this never
+            reaches would wait on one that never settles.
+        """
+        descriptors = -(-self.rows // _MAX_DESCRIPTOR_ROWS)
+        return (1 << min(descriptors, asm_module.DMA_SLOT_COUNT)) - 1
+
+    def issue(self, *, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int) -> int:
+        """Issues one descriptor per slot, freeing each slot it reuses.
+
+        Args:
+            put: Merges slot words into the bundle at one offset.
+            builder: Encodes each slot word.
+            at: The bundle offset the first descriptor occupies.
+
+        Returns:
+            The next free bundle offset.
+        """
+        for slot in range(asm_module.DMA_SLOT_COUNT):
+            if self.moved >= self.rows:
+                break
+            if slot in self.live:
+                put(offset=at, f=builder.flush_slot(mask=1 << slot))
+                at += 1
+                self.live = tuple(ride for ride in self.live if ride != slot)
+            at = self._descriptor(put=put, builder=builder, at=at, slot=slot)
+        return at
+
+    def finish(self, *, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int, wait: bool) -> int:
+        """Issues whatever the issue points had no room for, blocking on each, and waits for the rest.
+
+        Args:
+            put: Merges slot words into the bundle at one offset.
+            builder: Encodes each slot word.
+            at: The bundle offset the first descriptor occupies.
+            wait: Determines whether the transfer is waited on here rather than by a later flush.
+
+        Returns:
+            The next free bundle offset.
+        """
+        while self.moved < self.rows:
+            at = self.issue(put=put, builder=builder, at=at)
+        if wait and self.live:
+            put(offset=at, f=builder.flush_slot(mask=sum(1 << slot for slot in self.live)))
+            at += 1
+            self.live = ()
+        return at
+
+    def _descriptor(self, *, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int,
+                    slot: int) -> int:
+        """Places one descriptor on the given slot and the pointer advance that follows it."""
+        span = min(self.rows - self.moved, _MAX_DESCRIPTOR_ROWS)
+        issue = builder.dma_store if self.store else builder.dma_load
+        put(offset=at, d=issue(slot=slot, vmem_address=self.first_row + self.moved, rows=span,
+                               base_sreg=self.pointer, stride_sreg=_STRIDE_REGISTER))
+        at += 1
+        # The advance follows the descriptor that reads it, the scalar unit interlocking nothing.
+        put(offset=at, s=builder.saddi(rd=self.pointer, rs=self.pointer, value=span * _ROW_BYTES))
+        at += 1 + _SCALAR_GAP - 1
+        self.moved += span
+        self.live += (slot,)
+        return at
 
 
 def drain_descriptors(rows: int) -> tuple[int, int]:
@@ -526,13 +609,17 @@ def looped_gemm_stream(*, column_tiles: int, groups: int, loop_blocks: int, fuse
     return _flatten(bundles), staging
 
 
-
 def fused_ffn(*, chunks: int, steps: int, output_tiles: int) -> tuple[dict[int, dict[str, int]], Staging]:
     """Returns the fused feed-forward layer's bundles and what a host stages for them.
 
     Each hidden chunk is contracted into the resident tiles, activated where it lies, then pushed once per
     output tile, so the intermediate never reaches VMEM and the up projection runs once however wide the
     output. The output accumulates in VMEM, the register file holding one tile of it at a time.
+
+    Notes:
+        A chunk's weights land under the sweep before the one that reads them, the down projection's under the
+        up projection and the next chunk's up projection under the down. Neither needs a second buffer, since
+        the region a transfer fills was last read by a sweep that has already closed.
 
     Args:
         chunks: Tiles the hidden width covers, being the loop both products sit inside.
@@ -552,7 +639,7 @@ def fused_ffn(*, chunks: int, steps: int, output_tiles: int) -> tuple[dict[int, 
 
     registers = fused_register_map(token_groups=_TOKEN_GROUPS)
     rows = _fused_vmem_map(steps=steps, output_tiles=output_tiles)
-    weight_rows = (steps + output_tiles) * _TILE
+    up_rows, down_rows = steps * _TILE, output_tiles * _TILE
     builder = asm_module.AsmBuilder()
     bundles: dict[int, dict[str, int]] = {}
 
@@ -560,29 +647,27 @@ def fused_ffn(*, chunks: int, steps: int, output_tiles: int) -> tuple[dict[int, 
         """Merges slot words into one bundle, so co-issue reads at the call site."""
         _merge(bundles=bundles, offset=offset, slots=slots)
 
-    at = _emit_fused_prologue(put=put, builder=builder, bundles=bundles, rows=rows, registers=registers,
+    at = _emit_fused_prologue(put=put, builder=builder, rows=rows, registers=registers,
                               steps=steps, output_tiles=output_tiles)
+
+    # The transfers each sweep carries: this chunk's down projection weights under the up projection, and the
+    # next chunk's up projection weights under the down. Neither region needs a second buffer, since the sweep
+    # that last read it has closed by the time the transfer fills it.
+    down = _Prefetch(first_row=rows["down"], rows=down_rows, pointer=_WEIGHT_POINTER)
+    following = _Prefetch(first_row=rows["weights"], rows=up_rows, pointer=_WEIGHT_POINTER)
 
     put(offset=at, f=builder.lbegin(chunks))
     at += 1
-    at = _emit_fused_staging(bundles=bundles, at=at, builder=builder, slot=_WEIGHT_SLOT,
-                             first_row=rows["weights"], rows=weight_rows, pointer=_WEIGHT_POINTER)
+    # Collects the up projection's weights, which landed under the last chunk's down projection.
+    put(offset=at, f=builder.flush_slot(mask=following.mask))
+    at += 1
     at = _emit_fused_clear(put=put, builder=builder, at=at, tiles=registers.hidden, zero=rows["zero"])
 
-    # The up projection. One step body serves every contraction tile, its weights read a step ahead so the
-    # body opens on the weight load.
-    at = _emit_fused_tile(put=put, builder=builder, at=at, first=registers.weight, row=rows["weights"])
-    put(offset=at, f=builder.lbegin(steps))
-    at += 1
-    at = _emit_fused_product(
-        put=put, builder=builder, at=at, registers=registers, close_loop=True,
-        pushed=registers.staged, accumulators=registers.hidden,
-        operands=lambda offset: _emit_fused_operands(put=put, builder=builder, at=offset,
-                                                     tiles=registers.staged, row=rows["input"],
-                                                     shift=_BLOCK_SHIFT),
-        prefetch=lambda vreg: builder.vld(vreg=registers.weight + vreg,
-                                          row=rows["weights"] + _TILE + _NUM_SUBLANES * vreg,
-                                          agu=True, shift=_TILE_SHIFT, level=_INNER_LEVEL))
+    at = _emit_fused_sweep(put=put, builder=builder, at=at, registers=registers, trips=steps,
+                           weight_row=rows["weights"], operand_row=rows["input"],
+                           operand_tiles=registers.staged, pushed=registers.staged,
+                           accumulators=registers.hidden, drain=False, prefetch=down)
+    at = down.finish(put=put, builder=builder, at=at, wait=True)
 
     # Activates ahead of the output loop, a vgelu inside it rewriting the chunk once per tile.
     for tile in registers.hidden:
@@ -591,27 +676,19 @@ def fused_ffn(*, chunks: int, steps: int, output_tiles: int) -> tuple[dict[int, 
             at += 1
 
     # The down projection, the activated chunk pushed once per output tile against a weight tile of its own.
-    at = _emit_fused_tile(put=put, builder=builder, at=at, first=registers.weight, row=rows["down"])
-    put(offset=at, f=builder.lbegin(output_tiles))
-    at += 1
-    at = _emit_fused_product(
-        put=put, builder=builder, at=at, registers=registers, close_loop=False,
-        pushed=registers.hidden, accumulators=registers.output,
-        operands=lambda offset: _emit_fused_operands(put=put, builder=builder, at=offset,
-                                                     tiles=registers.output, row=rows["output"],
-                                                     shift=_BLOCK_SHIFT),
-        prefetch=lambda vreg: builder.vld(vreg=registers.weight + vreg,
-                                          row=rows["down"] + _TILE + _NUM_SUBLANES * vreg,
-                                          agu=True, shift=_TILE_SHIFT, level=_INNER_LEVEL))
-    at = _emit_fused_operands(put=put, builder=builder, at=at, tiles=registers.output, row=rows["output"],
-                              shift=_BLOCK_SHIFT, store=True)
-    put(offset=at - 1, f=builder.loop_end())
+    at = _emit_fused_sweep(put=put, builder=builder, at=at, registers=registers, trips=output_tiles,
+                           weight_row=rows["down"], operand_row=rows["output"],
+                           operand_tiles=registers.output, pushed=registers.hidden,
+                           accumulators=registers.output, drain=True, prefetch=following)
+    at = following.finish(put=put, builder=builder, at=at, wait=False)
     put(offset=at, f=builder.loop_end())
     at += 1
+    # Collects the read-ahead the last chunk issued into the padding, whose slots the drain reuses.
+    put(offset=at, f=builder.flush_slot(mask=following.mask))
+    at += 1
 
-    at = _emit_fused_staging(bundles=bundles, at=at, builder=builder, slot=_INPUT_SLOT,
-                             first_row=rows["output"], rows=output_tiles * _BLOCK_TOKENS,
-                             pointer=_DRAIN_POINTER, store=True)
+    at = _Prefetch(first_row=rows["output"], rows=output_tiles * _BLOCK_TOKENS, pointer=_DRAIN_POINTER,
+                   store=True).finish(put=put, builder=builder, at=at, wait=True)
     put(offset=at, f=builder.halt())
     at += 1
 
@@ -1076,14 +1153,13 @@ def _fused_vmem_map(*, steps: int, output_tiles: int) -> dict[str, int]:
 
 
 def _emit_fused_prologue(*, put: Callable[..., None], builder: asm_module.AsmBuilder,
-                         bundles: dict[int, dict[str, int]], rows: dict[str, int],
-                         registers: FusedRegisterMap, steps: int, output_tiles: int) -> int:
-    """Binds the launch arguments, stages the input once and clears the output in VMEM.
+                         rows: dict[str, int], registers: FusedRegisterMap, steps: int,
+                         output_tiles: int) -> int:
+    """Binds the launch arguments, stages the input and the first weights, and clears the output in VMEM.
 
     Args:
         put: Merges slot words into the bundle at one offset.
         builder: Encodes each slot word.
-        bundles: The bundles placed so far, which the descriptors are written into directly.
         rows: First VMEM row of each region the layer stages.
         registers: Where the layer's tiles live.
         steps: Tiles the up projection's contraction covers.
@@ -1093,25 +1169,31 @@ def _emit_fused_prologue(*, put: Callable[..., None], builder: asm_module.AsmBui
         The next free bundle offset.
     """
     at = 0
-    bundles[at] = {"s": builder.smovi(rd=_STRIDE_REGISTER, value=_ROW_BYTES)}
+    put(offset=at, s=builder.smovi(rd=_STRIDE_REGISTER, value=_ROW_BYTES))
     at += 1
-    bundles[at] = {"s": builder.smov_arg(rd=_DRAIN_POINTER, arg=2)}
+    put(offset=at, s=builder.smov_arg(rd=_DRAIN_POINTER, arg=2))
     at += 1 + _SCALAR_GAP - 1
-    bundles[at] = {"d": builder.dma_load(slot=0, vmem_address=rows["zero"], rows=_ZERO_ROWS,
-                                         base_sreg=_DRAIN_POINTER, stride_sreg=_STRIDE_REGISTER)}
+    put(offset=at, d=builder.dma_load(slot=0, vmem_address=rows["zero"], rows=_ZERO_ROWS,
+                                      base_sreg=_DRAIN_POINTER, stride_sreg=_STRIDE_REGISTER))
     at += 1
-    bundles[at] = {"f": builder.flush_slot(mask=1)}
+    put(offset=at, f=builder.flush_slot(mask=1))
     at += 1
-    bundles[at] = {"s": builder.smov_arg(rd=_INPUT_POINTER, arg=0)}
+    put(offset=at, s=builder.smov_arg(rd=_INPUT_POINTER, arg=0))
     at += 1
-    bundles[at] = {"s": builder.smov_arg(rd=_WEIGHT_POINTER, arg=1)}
+    put(offset=at, s=builder.smov_arg(rd=_WEIGHT_POINTER, arg=1))
     at += 1
-    bundles[at] = {"s": builder.saddi(rd=_DRAIN_POINTER, rs=_DRAIN_POINTER, value=_ZERO_TILE_BYTES)}
+    put(offset=at, s=builder.saddi(rd=_DRAIN_POINTER, rs=_DRAIN_POINTER, value=_ZERO_TILE_BYTES))
     at += 1 + _SCALAR_GAP - 1
 
     # Stages the input once, every hidden chunk contracting the same tokens.
-    at = _emit_fused_staging(bundles=bundles, at=at, builder=builder, slot=_INPUT_SLOT,
-                             first_row=rows["input"], rows=steps * _BLOCK_TOKENS, pointer=_INPUT_POINTER)
+    at = _Prefetch(first_row=rows["input"], rows=steps * _BLOCK_TOKENS,
+                   pointer=_INPUT_POINTER).finish(put=put, builder=builder, at=at, wait=True)
+    # Stages the weights the first chunk opens on, which no sweep stands before to carry. This one is left
+    # unwaited: a flush consumes the slot's done bit, so the chunk loop's own flush has to be the one to take
+    # it, whether the transfer it collects came from here or from the chunk before.
+    at = _Prefetch(first_row=rows["weights"], rows=steps * _TILE,
+                   pointer=_WEIGHT_POINTER).finish(put=put, builder=builder, at=at, wait=False)
+
     at = _emit_fused_clear(put=put, builder=builder, at=at, tiles=registers.output, zero=rows["zero"])
     put(offset=at, f=builder.lbegin(output_tiles))
     at += 1
@@ -1123,40 +1205,75 @@ def _emit_fused_prologue(*, put: Callable[..., None], builder: asm_module.AsmBui
     return at
 
 
-def _emit_fused_staging(*, bundles: dict[int, dict[str, int]], at: int, builder: asm_module.AsmBuilder,
-                        slot: int, first_row: int, rows: int, pointer: int, store: bool = False) -> int:
-    """Moves the given rows, splitting them over descriptors and holding one per slot in flight.
+def _emit_fused_sweep(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int,
+                      registers: FusedRegisterMap, trips: int, weight_row: int, operand_row: int,
+                      operand_tiles: tuple[int, ...], pushed: tuple[int, ...],
+                      accumulators: tuple[int, ...], drain: bool, prefetch: _Prefetch) -> int:
+    """Emits one product as rolled loops, split so the prefetch has an issue point before each.
 
-    A transfer wider than the descriptor's row field is split over several, each waited on before the slot it
-    rides is reused. Each pointer advance follows the descriptor that reads it, the scalar unit taking two
-    bundles to write back and interlocking nothing.
+    Notes:
+        The splits exist for the prefetch alone, a descriptor's VMEM address being an immediate no loop can
+        walk. Each split's immediates carry the tiles the splits before it covered, the AGU index restarting at
+        zero inside every one, and a split opens on the weight tile its predecessor's last iteration read ahead.
 
     Args:
-        bundles: The bundles placed so far, which the descriptors are written into directly.
-        at: The bundle offset the first descriptor occupies.
+        put: Merges slot words into the bundle at one offset.
         builder: Encodes each slot word.
-        slot: Descriptor slot every one of the transfer's descriptors rides.
-        first_row: First VMEM row the transfer covers.
-        rows: Rows the transfer moves.
-        pointer: Scalar register holding the host address.
-        store: Determines whether the transfer writes host memory rather than reading it.
+        at: The bundle offset the first weight load occupies.
+        registers: Where the layer's tiles live.
+        trips: Tiles the product sweeps, split between the loops this emits.
+        weight_row: First VMEM row the product's weights occupy.
+        operand_row: First VMEM row the tiles each iteration reads occupy.
+        operand_tiles: First register of each token group's operand tile.
+        pushed: First register of each token group's pushed tile.
+        accumulators: First register of each token group's accumulator.
+        drain: Determines whether each iteration writes its accumulators back to VMEM, which the output sweep
+            does and the hidden sweep, holding its chunk in registers for the activation, does not.
+        prefetch: The transfer the splits carry, one descriptor per slot before each.
 
     Returns:
         The next free bundle offset.
     """
-    moved = 0
-    while moved < rows:
-        span = min(rows - moved, _MAX_DESCRIPTOR_ROWS)
-        issue = builder.dma_store if store else builder.dma_load
-        bundles[at] = {"d": issue(slot=slot, vmem_address=first_row + moved, rows=span,
-                                  base_sreg=pointer, stride_sreg=_STRIDE_REGISTER)}
+    splits = _staging_splits(trips=trips, rows=prefetch.rows)
+    per_split = trips // splits
+    at = _emit_fused_tile(put=put, builder=builder, at=at, first=registers.weight, row=weight_row)
+    for split in range(splits):
+        at = prefetch.issue(put=put, builder=builder, at=at)
+        covered = split * per_split
+        put(offset=at, f=builder.lbegin(per_split))
         at += 1
-        bundles[at] = {"s": builder.saddi(rd=pointer, rs=pointer, value=span * _ROW_BYTES)}
-        at += 1 + _SCALAR_GAP - 1
-        bundles[at] = {"f": builder.flush_slot(mask=1 << slot)}
-        at += 1
-        moved += span
+        at = _emit_fused_product(
+            put=put, builder=builder, at=at, registers=registers, close_loop=not drain,
+            pushed=pushed, accumulators=accumulators,
+            operands=lambda offset, covered=covered: _emit_fused_operands(
+                put=put, builder=builder, at=offset, tiles=operand_tiles,
+                row=operand_row + covered * _BLOCK_TOKENS, shift=_BLOCK_SHIFT),
+            prefetch=lambda vreg, covered=covered: builder.vld(
+                vreg=registers.weight + vreg,
+                row=weight_row + (covered + 1) * _TILE + _NUM_SUBLANES * vreg,
+                agu=True, shift=_TILE_SHIFT, level=_INNER_LEVEL))
+        if drain:
+            at = _emit_fused_operands(put=put, builder=builder, at=at, tiles=operand_tiles,
+                                      row=operand_row + covered * _BLOCK_TOKENS, shift=_BLOCK_SHIFT,
+                                      store=True)
+            put(offset=at - 1, f=builder.loop_end())
     return at
+
+
+def _staging_splits(*, trips: int, rows: int) -> int:
+    """Returns the loops a sweep splits into so every descriptor of a transfer has an issue point.
+
+    Args:
+        trips: Tiles the sweep covers, which the splits divide between them.
+        rows: Rows the transfer riding the sweep moves.
+
+    Returns:
+        The smallest divisor of the trip count holding one issue point per slot-full of descriptors, or the
+        trip count itself when no divisor is large enough and the remainder blocks.
+    """
+    descriptors = -(-rows // _MAX_DESCRIPTOR_ROWS)
+    needed = -(-descriptors // asm_module.DMA_SLOT_COUNT)
+    return next((splits for splits in range(needed, trips + 1) if not trips % splits), trips)
 
 
 def _emit_fused_clear(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int,

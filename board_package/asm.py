@@ -180,75 +180,6 @@ _X_ROW_W: int = 13
 assert _DELAY_SHIFT == COMPUTE_RESERVED_W, (
     "compute payload field positions disagree with the slot widths")
 
-def _e_opcodes(*, reads_b: bool | None = None, w: int | None = None) -> set[int]:
-    """Returns the E opcodes matching an operand shape, a writeback offset, or both.
-
-    Args:
-        reads_b: Selects opcodes by whether they read the second source register, or None to ignore it.
-        w: Selects opcodes by writeback offset, or None to ignore it.
-
-    Returns:
-        The matching opcodes.
-    """
-    return {
-        opcode
-        for group in OPERATIONS
-        for opcode in (group["opcodes"] if group["slot"] == "E" else ())
-        if (reads_b is None or ("rb" in group["reads"]) == reads_b)
-        and (w is None or group["w"] == w)
-    }
-
-
-_E_BINARY_OPS: set[int] = _e_opcodes(reads_b=True)
-"""E opcodes reading both source registers."""
-
-_E_ALU_OPS: set[int] = _e_opcodes(w=W_ALU)
-"""E opcodes carrying ALU latency, which adds the unary vmov to the binary set.
-
-vmax and vmin ride the ALU's move stages, so every opcode in the set keeps one latency."""
-
-_E_TXOUT: int = _OPCODES["vtxout"]
-"""E opcode draining the transpose tile, which writes a VREG and reads none."""
-
-_F_FLUSH: int = _OPCODES["flush_slot"]
-"""F opcode blocking until every DMA slot its mask names reports done."""
-
-_E_SFU_OPS: set[int] = _e_opcodes(w=W_SFU)
-"""E opcodes carrying SFU latency, each reading port A alone."""
-
-_E_REDUCE_OPS: set[int] = _e_opcodes(w=W_REDUCE)
-"""E opcodes carrying reduction latency, each reading port A alone."""
-
-_M_OCCUPANCY: dict[int, int] = {_OPCODES[name]: cycles for name, cycles in MATRIX_OCCUPANCY.items()}
-"""Cycles the matrix controller is busy per M subop, keyed by opcode.
-
-A vmatpush retires on beat acceptance, so its entry is the controller's occupancy rather than its result latency."""
-
-_M_HOLDS_PORT_A: set[int] = {_OPCODES[name] for name in MATRIX_PORT_A}
-"""M subops owning VREG read port A while they run, which vmatpop stays out of by never asserting
-vreg_read_valid_o."""
-
-_M_RESULT_LATENCY: int = MATRIX_RESULT_LATENCY
-"""Cycles from a vmatpush to its first result.
-
-Results leave the array in push order and one vmatpop drains exactly one vmatpush's worth, so the wait is tracked
-as a queue where a pop waits for the oldest un-popped push."""
-
-_MXU_OUTPUT_FIFO_DEPTH: int = 32
-"""Entries in each lane's MXU output FIFO, mirroring mxu.sv gen_lane_output's OUTPUT_FIFO_DEPTH.
-
-Overflow drops results silently, with no replay or recovery, as vpu_fifo.sv's header states."""
-
-_MXU_ENTRIES_PER_PUSH: int = 4
-"""Entries one vmatpush produces, being the NUM_SUBLANES activation rows it streams."""
-
-_MXU_ENTRIES_PER_POP: int = 4
-"""Entries one vmatpop consumes across its masked beats."""
-
-_SCHEDULE_CACHE_MAGIC: bytes = b"MTSC1"
-"""Header for a remembered schedule, carrying `MTSC` and a format number so a file written by a different layout is
-rejected rather than misread."""
-
 
 @dataclass
 class AsmBuilder:
@@ -870,6 +801,97 @@ def asm(function: Callable[[], None], *, namespace: str = "asm", placement: str 
     return kernel
 
 
+def check_dma_exclusive(slots: dict[str, int]) -> None:
+    """Rejects a DMA bundle that also names a compute slot.
+
+    Args:
+        slots: The named slots one bundle assembles, keyed by slot letter.
+
+    Raises:
+        ValueError: If the bundle names the D slot together with any compute slot.
+    """
+    if "d" not in slots:
+        return
+    conflicting = sorted(DMA_EXCLUSIVE_SLOTS & set(slots))
+    if conflicting:
+        message = (
+            f"Unable to assemble a D slot co-issued with {conflicting}. The D slot is exclusive, because a DMA "
+            f"bundle encodes a descriptor over the bits a compute bundle spends on those slots. The overlap "
+            f"corrupts the descriptor or drops the slot, silently in both cases. Emit the DMA in its own bundle."
+        )
+        raise ValueError(message)
+
+
+def _e_opcodes(*, reads_b: bool | None = None, w: int | None = None) -> set[int]:
+    """Returns the E opcodes matching an operand shape, a writeback offset, or both.
+
+    Args:
+        reads_b: Selects opcodes by whether they read the second source register, or None to ignore it.
+        w: Selects opcodes by writeback offset, or None to ignore it.
+
+    Returns:
+        The matching opcodes.
+    """
+    return {
+        opcode
+        for group in OPERATIONS
+        for opcode in (group["opcodes"] if group["slot"] == "E" else ())
+        if (reads_b is None or ("rb" in group["reads"]) == reads_b)
+        and (w is None or group["w"] == w)
+    }
+
+
+_E_BINARY_OPS: set[int] = _e_opcodes(reads_b=True)
+"""E opcodes reading both source registers."""
+
+_E_ALU_OPS: set[int] = _e_opcodes(w=W_ALU)
+"""E opcodes carrying ALU latency, which adds the unary vmov to the binary set.
+
+vmax and vmin ride the ALU's move stages, so every opcode in the set keeps one latency."""
+
+_E_TXOUT: int = _OPCODES["vtxout"]
+"""E opcode draining the transpose tile, which writes a VREG and reads none."""
+
+_F_FLUSH: int = _OPCODES["flush_slot"]
+"""F opcode blocking until every DMA slot its mask names reports done."""
+
+_E_SFU_OPS: set[int] = _e_opcodes(w=W_SFU)
+"""E opcodes carrying SFU latency, each reading port A alone."""
+
+_E_REDUCE_OPS: set[int] = _e_opcodes(w=W_REDUCE)
+"""E opcodes carrying reduction latency, each reading port A alone."""
+
+_M_OCCUPANCY: dict[int, int] = {_OPCODES[name]: cycles for name, cycles in MATRIX_OCCUPANCY.items()}
+"""Cycles the matrix controller is busy per M subop, keyed by opcode.
+
+A vmatpush retires on beat acceptance, so its entry is the controller's occupancy rather than its result latency."""
+
+_M_HOLDS_PORT_A: set[int] = {_OPCODES[name] for name in MATRIX_PORT_A}
+"""M subops owning VREG read port A while they run, which vmatpop stays out of by never asserting
+vreg_read_valid_o."""
+
+_M_RESULT_LATENCY: int = MATRIX_RESULT_LATENCY
+"""Cycles from a vmatpush to its first result.
+
+Results leave the array in push order and one vmatpop drains exactly one vmatpush's worth, so the wait is tracked
+as a queue where a pop waits for the oldest un-popped push."""
+
+_MXU_OUTPUT_FIFO_DEPTH: int = 32
+"""Entries in each lane's MXU output FIFO, mirroring mxu.sv gen_lane_output's OUTPUT_FIFO_DEPTH.
+
+Overflow drops results silently, with no replay or recovery, as vpu_fifo.sv's header states."""
+
+_MXU_ENTRIES_PER_PUSH: int = 4
+"""Entries one vmatpush produces, being the NUM_SUBLANES activation rows it streams."""
+
+_MXU_ENTRIES_PER_POP: int = 4
+"""Entries one vmatpop consumes across its masked beats."""
+
+_SCHEDULE_CACHE_MAGIC: bytes = b"MTSC1"
+"""Header for a remembered schedule, carrying `MTSC` and a format number so a file written by a different layout is
+rejected rather than misread."""
+
+
 def _bundle(value: int) -> int:
     """Validates that one assembled word fits a physical bundle.
 
@@ -901,27 +923,6 @@ def _is_halt(word: int) -> bool:
         True when the word is the halt bundle.
     """
     return word == HALT_BUNDLE
-
-
-def check_dma_exclusive(slots: dict[str, int]) -> None:
-    """Rejects a DMA bundle that also names a compute slot.
-
-    Args:
-        slots: The named slots one bundle assembles, keyed by slot letter.
-
-    Raises:
-        ValueError: If the bundle names the D slot together with any compute slot.
-    """
-    if "d" not in slots:
-        return
-    conflicting = sorted(DMA_EXCLUSIVE_SLOTS & set(slots))
-    if conflicting:
-        message = (
-            f"Unable to assemble a D slot co-issued with {conflicting}. The D slot is exclusive, because a DMA "
-            f"bundle encodes a descriptor over the bits a compute bundle spends on those slots. The overlap "
-            f"corrupts the descriptor or drops the slot, silently in both cases. Emit the DMA in its own bundle."
-        )
-        raise ValueError(message)
 
 
 def _compute_s(rd: int, rs: int, *, op: int, imm: int = 0) -> int:

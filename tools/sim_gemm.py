@@ -82,22 +82,6 @@ def simulate(*, launch: Launch, reduction: int, build_dir: str | None = None,
     return float(np.abs(product - expected).max() / np.abs(expected).max())
 
 
-def _issued(*, order: str, tokens: int, columns: int) -> list[tuple[int, int]]:
-    """Returns every launch a host issues, as its token block and column block, in the order the kernel walks them.
-
-    Args:
-        order: The output axes the kernel walks, outermost first, as the entry point packed them.
-        tokens: Token blocks the product covers.
-        columns: Column blocks one token block is issued against.
-
-    Returns:
-        The token block and column block of each launch, in issue order.
-    """
-    if order.startswith("n"):
-        return [(token, column) for column in range(columns) for token in range(tokens)]
-    return [(token, column) for token in range(tokens) for column in range(columns)]
-
-
 def simulate_compiled(*, image: bytes, operands: np.lib.npyio.NpzFile, build_dir: str | None = None,
                       max_cycles: int | None = None) -> float:
     """Runs a compiled image against the RTL once per token block and returns its error.
@@ -137,6 +121,22 @@ def simulate_compiled(*, image: bytes, operands: np.lib.npyio.NpzFile, build_dir
         product[token * block_rows : (token + 1) * block_rows,
                 column * block_columns : (column + 1) * block_columns] = piece
     return float(np.abs(product - expected).max() / np.abs(expected).max())
+
+
+def _issued(*, order: str, tokens: int, columns: int) -> list[tuple[int, int]]:
+    """Returns every launch a host issues, as its token block and column block, in the order the kernel walks them.
+
+    Args:
+        order: The output axes the kernel walks, outermost first, as the entry point packed them.
+        tokens: Token blocks the product covers.
+        columns: Column blocks one token block is issued against.
+
+    Returns:
+        The token block and column block of each launch, in issue order.
+    """
+    if order.startswith("n"):
+        return [(token, column) for column in range(columns) for token in range(tokens)]
+    return [(token, column) for token in range(tokens) for column in range(columns)]
 
 
 def _run_image(*, image: bytes, activations: bytes, weights: bytes, drain_bytes: int,

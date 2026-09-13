@@ -23,7 +23,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE / "minitpu_runtime"))
 
-from bf16 import (  # noqa: E402,F401  -- re-exported: the operand tests import them from here
+from bf16 import (  # noqa: E402,F401  (re-exported, the operand tests importing them from here)
     MAX_ATTENTION_ROWS,
     _BLOCK_ACTIVATION_BYTES,
     _BLOCK_DEPTH,
@@ -108,6 +108,158 @@ _ATTENTION_ERROR_LIMIT: float = 0.02
 _BLOCK_ERROR_LIMIT: float = 0.05
 
 
+_TENSOR_POOL: dict[tuple[int, int], list[int]] = {}
+"""Freed tensors waiting to be handed out again, keyed by shape. A launch reads a drain buffer's clearing tile
+and never writes it, so a reused buffer needs no re-zeroing, which is the copy the pool saves."""
+
+
+_RESIDENT_IMAGES: dict[bytes, int] = {}
+"""What each kernel base currently holds, so relaunching an unchanged image copies nothing. Sound only while
+every launch in the process stages through `_stage_image`, which a program mixing in a runtime-staged kernel
+would not, and the cache would then belong in the runtime instead."""
+
+
+_KERNEL_CACHE: dict[tuple, tuple] = {}
+"""Assembled kernels and their serialised images, keyed by the arguments that built them, serialising alone
+having measured 36.8 ms of a 47.4 ms fully resident launch. The key is the arguments rather than the kernel:
+`id` is reused once CPython collects the object, which handed a dead kernel's image to a later one, and a frozen
+dataclass cannot be memoised on."""
+
+
+_ATTENTION_MASKS: dict[tuple, DeviceTensor] = {}
+"""Additive attention masks, keyed by shape. A mask is a constant of a shape rather than of a layer, so one
+serves every layer and is built once."""
+
+
+_GROUPED_OPERANDS: dict[tuple, tuple] = {}
+"""Attention's per-head operands, keyed by shape. Every layer's scatter overwrites them, so one set serves every
+layer and is zeroed once."""
+
+
+class ResidentWeights:
+    """A packed weight matrix that lives in DMEM across launches.
+
+    Notes:
+        Re-deriving the device layout on every call costs 72.7 ms of a 168 ms launch, and the weights do not
+        change between tokens. Device allocations outlive a launch already, `minitpuHostReset` resetting only
+        the host udmabuf, so residency needed somewhere to keep the address and nothing more.
+
+    Attributes:
+        address: Device address the packed matrix starts at, or None once freed.
+        depth: Contraction the matrix walks.
+        columns: Columns the matrix covers.
+        nbytes: Bytes the packed matrix occupies.
+    """
+
+    def __init__(self, address: int, depth: int, columns: int, nbytes: int) -> None:
+        self.address = address
+        self.depth = depth
+        self.columns = columns
+        self.nbytes = nbytes
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (self.depth, self.columns)
+
+    def free(self) -> None:
+        """Releases the DMEM this holds."""
+        if self.address is not None:
+            minitpuFree(self.address)
+            self.address = None
+
+
+class DeviceTensor:
+    """Packed activations living in DMEM, in the layout a fused GEMM already drains.
+
+    Notes:
+        A fused launch writes [column_tiles, BLOCK_TOKENS, TILE], which is the layout `pack_activations`
+        produces, so a product is already the next launch's packed left operand with nothing to repack. The
+        layout is block major rather than one array with a token axis, which is what leaves a block's operand
+        and its output each a plain offset from the base. Every block is headed by its own zeroed clearing tile,
+        a launch loading that tile from the drain pointer it is given.
+
+    Attributes:
+        base: Device address the tensor starts at.
+        tokens: Token rows the tensor holds, a whole number of blocks.
+        features: Features each token row carries.
+    """
+
+    def __init__(self, base: int, tokens: int, features: int) -> None:
+        self.base = base
+        self.tokens = tokens
+        self.features = features
+
+    @property
+    def blocks(self) -> int:
+        return self.tokens // _BLOCK_TOKENS
+
+    @property
+    def block_bytes(self) -> int:
+        """One block's clearing tile plus its packed rows."""
+        return _ZERO_TILE_BYTES + _BLOCK_TOKENS * self.features * _ELEMENT_BYTES
+
+    def d_drain(self, block: int) -> int:
+        """The address a launch binds as its drain argument for one block."""
+        return self.base + block * self.block_bytes
+
+    def operand(self, block: int) -> int:
+        """The address a launch binds as its activation argument for one block."""
+        return self.d_drain(block) + _ZERO_TILE_BYTES
+
+    @property
+    def address(self) -> int:
+        return self.operand(0)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (self.tokens, self.features)
+
+    @property
+    def nbytes(self) -> int:
+        return self.blocks * self.block_bytes
+
+    def free(self) -> None:
+        """Returns this tensor to the pool for reuse.
+
+        Notes:
+            Not a `minitpuFree`: a clearing tile is read by a launch and never written by one, so a buffer
+            of the same shape is handed straight back out with its tile still zeroed, which saves a host
+            copy per allocation.
+        """
+        if self.base is not None:
+            _TENSOR_POOL.setdefault((self.tokens, self.features), []).append(self.base)
+            self.base = None
+
+
+class DeviceTensorSlice:
+    """A contiguous feature range of a packed tensor, addressed in ITS blocks.
+
+    Notes:
+        A block is `[features / TILE, BLOCK_TOKENS, TILE]`, so a range of feature tiles is a contiguous run
+        at a plain offset and splitting a fused QKV projection into thirds copies nothing. This is a view
+        rather than a `DeviceTensor` because a tensor derives its block stride from its own feature count,
+        while a slice must keep the parent's.
+
+    Attributes:
+        tokens: Token rows the slice covers, being the parent's.
+        features: Features the slice spans.
+    """
+
+    def __init__(self, d_parent: DeviceTensor, first_tile: int, features: int) -> None:
+        self._d_parent = d_parent
+        self._offset = first_tile * _BLOCK_TOKENS * _TILE * _ELEMENT_BYTES
+        self.tokens = d_parent.tokens
+        self.features = features
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (self.tokens, self.features)
+
+    def operand(self, block: int) -> int:
+        """The address a launch binds as its activation argument for one block."""
+        return self._d_parent.operand(block) + self._offset
+
+
 def layernorm_reference(
     rows: NDArray[np.float32], gamma: NDArray[np.float32], beta: NDArray[np.float32]
 ) -> NDArray[np.float32]:
@@ -148,37 +300,6 @@ def softmax_reference(scores: NDArray[np.float32]) -> NDArray[np.float32]:
     weights = _on_bf16_grid(values=np.exp(shifted, dtype=np.float32))
     totals = _on_bf16_grid(values=weights.sum(axis=1, keepdims=True, dtype=np.float32))
     return _on_bf16_grid(values=weights * _on_bf16_grid(values=1.0 / totals))
-
-
-class ResidentWeights:
-    """A packed weight matrix that lives in DMEM across launches.
-
-    `full_gemm` used to take fp32 numpy and re-derive the device's layout on every
-    call: `pack_weights` alone measures 72.7 ms of a 168 ms launch, and a decode
-    token re-packs all 85 M parameters of GPT-2's body because nothing survives
-    the call. The weights do not change between tokens, so this uploads them once.
-
-    Device allocations outlive a launch already -- `minitpuHostReset` resets only
-    the host udmabuf, and the device pool is rebuilt only if the address space
-    changes -- so residency needed no runtime change, just somewhere to keep the
-    address.
-    """
-
-    def __init__(self, address: int, depth: int, columns: int, nbytes: int) -> None:
-        self.address = address
-        self.depth = depth
-        self.columns = columns
-        self.nbytes = nbytes
-
-    @property
-    def shape(self) -> tuple[int, int]:
-        return (self.depth, self.columns)
-
-    def free(self) -> None:
-        """Releases the DMEM this holds."""
-        if self.address is not None:
-            minitpuFree(self.address)
-            self.address = None
 
 
 def upload_weights(h_weights: NDArray[np.float32]) -> ResidentWeights:
@@ -225,283 +346,17 @@ def upload_bias(h_bias: NDArray[np.float32]) -> ResidentWeights:
                            nbytes=words.nbytes)
 
 
-#: What is currently staged at the kernel base, so an unchanged image is not
-#: re-copied. The staging address is fixed, so re-launching the same kernel only
-#: needs the COPY when something else has been staged since.
-#:
-#: Sound only while every launch in the process stages through `_stage_image`.
-#: Every driver in this module does. A program that also runs a decorated kernel
-#: from `run_example_kernel.py`, which stages its own image through the runtime, would
-#: leave this stale -- so the cache belongs in the runtime rather than here once
-#: anything needs to mix the two.
-_RESIDENT_IMAGES: dict[bytes, int] = {}
-
-
-#: Assembled kernels and their serialised images, keyed by the arguments that
-#: built them. `MinitpuKernel.image.to_bytes` rebuilds the byte string bundle by
-#: bundle, and it measured 36.8 ms of a 47.4 ms fully-resident launch -- the
-#: largest single cost left once the weights, the activations and the staged image
-#: all stopped being re-derived. Building the kernel is not free either, and
-#: `build_softmax_rows` and `build_layernorm_rows` did it on every call.
-#:
-#: Keyed by build arguments rather than by the kernel object. Two earlier attempts
-#: were unsound: `id(kernel)` is reused once CPython collects the object, so a
-#: dead softmax kernel handed its image to a later layernorm and the chat emitted
-#: token 0 forever -- while all fourteen board checks passed, because they reuse
-#: kernels that never die. Memoising ON the kernel fails outright, since it is a
-#: frozen dataclass. The arguments are the identity.
-_KERNEL_CACHE: dict[tuple, tuple] = {}
-
-
-def _image_of(kernel) -> bytes:
-    """Serialises a kernel, without caching.
-
-    Only the module-level kernels reach this, and only from the launch-path
-    checks, which run once. Every hot path goes through `_kernel_and_image`
-    instead, which keys on the arguments that built the kernel rather than on the
-    object -- see the note above for why the object is the wrong key.
-
-    Args:
-        kernel: An assembled kernel.
-
-    Returns:
-        Its padded byte image.
-    """
-    return bytes(kernel.image.to_bytes(pad_to=4))
-
-
-def _kernel_and_image(key: tuple, build) -> tuple:
-    """Returns an assembled kernel and its serialised image, building each once.
-
-    Args:
-        key: The build arguments, which identify the kernel.
-        build: Builds it when the key is new.
-
-    Returns:
-        The (kernel, image bytes) pair.
-    """
-    cached = _KERNEL_CACHE.get(key)
-    if cached is None:
-        kernel = build()
-        cached = (kernel, bytes(kernel.image.to_bytes(pad_to=4)))
-        _KERNEL_CACHE[key] = cached
-    return cached
-
-
-def _stage_image(image_bytes: bytes) -> int:
-    """Makes a kernel image resident in DMEM, once, and returns its address.
-
-    Args:
-        image_bytes: The assembled image.
-
-    Returns:
-        The DMEM address it is resident at, to pass as `kbin_addr`.
-    """
-    resident = _RESIDENT_IMAGES.get(image_bytes)
-    if resident is not None:
-        return resident
-    # Its own address, not the shared staging one. `minitpuLaunchKernel` takes
-    # kbin_addr as "the device-memory base of the kernel binary" and asks only for
-    # 32-byte alignment, which the allocator already gives -- nothing requires the
-    # image to live at `kernel_base`. Staging every kernel at one address is what
-    # made a layer restage on all eighteen launches, at 1.35 ms of COPY each.
-    address = minitpuMalloc(len(image_bytes))
-    host = minitpuHostAlloc(len(image_bytes))
-    host.view[: len(image_bytes) // 4] = np.frombuffer(image_bytes, dtype="<u4")
-    minitpuMemcpy(address, host, len(image_bytes), MemcpyKind.HostToDevice)
-    _RESIDENT_IMAGES[image_bytes] = address
-    return address
-
-
-class DeviceTensor:
-    """Packed activations living in DMEM, in the layout the GEMM already produces.
-
-    The point of this type is that a product never has to reach the host to be
-    usable. With `fuse_groups`, a GEMM drains one tile per output column tile, so
-    one launch writes [column_tiles, BLOCK_TOKENS, TILE] -- and `pack_activations`
-    orders a block's result [depth/TILE, BLOCK_TOKENS, TILE]. Those are the SAME
-    layout, so a fused product is already the next launch's packed left operand,
-    with nothing to transpose, repack or copy. The host's reshape in `full_gemm`
-    exists only to hand a caller a row-major numpy array.
-
-    The layout is BLOCK-MAJOR: a tensor of more than `_BLOCK_TOKENS` rows is a
-    sequence of independent per-block buffers, not one array with a token axis.
-    That is what makes a block's operand and its output both a plain linear offset
-    from the base -- interleaving them into a single token axis would leave
-    neither addressable by pointer arithmetic, because a launch writes its column
-    tiles consecutively.
-
-    Every block is headed by its own zeroed clearing tile, because a launch loads
-    that tile from the drain pointer it is given -- so block 1's pointer must find
-    zeros there, not block 0's results. That makes each block a uniform region and
-    keeps both offsets a multiple of one stride.
-    """
-
-    def __init__(self, base: int, tokens: int, features: int) -> None:
-        self.base = base
-        self.tokens = tokens
-        self.features = features
-
-    @property
-    def blocks(self) -> int:
-        return self.tokens // _BLOCK_TOKENS
-
-    @property
-    def block_bytes(self) -> int:
-        """One block's clearing tile plus its packed rows."""
-        return _ZERO_TILE_BYTES + _BLOCK_TOKENS * self.features * _ELEMENT_BYTES
-
-    def d_drain(self, block: int) -> int:
-        """The address a launch binds as its drain argument for one block."""
-        return self.base + block * self.block_bytes
-
-    def operand(self, block: int) -> int:
-        """The address a launch binds as its activation argument for one block."""
-        return self.d_drain(block) + _ZERO_TILE_BYTES
-
-    @property
-    def address(self) -> int:
-        return self.operand(0)
-
-    @property
-    def shape(self) -> tuple[int, int]:
-        return (self.tokens, self.features)
-
-    @property
-    def nbytes(self) -> int:
-        return self.blocks * self.block_bytes
-
-    def free(self) -> None:
-        """Returns this tensor to the pool for reuse.
-
-        Not a `minitpuFree`: a tensor's clearing tile is read by a launch and never
-        written by one, so a buffer of the same shape can be handed straight back
-        out with its tile still zeroed. Zeroing it costs a host-to-device copy per
-        allocation, and a layer allocates one per GEMM and per add.
-        """
-        if self.base is not None:
-            _TENSOR_POOL.setdefault((self.tokens, self.features), []).append(self.base)
-            self.base = None
-
-
-#: Freed tensors, keyed by shape, waiting to be handed out again. A launch reads
-#: a drain buffer's clearing tile and never writes it, so a reused buffer needs no
-#: re-zeroing -- which is what makes the pool worth having, since zeroing is a
-#: host-to-device copy and a layer allocates one buffer per GEMM and per add.
-_TENSOR_POOL: dict[tuple[int, int], list[int]] = {}
-
-
-class DeviceTensorSlice:
-    """A contiguous feature range of a packed tensor, addressed in ITS blocks.
-
-    The fused QKV projection is one `[tokens, 3 * model]` tensor and attention wants
-    its three thirds separately. In the packed layout a block is
-    `[features / TILE, BLOCK_TOKENS, TILE]`, so a range of feature tiles is a
-    contiguous run starting at a plain offset -- splitting Q, K and V is pointer
-    arithmetic and copies nothing.
-
-    This is a view rather than a `DeviceTensor` because a tensor derives its block
-    stride from its own feature count, and a slice must keep the PARENT's stride:
-    the blocks it lives in are the parent's blocks, spaced by the parent's width.
-    """
-
-    def __init__(self, d_parent: DeviceTensor, first_tile: int, features: int) -> None:
-        self._d_parent = d_parent
-        self._offset = first_tile * _BLOCK_TOKENS * _TILE * _ELEMENT_BYTES
-        self.tokens = d_parent.tokens
-        self.features = features
-
-    @property
-    def shape(self) -> tuple[int, int]:
-        return (self.tokens, self.features)
-
-    def operand(self, block: int) -> int:
-        """The address a launch binds as its activation argument for one block."""
-        return self._d_parent.operand(block) + self._offset
-
-
-# Host staging is a fresh `minitpuHostAlloc` per call, deliberately. It is a bump
-# allocator with no per-region free (v1 by design), so a long-lived process that
-# sweeps many shapes will exhaust its 16 MiB udmabuf, which is why a benchmark
-# takes one shape per process.
-#
-# Caching and reusing one region per role does not work. Two things break it. A cached region does not survive
-# `minitpuHostReset`, which the drivers call and which drops the udmabuf out from under every region carved from it. The
-# helper also cannot bind a device of its own without rebinding one in the middle of whatever sequence its caller was
-# running. Both show up as `instr_ready` never returning, the device left mid-command, rather than as a wrong answer,
-# and
-# the second attempt took the board from 6 of 16 to 0 of 16. The fix belongs in the
-# allocator, as a real per-region free, not in a cache layered over one that has none.
-
-
 def reset_host_staging() -> None:
-    """Returns the pinned staging arena to empty. Safe only when nothing is live.
+    """Returns the pinned staging arena to empty, which is safe only when nothing is live.
 
-    Rewinds the bump offset rather than dropping the buffer. `minitpuHostReset`
-    unmaps the 16 MiB udmabuf too, so the next allocation re-opens it -- profiled
-    at 1.875 ms a call, 3.7 ms a layer, more than either host-to-device copy the
-    layer makes. Nothing here survives the call that made it, so there is nothing
-    for the weaker guarantee to break.
-
-    `minitpuHostAlloc` is a bump allocator with no per-region free (v1 by design),
-    so every kernel image staged and every operand packed consumes a slice of a
-    16 MiB udmabuf permanently. One forward pass is comfortable; seventeen of them
-    in a process is not, which is what a batch-invariance sweep does.
-
-    Every staging region in this module dies inside the call that made it -- write,
-    copy, done, or copy, read, done -- so between forward passes there is nothing to
-    invalidate. DEVICE allocations are a separate pool and are untouched: the
-    resident weights, the biases, the block-diagonal operands, the LayerNorm
-    constants and the tensor pool all survive.
-
-    What is NOT safe is caching a region ACROSS this call. A reset drops the udmabuf,
-    every region carved from it becomes a view into memory the allocator no longer
-    owns, and handing one to a DMA leaves the core mid-command -- which reads as
-    `instr_ready` never returning rather than as a wrong answer.
+    Notes:
+        This rewinds the bump offset rather than dropping the buffer, `minitpuHostReset` unmapping the udmabuf
+        and costing the next allocation 1.875 ms to re-open it. The weaker guarantee holds because every staging
+        region in this module dies inside the call that made it, and device allocations are a separate pool this
+        does not touch. Caching a region across this call is what is unsafe: the region becomes a view into
+        memory the allocator no longer owns, and handing one to a DMA leaves the core mid-command.
     """
     minitpuHostRewind()
-
-
-def _allocate_tensor(tokens: int, features: int) -> DeviceTensor:
-    """Hands out a drain-shaped DMEM buffer, from the pool when one is waiting.
-
-    The kernel loads its clearing tile from the head of the drain buffer, so those
-    bytes must be zero before the first launch that uses it -- but only ONCE per
-    buffer. A launch reads that tile and never writes it, so a freed buffer comes
-    back with its tile still zeroed and needs neither a malloc nor a copy.
-
-    `DeviceTensor.free` has pushed buffers onto `_TENSOR_POOL` all along and
-    nothing ever took one back off, so every intermediate in every layer was a
-    fresh allocation and a fresh host-to-device zeroing copy: 17 copies a layer
-    that the trace attributed to the layer and that were pure allocation.
-
-    Args:
-        tokens: Rows the buffer holds.
-        features: Columns the buffer holds.
-
-    Returns:
-        The allocated tensor.
-    """
-    if tokens % _BLOCK_TOKENS:
-        message = (
-            f"Unable to hold {tokens} rows in DMEM. A tensor is a whole number of "
-            f"{_BLOCK_TOKENS}-row blocks, which is what one launch covers."
-        )
-        raise ValueError(message)
-    waiting = _TENSOR_POOL.get((tokens, features))
-    if waiting:
-        return DeviceTensor(base=waiting.pop(), tokens=tokens, features=features)
-
-    # Allocating and zeroing both need a bound device, and a caller may reach this
-    # before any launch has bound one.
-    minitpuSetDevice(single_halt.uio_name)
-    tensor = DeviceTensor(base=0, tokens=tokens, features=features)
-    tensor.base = minitpuMalloc(tensor.nbytes)
-    host = minitpuHostAlloc(_ZERO_TILE_BYTES)
-    host.view.view("<u2")[:_ZERO_TILE_WORDS] = 0
-    for block in range(tensor.blocks):
-        minitpuMemcpy(tensor.d_drain(block), host, _ZERO_TILE_BYTES, MemcpyKind.HostToDevice)
-    return tensor
 
 
 def upload_activations(h_activations: NDArray[np.float32]) -> DeviceTensor:
@@ -550,6 +405,12 @@ def download_activations(d_tensor: DeviceTensor) -> NDArray[np.float32]:
     return h_out
 
 
+# Host staging takes a fresh allocation per call deliberately. The allocator is a bump allocator with no
+# per-region free, so a process sweeping many shapes exhausts its 16 MiB udmabuf and a benchmark takes one
+# shape per process. Caching a region per role does not survive `minitpuHostReset`, which the drivers call
+# and which drops the udmabuf out from under every region carved from it. The fix belongs in the allocator.
+
+
 def upload_layernorm_constants(h_gamma: NDArray[np.float32],
                                h_beta: NDArray[np.float32]) -> int:
     """Uploads one LayerNorm's packed constants and returns their DMEM address.
@@ -574,9 +435,9 @@ def layernorm_resident(d_rows: DeviceTensor, d_constants: int, *,
                        d_out: DeviceTensor | None = None) -> DeviceTensor:
     """Normalises a resident tensor in place of the layout, leaving it resident.
 
-    The kernel reads and writes in the layout a GEMM operand uses, so a normalised
-    tensor feeds the next projection where it lies. It used to come back to PS DDR
-    to be re-packed, purely because its descriptors were set for row-major.
+    Notes:
+        The kernel reads and writes in the layout a GEMM operand uses, so a normalised tensor feeds the next
+        projection where it lies rather than returning to PS DDR to be re-packed.
 
     Args:
         d_rows: [tokens, model] resident rows.
@@ -614,15 +475,10 @@ def transpose_2d(h_matrix: NDArray[np.float32]) -> NDArray[np.float32]:
     """Transposes a whole [rows, columns] array on the device.
 
     Notes:
-        A 16x16 tile of a row-major array is 16 rows at stride `columns / NUM_LANES`,
-        not 16 consecutive rows, so this is the first thing in the package that
-        needs a DMA descriptor stride other than one. Every other kernel here reads
-        consecutive VMEM rows with a full mask.
-
-        Tile (i, j) of the source becomes tile (j, i) of the destination, and that
-        placement is pointer arithmetic: one launch per source tile COLUMN walks
-        that column's tiles with `load_stride = columns / NUM_LANES` and lands them
-        consecutively in the destination row they belong to.
+        A tile of a row-major array is 16 rows at stride `columns / NUM_LANES` rather than 16 consecutive
+        ones, which is the only descriptor stride other than one in this package. Tile (i, j) becomes tile
+        (j, i) by pointer arithmetic: one launch per source tile column walks that column at the load stride
+        and lands its tiles consecutively in the destination row they belong to.
 
     Args:
         h_matrix: [rows, columns] host array, both a whole number of `_TILE`.
@@ -662,10 +518,8 @@ def transpose_2d(h_matrix: NDArray[np.float32]) -> NDArray[np.float32]:
         d_out = minitpuMalloc(words.nbytes)
         d_owned.append(d_out)
 
-        # One launch for the whole matrix. The tile-column walk is the kernel's
-        # outer loop now, not the host's: at GPT-2's width this was 48 launches of
-        # a 32-row transpose, and on .193 that made the launch count scale with the
-        # batch at ~51 per sequence per layer, 48 of them here.
+        # One launch for the whole matrix, the tile-column walk being the kernel's outer loop rather than the
+        # host's, which at GPT-2's width was 48 launches of a 32-row transpose.
         minitpuLaunchKernel(d_image, len(image_bytes),
                             args=[d_in, 0, d_out])
         minitpuMemcpy(h_out, d_out, words.nbytes, MemcpyKind.DeviceToHost)
@@ -680,10 +534,9 @@ def transpose_2d(h_matrix: NDArray[np.float32]) -> NDArray[np.float32]:
 def transpose_tiles(h_tiles: NDArray[np.float32]) -> NDArray[np.float32]:
     """Transposes each 16x16 tile of an array on the device.
 
-    The operation nothing else in the machine could express: `sublane_stride`
-    permutes rows uniformly across every lane and a DMA descriptor moves whole
-    16-lane rows, so exchanging lanes with sublanes needed the staging array that
-    `vtxin` and `vtxout` drive.
+    Notes:
+        `sublane_stride` permutes rows uniformly across every lane and a DMA descriptor moves whole 16-lane
+        rows, so exchanging lanes with sublanes needs the staging array `vtxin` and `vtxout` drive.
 
     Args:
         h_tiles: [tiles * _TILE, _TILE] host array, a stack of square tiles.
@@ -740,10 +593,9 @@ def add_resident(d_left: DeviceTensor, d_right: DeviceTensor, *,
                  d_out: DeviceTensor | None = None) -> DeviceTensor:
     """Adds two DMEM tensors elementwise, leaving the sum in DMEM.
 
-    This is what a projection's bias and a block's residual become once they stop
-    being numpy. Both were forcing the product back to PS DDR to be added there,
-    and then the next projection sent it out again -- two copies per add, for one
-    `vadd` the machine has always had.
+    Notes:
+        This is what a projection's bias and a block's residual become once they stop being numpy, each of
+        which otherwise costs two host copies per add for one `vadd` the machine has always had.
 
     Args:
         d_left: A resident tensor.
@@ -790,9 +642,10 @@ def add_bias_resident(d_left: DeviceTensor, d_bias: ResidentWeights, *,
                       d_out: DeviceTensor | None = None) -> DeviceTensor:
     """Adds one resident feature row to every token row.
 
-    The bias is packed with each feature tile repeated across the four sublane rows, so the kernel stages it once
-    and one contiguous read broadcasts it across tokens. That is far cheaper than materialising a
-    `[tokens, features]` tensor for every layer and execution shape.
+    Notes:
+        The bias is packed with each feature tile repeated across the four sublane rows, so the kernel stages
+        it once and one contiguous read broadcasts it across tokens, rather than materialising a
+        `[tokens, features]` tensor per layer and shape.
     """
     if d_bias.depth != 1 or d_bias.columns != d_left.features:
         raise ValueError(
@@ -826,20 +679,15 @@ def gemm_resident(d_activations: DeviceTensor, d_weights: ResidentWeights, *,
                   activate: bool = False, d_out: DeviceTensor | None = None) -> DeviceTensor:
     """Multiplies two DMEM operands and leaves the product in DMEM.
 
-    Nothing crosses the host boundary: the activations are already packed, the
-    weights are already packed, and the product is written in the layout the next
-    launch's activation argument expects. The only host work is issuing the
-    launch, which is the intervention point that stays.
+    Notes:
+        Nothing crosses the host boundary: both operands are already packed and the product is written in the
+        layout the next launch's activation argument expects, leaving the host only the launch to issue.
 
     Notes:
-        Always fuses the contraction's groups, because a per-group drain would
-        leave partials the host has to add -- and adding them here is the whole
-        point. That costs about 1.8x the relative error of the float32 host sum
-        (`check_fused_groups` reports both on every board run).
-
-        One launch per block of `_BLOCK_TOKENS` rows, as `full_gemm` does. The
-        activation pointer advances by a block of packed rows and the drain
-        pointer by a block of output rows.
+        Always fuses the contraction's groups, a per-group drain leaving partials the host would have to add,
+        which costs about 1.8x the relative error of the float32 host sum. One launch covers a block of
+        `_BLOCK_TOKENS` rows, the activation pointer advancing by a block of packed rows and the drain pointer
+        by a block of output rows.
 
     Args:
         d_activations: [tokens, contraction] left operand, resident.
@@ -903,10 +751,9 @@ def full_gemm(
         group. The host sums those groups in float32, which holds the BF16 accumulate chain to a depth the error
         bound tolerates.
 
-        `weights` may be a `ResidentWeights` handle instead of an array, in which case nothing is packed or
-        copied: the matrix is already in DMEM from a previous `upload_weights`. That removes the single
-        largest cost of a launch -- `pack_weights` is 72.7 ms of 168 ms -- for any caller that reuses a matrix,
-        which a language model does on every token.
+        `weights` may be a `ResidentWeights` handle rather than an array, in which case nothing is packed or
+        copied, the matrix already being in DMEM. Packing is the single largest cost of a launch, so a caller
+        reusing a matrix should hand one over.
 
     Args:
         activations: The left operand, whose rows are tokens and columns the contraction.
@@ -969,7 +816,7 @@ def full_gemm(
         d_image = _stage_image(image_bytes)
 
         if resident is not None:
-            # Already in DMEM, and deliberately NOT appended to `device`: it must
+            # Already in DMEM, and deliberately not appended to `device`: it must
             # outlive this launch, which is the whole point of uploading it once.
             d_weights = resident.address
         else:
@@ -1086,11 +933,9 @@ def softmax_rows(scores: NDArray[np.float32]) -> NDArray[np.float32]:
         h_scores.view.view("<u2")[: words.size] = words
         minitpuMemcpy(d_scores, h_scores, words.nbytes, MemcpyKind.HostToDevice)
 
-        # One launch streams every whole chunk: the kernel advances its own
-        # pointers, and its inner loop names its AGU level so the chunk loop does
-        # not steal the row index. A ragged tail still needs its own image, because
-        # the inner trip count is baked in -- but that is one more launch, not one
-        # per chunk.
+        # One launch streams every whole chunk, the kernel advancing its own pointers and its inner loop naming
+        # its AGU level so the chunk loop does not steal the row index. A ragged tail needs an image of its own,
+        # the inner trip count being baked in, which is one more launch rather than one each.
         stride = chunk * width * _ELEMENT_BYTES
         if whole:
             _, image_bytes = _kernel_and_image(
@@ -1185,13 +1030,10 @@ def multi_head_attention(
     """Runs one multi-head self-attention on the device.
 
     Notes:
-        The projections are device products at model width, and the attention is
-        `prefill_attention` -- three launches for every head, not three per head. Splitting the
-        projection into heads and concatenating them again is a contiguous view over the same bytes
-        and costs nothing at all.
-
-        Unmasked, matching `attention_head`'s long-standing behaviour and what
-        `transformer_block_reference` models. The chat path passes `causal=True`.
+        The projections are device products at model width and the attention is `prefill_attention`, which is
+        three launches for every head rather than three per head, splitting the projection into heads being a
+        contiguous view over the same bytes. This is unmasked, as `transformer_block_reference` models it; the
+        chat path passes `causal=True`.
 
     Args:
         hidden: [tokens, model] input.
@@ -1276,21 +1118,12 @@ def attention_head(
     """Runs one attention head on the device: softmax(Q Kᵀ / √d) V.
 
     Notes:
-        Three launches, composed the way `full_ffn` composes two: a product, a softmax, a product.
-        Two things ride on the host, deliberately and temporarily.
-
-        **The transpose.** A weight-stationary array wants Kᵀ as its stationary operand, and nothing
-        in the ISA exchanges lanes with sublanes -- `sublane_stride` permutes rows, and a DMA
-        descriptor moves whole rows too. The host packer already materialises a copy of every
-        operand, so it transposes there for free.
-
-        **The contraction padding.** The looped GEMM accumulates `_LOOP_BLOCKS` blocks of
-        `_BLOCK_DEPTH` before draining, so its contraction must be a whole number of
-        `_LOOP_BLOCKS * _BLOCK_DEPTH`. A head is 64 deep and that is not, so both products pad the
-        contraction with zeros -- exact, because the extra terms are zero, but it moves three times
-        the operand bytes it needs to. Getting a range of M, N, K right removes it.
-
-        The 1/√d scale folds into the packed query at no device cost.
+        Three launches, composed the way `full_ffn` composes two: a product, a softmax, a product. Two steps
+        ride on the host. The transpose does, because nothing in the ISA exchanges lanes with sublanes and the
+        packer already materialises a copy it can transpose in. The contraction padding does, because the
+        looped GEMM drains on a whole number of `_LOOP_BLOCKS * _BLOCK_DEPTH` and a head is 64 deep, so both
+        products pad with zeros: exact, but moving three times the operand bytes they need. The 1/√d scale
+        folds into the packed query at no device cost.
 
     Args:
         query: [tokens, head] queries.
@@ -1307,7 +1140,7 @@ def attention_head(
     if tokens != _VREG_ELEMENTS:
         message = (
             f"Unable to attend over {tokens} tokens. The softmax reduces over a whole VREG, so a "
-            f"score row -- one per token -- must be exactly {_VREG_ELEMENTS} wide."
+            f"score row, one per token, must be exactly {_VREG_ELEMENTS} wide."
         )
         raise ValueError(message)
 
@@ -1320,151 +1153,12 @@ def attention_head(
         extended[: values.shape[0]] = values
         return extended
 
-    # This one takes UNSCALED queries and always applies 1/sqrt(d) itself: it is a
-    # single head with no projection in front of it, so there is nothing to fold
-    # into. `prefill_attention` and `decode_attention` take a `scale` because the
-    # body folds theirs into the QKV weights.
+    # This takes unscaled queries and applies 1/sqrt(d) itself, being a single head with no projection in
+    # front of it to fold into, unlike the prefill and decode paths whose scale rides the QKV weights.
     scaled = (query / math.sqrt(head)).astype(np.float32)
     scores = full_gemm(activations=_pad_columns(scaled, contraction), weights=padded(key.T.copy()))
     weights = softmax_rows(scores=scores)
     return full_gemm(activations=_pad_columns(weights, contraction), weights=padded(value))
-
-
-def _sequence_length(*, rows: int, valid: int, sequences: int) -> int:
-    """Rows one sequence owns, for the mask that keeps sequences apart.
-
-    ONE sequence needs no boundary: the padded tail is excluded by column and the
-    causal rule excludes everything after a query anyway, so the sequence is the
-    whole padded axis and a prompt of any length works. Requiring the padded axis to
-    be a multiple of the real one instead sent a five-token prompt -- an ordinary
-    chat prompt -- down the host path without saying so.
-
-    A BATCH does need the boundary, and needs it to tile the padded axis, because
-    the mask places each sequence by index.
-
-    Args:
-        rows: The padded token axis.
-        valid: Real rows in it.
-        sequences: Independent sequences laid end to end.
-
-    Returns:
-        The rows between one sequence's start and the next.
-
-    Raises:
-        ValueError: If a batch's sequences do not tile the padded axis.
-    """
-    if sequences == 1:
-        return rows
-    if valid % sequences or rows % (valid // sequences):
-        message = (
-            f"Unable to split {valid} real rows of {rows} into {sequences} "
-            f"sequences. A batch lays equal-length sequences end to end, and the "
-            f"padded axis must be a whole number of them."
-        )
-        raise ValueError(message)
-    return valid // sequences
-
-
-#: Additive attention masks, keyed by shape. A mask is a CONSTANT of a shape, not
-#: of a layer, so one per shape serves all twelve and is built once.
-_ATTENTION_MASKS: dict[tuple, DeviceTensor] = {}
-
-
-def _attention_mask(rows: int, heads: int, *, causal: bool, sequence: int,
-                    valid: int, span: int) -> DeviceTensor:
-    """Returns the additive mask for a shape, uploading it once.
-
-    Notes:
-        Three things are forbidden and all three are the same constant: a key past
-        the end of the array, a key in ANOTHER SEQUENCE, and -- when causal -- a key
-        after the query's own position. The batch axis needs no kernel of its own
-        because of the middle one.
-
-        Large and negative rather than -inf, because the kernel subtracts the row
-        maximum before the exponential and inf - inf is a NaN.
-
-    Args:
-        rows: The padded token axis.
-        heads: Attention heads.
-        causal: Whether a query may only attend at or before its own position.
-        sequence: Rows one sequence owns.
-        valid: Real rows; the rest of the axis is padding no query may attend to.
-        span: Keys a score row covers.
-
-    Returns:
-        The [rows, heads * span] mask, resident.
-    """
-    key = (rows, heads, causal, sequence, valid, span)
-    d_cached = _ATTENTION_MASKS.get(key)
-    if d_cached is not None:
-        return d_cached
-
-    index = np.arange(rows)
-    forbidden = index[:, None] // sequence != index[None, :] // sequence
-    forbidden |= index[None, :] >= valid
-    if causal:
-        forbidden |= index[None, :] % sequence > index[:, None] % sequence
-    # A row may always attend to ITSELF. True already for every real query; it is
-    # the PADDED rows that need it, which otherwise forbid everything and leave the
-    # softmax subtracting -1e30 from -1e30. Their output is discarded either way;
-    # what matters is that it is a number.
-    forbidden &= index[:, None] != index[None, :]
-
-    h_mask = np.zeros((rows, heads * span), dtype=np.float32)
-    for head in range(heads):
-        h_mask[:, head * span:(head + 1) * span][:, :rows][forbidden] = -1.0e30
-        h_mask[:, head * span:(head + 1) * span][:, rows:] = -1.0e30
-    d_cached = upload_activations(h_mask)
-    _ATTENTION_MASKS[key] = d_cached
-    return d_cached
-
-
-#: Attention's per-head operands, keyed by shape. Constants of a SHAPE, not of a
-#: layer: every layer's scatter overwrites them, so one set serves all twelve and
-#: is zeroed once.
-_GROUPED_OPERANDS: dict[tuple, tuple] = {}
-
-
-def _grouped_operands(rows: int, heads: int, head: int, span: int):
-    """Allocates the per-head K-transpose and V operands for a grouped attention.
-
-    Notes:
-        These are the block-diagonal's replacement. A diagonal block encodes
-        independence by surrounding each head's operand with zeros, which costs a
-        factor of `heads` in multiplies; laying the same operands end to end and
-        walking them with a loop level costs a loop level.
-
-        `[heads, head_dim, span]` for the transposed keys and `[heads, span, head]`
-        for the values -- one independent weight matrix per head, contiguous, which
-        is exactly what `build_looped_gemm(batch=heads)` walks.
-
-    Args:
-        rows: Padded rows attended over.
-        heads: Attention heads.
-        head: The head dimension.
-        span: Keys a score row covers, rows rounded up to whole VREGs.
-
-    Returns:
-        The key operand and the value operand, as `ResidentWeights` over the whole
-        stack -- the GEMM is given the first problem's address and walks the rest.
-    """
-    key = (rows, heads, head, span)
-    if key in _GROUPED_OPERANDS:
-        return _GROUPED_OPERANDS[key]
-
-    # `depth` and `columns` describe ONE problem; the launch walks `heads` of them.
-    d_keys = ResidentWeights(minitpuMalloc(heads * head * span * _ELEMENT_BYTES),
-                             head, span, heads * head * span * _ELEMENT_BYTES)
-    d_values = ResidentWeights(minitpuMalloc(heads * span * head * _ELEMENT_BYTES),
-                               span, head, heads * span * head * _ELEMENT_BYTES)
-    for d_operand in (d_keys, d_values):
-        h_zero = minitpuHostAlloc(d_operand.nbytes)
-        h_zero.view[:d_operand.nbytes] = 0
-        minitpuMemcpy(d_operand.address, h_zero, d_operand.nbytes,
-                      MemcpyKind.HostToDevice)
-
-    _GROUPED_OPERANDS[key] = (d_keys, d_values)
-    return _GROUPED_OPERANDS[key]
 
 
 def attention(d_fused: DeviceTensor, *, heads: int = 12, causal: bool = True,
@@ -1472,25 +1166,11 @@ def attention(d_fused: DeviceTensor, *, heads: int = 12, causal: bool = True,
     """Attention with each head an independent product, not a diagonal block.
 
     Notes:
-        The block-diagonal form runs every head in one product by giving the array
-        an operand that is mostly zeros: `[rows, model] @ [model, heads * span]`,
-        which is `heads` times the multiplies the problem has and `heads * B` times
-        once a batch shares the span. This runs the same twelve products as twelve
-        PROBLEMS in one launch instead -- `[rows, head_dim] @ [head_dim, span]`
-        each -- so the zeros are gone and the launch count is not worse.
-
-        Nothing downstream changes, and that is not luck. A grouped launch drains
-        problem after problem, each `[column_tiles, BLOCK_TOKENS, TILE]`, and the
-        packed layout of the whole `[rows, heads * span]` score array is
-        `[global_tile, rows, TILE]` with `global_tile = span_tiles * h + q`. Those
-        are the same ordering, so the packed softmax reads the grouped output where
-        it lies, head h's probabilities are the contiguous run the gather's problem
-        h wants, and the gather's own output is the packed `[rows, model]` the
-        output projection consumes.
-
-        The operands are what change: `d_keys` holds `heads` transposed key
-        matrices end to end rather than one block-diagonal, which is the same
-        transpose-scatter with `depth = head_dim` instead of `depth = model`.
+        The block-diagonal form runs every head against an operand that is mostly zeros, costing `heads` times
+        the multiplies the problem has. This runs the heads as that many problems in one launch instead, so the
+        zeros are gone and the launch count is no worse. Nothing downstream changes: a grouped launch drains
+        problem after problem in the ordering the packed score array already has. Only `d_keys` changes, holding
+        one transposed key matrix per head end to end rather than one block-diagonal.
 
     Args:
         d_fused: [rows, 3 * model] fused QKV projection, resident.
@@ -1526,10 +1206,8 @@ def attention(d_fused: DeviceTensor, *, heads: int = 12, causal: bool = True,
     down = _BLOCK_TOKENS // _TILE
     blocks = rows // _BLOCK_TOKENS
 
-    # Kᵀ, one [head_dim, span] matrix per head. The same transpose-scatter as the
-    # block-diagonal's, with the destination's depth being a head rather than the
-    # model -- so a head's tiles land `head_dim` apart instead of `model` apart, and
-    # the next head begins where this one ended.
+    # One [head_dim, span] transpose per head, scattered as the block-diagonal's is but against a head's depth
+    # rather than the model's, so a head's tiles land `head_dim` apart and the next begins where it ended.
     scatter_key, key_image = _kernel_and_image(
         ("head_transpose", heads, head_tiles, down, head, span // _TILE),
         # Grouped: no row band, so the feature-tile loop's walk is taken back.
@@ -1580,38 +1258,6 @@ def attention(d_fused: DeviceTensor, *, heads: int = 12, causal: bool = True,
     return d_gathered
 
 
-def _grouped_product(d_left, d_weights: ResidentWeights, *, heads: int, rows: int,
-                     columns: int, name: str) -> DeviceTensor:
-    """Runs `heads` independent products in one launch per token block.
-
-    Args:
-        d_left: The stacked left operands; problem h's is a contiguous slice.
-        d_weights: The stacked right operands, `heads` of them end to end.
-        heads: Problems in the launch.
-        rows: Padded token rows.
-        columns: Output columns of ONE problem.
-        name: Cache key prefix for the assembled image.
-
-    Returns:
-        The [rows, heads * columns] product, resident and packed.
-    """
-    depth = d_weights.depth
-    kernel, image_bytes = _kernel_and_image(
-        (name, columns // _TILE, depth, heads),
-        lambda: build_looped_gemm(
-            column_tiles=columns // _TILE, groups=1, activate=False,
-            fuse_groups=True, loop_blocks=depth // _BLOCK_DEPTH, batch=heads,
-            batch_activation_bytes=_BLOCK_TOKENS * depth * _ELEMENT_BYTES))
-    minitpuSetDevice(kernel.uio_name)
-    d_image = _stage_image(image_bytes)
-    d_out = _allocate_tensor(rows, heads * columns)
-    for block in range(rows // _BLOCK_TOKENS):
-        minitpuLaunchKernel(
-            d_image, len(image_bytes),
-            args=[d_left.operand(block), d_weights.address, d_out.d_drain(block)])
-    return d_out
-
-
 def prefill_attention(
     query: NDArray[np.float32], key: NDArray[np.float32], value: NDArray[np.float32],
     *, heads: int = 12, causal: bool = True, scale: float | None = None
@@ -1619,20 +1265,11 @@ def prefill_attention(
     """Runs prefill attention for EVERY head on the device, in three launches.
 
     Notes:
-        Same batching as `decode_attention` and for the same reason: a head per launch is twelve
-        launches where one will do. Head h's transposed keys occupy block (h, h) of a block-diagonal
-        operand, so a single product gives every head's score matrix side by side and no head can
-        see another's keys.
-
-        The layout works out because **splitting heads is addressing, not movement**. A [tokens,
-        model] array is already [tokens, heads, head] in memory, and the [tokens, heads*context]
-        score array is already [tokens*heads, context] -- both reshapes are contiguous views over
-        the same bytes. The head axis costs nothing here; the only layout operation that costs
-        anything is the transpose of the keys, which the host packer still does.
-
-        The causal mask is the one arithmetic step still on the host. It is an additive [tokens,
-        context] bias, and adding it needs the scores to stay in VMEM between the product and the
-        softmax -- which is a fused kernel, not a missing instruction.
+        Same batching as `decode_attention`: head h's transposed keys occupy block (h, h) of a block-diagonal
+        operand, so one product gives every head's score matrix side by side and no head sees another's keys.
+        Splitting heads is addressing rather than movement, both reshapes being contiguous views over the same
+        bytes, so only the key transpose costs anything. The causal mask is the one arithmetic step still on the
+        host, since adding it needs the scores to stay in VMEM between the product and the softmax.
 
     Args:
         query: [tokens, model] queries for all heads, unscaled.
@@ -1642,7 +1279,7 @@ def prefill_attention(
         causal: Whether a query may only attend to keys at or before its own position.
         scale: What to multiply the queries by. Defaults to 1/sqrt(head_dim). Pass
             1.0 when the caller has already folded the scale into the projection
-            that produced these queries, as `ResidentModel` does -- applying it twice
+            that produced these queries, as `ResidentModel` does, applying it twice
             is silent and looks like a plausible attention distribution.
 
     Returns:
@@ -1665,9 +1302,8 @@ def prefill_attention(
         scale = 1.0 / math.sqrt(head)
     scaled = (query * scale).astype(np.float32)
 
-    # Kᵀ comes from the device now. The block-diagonal PLACEMENT is still host
-    # bookkeeping -- zeros off the diagonal so no head sees another's keys -- but
-    # the transpose itself, the part with no software route, is a launch.
+    # The transposed keys come from the device. Their block-diagonal placement is still host bookkeeping,
+    # zeros off the diagonal so no head sees another's keys, but the transpose has no software route.
     h_key_t = transpose_2d(_pad_rows_to_tile(key))[:, :tokens]
     key_blocks = np.zeros((model, heads * span), dtype=np.float32)
     value_blocks = np.zeros((heads * span, model), dtype=np.float32)
@@ -1704,23 +1340,12 @@ def decode_attention(
     """Runs one decode step's attention for EVERY head on the device, in three launches.
 
     Notes:
-        A decode step has one query row per head, and running a head per launch would be twelve
-        launches to replace about two milliseconds of host numpy -- at roughly 55 ms of host cost
-        each, that trade is badly the wrong way round. So all heads share one launch, by giving the
-        weight-stationary array a **block-diagonal** operand: head h's Kᵀ sits at block (h, h) and
-        everything off the diagonal is zero, so one product computes every head's scores at once and
-        no head can see another's keys.
-
-        It wastes eleven twelfths of the multiplies. That is the right trade while the device is
-        idle for most of a token and the launch is what costs -- and the shapes fall out
-        conveniently, because heads x head_dim IS the model width, so all three launches run at the
-        width the GEMM already covers.
-
-        Contexts shorter than a full VREG need their unused score columns pushed to zero
-        probability, and that is the one host touch left in this path. It is a [heads, 64] add, and
-        it exists only because the contraction has to be a whole number of
-        `_LOOP_BLOCKS * _BLOCK_DEPTH`: with a range of M, N, K the contraction becomes exactly the
-        context, the padding disappears and so does the mask.
+        A decode step has one query row per head, so all heads share one launch rather than paying a launch
+        each: head h's transposed keys sit at block (h, h) of a block-diagonal operand, everything off the
+        diagonal is zero, and no head sees another's keys. That wastes eleven twelfths of the multiplies, which
+        is the right trade while the device is idle for most of a token and the launch is what costs. Contexts
+        shorter than a full VREG need their unused score columns pushed to zero probability, a [heads, 64] add
+        that exists only because the contraction must be a whole number of `_LOOP_BLOCKS * _BLOCK_DEPTH`.
 
     Args:
         query: [heads, head] one query row per head, unscaled.
@@ -1751,10 +1376,9 @@ def decode_attention(
         scale = 1.0 / math.sqrt(head)
     scaled = (query * scale).astype(np.float32)
 
-    # Scores: [1, width] @ blockdiag(Kᵀ) -> [1, heads * VREG], head h in its own column band.
-    # One transpose covers every head: stack the caches into [heads * context, head]
-    # and the device returns [head, heads * context], from which each head's block
-    # is a column range. The transpose is the launch; the placement is bookkeeping.
+    # Scores are [1, width] against a block-diagonal transpose of K, each head landing in its own column band.
+    # One transpose covers every head: the stacked caches come back transposed, and each head's block is a
+    # column range of that.
     h_stacked = _pad_rows_to_tile(
         np.ascontiguousarray(keys.reshape(heads * context, head)))
     h_keys_t = transpose_2d(h_stacked)
@@ -1786,42 +1410,6 @@ def decode_attention(
     return gathered[0].reshape(heads, head)
 
 
-def _pad_rows_to_tile(h_rows: NDArray[np.float32]) -> NDArray[np.float32]:
-    """Zero-extends the row axis to a whole number of transpose tiles.
-
-    The staging tile is square, so a transpose needs both dimensions to be a whole
-    number of `_TILE`. Padding with zeros is exact here: the padded columns of the
-    result are dropped by the caller before they reach a score.
-    """
-    rows = h_rows.shape[0]
-    remainder = rows % _TILE
-    if remainder == 0:
-        return h_rows
-    extended = np.zeros((rows + _TILE - remainder, h_rows.shape[1]), dtype=np.float32)
-    extended[:rows] = h_rows
-    return extended
-
-
-def _pad_tokens_for_launch(rows: NDArray[np.float32]) -> NDArray[np.float32]:
-    """Zero-extends the token axis to the whole number of rows one launch covers."""
-    tokens = rows.shape[0]
-    remainder = tokens % _BLOCK_TOKENS
-    if remainder == 0:
-        return rows
-    extended = np.zeros((tokens + _BLOCK_TOKENS - remainder, rows.shape[1]), dtype=np.float32)
-    extended[:tokens] = rows
-    return extended
-
-
-def _pad_columns(values: NDArray[np.float32], columns: int) -> NDArray[np.float32]:
-    """Zero-extends an activation's contraction to `columns`, which pads with exact zeros."""
-    if values.shape[1] >= columns:
-        return values
-    extended = np.zeros((values.shape[0], columns), dtype=np.float32)
-    extended[:, : values.shape[1]] = values
-    return extended
-
-
 def attention_reference(
     query: NDArray[np.float32], key: NDArray[np.float32], value: NDArray[np.float32]
 ) -> NDArray[np.float32]:
@@ -1838,10 +1426,10 @@ def check_kernel_launch(kernel: MinitpuKernel) -> None:
     """Verifies the LAUNCH path by staging a resident kernel image and starting it from the host.
 
     Notes:
-        The transfer reaches device memory through the copy engine's alias of the kernel aperture, while the loader
-        reads the staged image back through the MINITPU's own device-memory port. Only a launch crosses both routes, so
-        an aperture whose two addresses resolve to different DRAM surfaces fails here rather than in a workload
-        result. Repeating the launch requires the command processor to return to idle between commands.
+        The transfer reaches device memory through the copy engine's alias of the kernel aperture, while the
+        loader reads the staged image back through the MINITPU's own device-memory port. Only a launch crosses
+        both routes, so an aperture whose two addresses resolve to different DRAM surfaces fails here rather
+        than in a workload result. Repeating the launch requires the command processor to return to idle.
 
     Args:
         kernel: The assembled program whose image is staged and started.
@@ -1948,8 +1536,8 @@ def check_copy_roundtrip(words: NDArray[np.uint32], *, uio_name: str = "minitpu"
         minitpuMemcpy(dst=device_address, src=source, nbytes=words.nbytes, kind=MemcpyKind.HostToDevice)
 
         # Writes the corruption word so a transfer that moves nothing fails. The udmabuf outlives the process and
-        # every run reuses the same offsets, so an untouched destination still holds the words the previous run left
-        # there. The flush carries the word past the cache lines the read-back invalidates.
+        # every run reuses its offsets, so an untouched destination still holds the last run's words. The flush
+        # carries the word past the cache lines the read-back invalidates.
         destination.view.view("<u2")[: words.size] = _CORRUPTION_WORD & 0xFFFF
         destination.sync_to_device()
 
@@ -2044,12 +1632,11 @@ def check_full_gemm(*, tokens: int = 32, depth: int = 768, columns: int = 3072) 
     """Runs a product at model dimensions and verifies the loop kernel against a host reference.
 
     Notes:
-        Runs two operand sets, because either alone is blind. The structured set is exactly
-        representable, so it pins the kernel to the host reference bit for bit -- but every one of its
-        token rows is identical and its weights are constant along the contraction, so any kernel that
-        confuses one token for another, or one contraction block for another, still passes it. The
-        varying set differs along every axis, which is what makes those confusions observable; its
-        BF16 partial sums cost exactness, so it carries a relative bound instead.
+        Runs two operand sets, either alone being blind. The structured set is exactly representable and pins
+        the kernel to the host reference bit for bit, but its token rows are identical and its weights constant
+        along the contraction, so a kernel confusing one token or one contraction block for another still
+        passes. The varying set differs along every axis, which makes those confusions observable, and carries
+        a relative bound because its BF16 partial sums cost exactness.
 
     Args:
         tokens: Rows the product covers, which must be a whole number of token blocks.
@@ -2097,10 +1684,10 @@ def check_full_ffn(*, tokens: int = 32, model: int = 768, hidden: int = 3072) ->
     """Runs one feed-forward layer at model dimensions and verifies it against a host reference.
 
     Notes:
-        Defaults to GPT-2 small's feed-forward shape, so a pass means two launches carry a real layer rather than a
-        tile. The reference quantizes both operands to BF16 and applies the SFU's own table,
-        leaving only the accumulate to differ, so the bound below is the error the BF16 partials contribute rather
-        than a tolerance for an unmodelled effect.
+        Defaults to GPT-2 small's feed-forward shape, so a pass means two launches carry a real layer rather
+        than a tile. The reference quantizes both operands to BF16 and applies the SFU's own table, leaving only
+        the accumulate to differ, so the bound below is what the BF16 partials contribute rather than a
+        tolerance for an unmodelled effect.
 
     Args:
         tokens: Rows the layer processes, which must be a whole number of token blocks.
@@ -2216,30 +1803,6 @@ def check_attention(*, tokens: int = 64, head: int = 64) -> str:
         raise AssertionError(message)
     return (f"softmax([{tokens},{head}] @ [{head},{tokens}]) @ [{tokens},{head}] in {elapsed:.1f} s, "
             f"relative error {error:.2%}")
-
-
-def _block_weights(model: int, seed: int) -> dict:
-    """Builds one block's parameters at GPT-2 initialisation scales, on the BF16 grid."""
-    rng = np.random.default_rng(seed)
-    hidden = 4 * model
-
-    def normal(shape: tuple, scale: float) -> NDArray[np.float32]:
-        return _on_bf16_grid(values=(rng.standard_normal(shape) * scale).astype(np.float32))
-
-    return {
-        "ln_1.g": _on_bf16_grid(values=np.ones(model, dtype=np.float32)),
-        "ln_1.b": normal((model,), 0.02),
-        "attn.qkv.w": normal((model, 3 * model), 0.02),
-        "attn.qkv.b": normal((3 * model,), 0.02),
-        "attn.proj.w": normal((model, model), 0.02),
-        "attn.proj.b": normal((model,), 0.02),
-        "ln_2.g": _on_bf16_grid(values=np.ones(model, dtype=np.float32)),
-        "ln_2.b": normal((model,), 0.02),
-        "mlp.fc.w": normal((model, hidden), 0.02),
-        "mlp.fc.b": normal((hidden,), 0.02),
-        "mlp.proj.w": normal((hidden, model), 0.02),
-        "mlp.proj.b": normal((model,), 0.02),
-    }
 
 
 def check_fused_groups(*, tokens: int = 32, depth: int = 768, columns: int = 3072) -> str:
@@ -2484,6 +2047,307 @@ def check_transformer_block(*, tokens: int = 64) -> str:
         raise AssertionError(message)
     return (f"[{tokens},{_MODEL_WIDTH}] block, 12 heads, in {elapsed:.1f} s, "
             f"relative error {error:.2%}")
+
+
+def _image_of(kernel) -> bytes:
+    """Serialises a kernel, without caching.
+
+    Notes:
+        Only the launch-path checks reach this, and they run once. Every hot path goes through
+        `_kernel_and_image`, which keys on the arguments that built the kernel rather than on the object.
+
+    Args:
+        kernel: An assembled kernel.
+
+    Returns:
+        Its padded byte image.
+    """
+    return bytes(kernel.image.to_bytes(pad_to=4))
+
+
+def _kernel_and_image(key: tuple, build) -> tuple:
+    """Returns an assembled kernel and its serialised image, building each once.
+
+    Args:
+        key: The build arguments, which identify the kernel.
+        build: Builds it when the key is new.
+
+    Returns:
+        The (kernel, image bytes) pair.
+    """
+    cached = _KERNEL_CACHE.get(key)
+    if cached is None:
+        kernel = build()
+        cached = (kernel, bytes(kernel.image.to_bytes(pad_to=4)))
+        _KERNEL_CACHE[key] = cached
+    return cached
+
+
+def _stage_image(image_bytes: bytes) -> int:
+    """Makes a kernel image resident in DMEM, once, and returns its address.
+
+    Args:
+        image_bytes: The assembled image.
+
+    Returns:
+        The DMEM address it is resident at, to pass as `kbin_addr`.
+    """
+    resident = _RESIDENT_IMAGES.get(image_bytes)
+    if resident is not None:
+        return resident
+    # Its own address rather than the shared staging one, which a launch does not require and which made a
+    # layer restage on every one of its eighteen launches.
+    address = minitpuMalloc(len(image_bytes))
+    host = minitpuHostAlloc(len(image_bytes))
+    host.view[: len(image_bytes) // 4] = np.frombuffer(image_bytes, dtype="<u4")
+    minitpuMemcpy(address, host, len(image_bytes), MemcpyKind.HostToDevice)
+    _RESIDENT_IMAGES[image_bytes] = address
+    return address
+
+
+def _allocate_tensor(tokens: int, features: int) -> DeviceTensor:
+    """Hands out a drain-shaped DMEM buffer, from the pool when one is waiting.
+
+    Notes:
+        The kernel loads its clearing tile from the head of the drain buffer, so those bytes must be zero
+        before the first launch that uses it, but only once per buffer: a launch reads that tile and never
+        writes it, so a pooled buffer comes back with its tile still zeroed and needs neither a malloc nor a
+        copy.
+
+    Args:
+        tokens: Rows the buffer holds.
+        features: Columns the buffer holds.
+
+    Returns:
+        The allocated tensor.
+    """
+    if tokens % _BLOCK_TOKENS:
+        message = (
+            f"Unable to hold {tokens} rows in DMEM. A tensor is a whole number of "
+            f"{_BLOCK_TOKENS}-row blocks, which is what one launch covers."
+        )
+        raise ValueError(message)
+    waiting = _TENSOR_POOL.get((tokens, features))
+    if waiting:
+        return DeviceTensor(base=waiting.pop(), tokens=tokens, features=features)
+
+    # Allocating and zeroing both need a bound device, and a caller may reach this
+    # before any launch has bound one.
+    minitpuSetDevice(single_halt.uio_name)
+    tensor = DeviceTensor(base=0, tokens=tokens, features=features)
+    tensor.base = minitpuMalloc(tensor.nbytes)
+    host = minitpuHostAlloc(_ZERO_TILE_BYTES)
+    host.view.view("<u2")[:_ZERO_TILE_WORDS] = 0
+    for block in range(tensor.blocks):
+        minitpuMemcpy(tensor.d_drain(block), host, _ZERO_TILE_BYTES, MemcpyKind.HostToDevice)
+    return tensor
+
+
+def _sequence_length(*, rows: int, valid: int, sequences: int) -> int:
+    """Rows one sequence owns, for the mask that keeps sequences apart.
+
+    Notes:
+        One sequence needs no boundary: the padded tail is excluded by column and the causal rule excludes
+        everything after a query, so the sequence is the whole padded axis and a prompt of any length works.
+        A batch does need the boundary, and needs it to tile the padded axis, the mask placing each sequence
+        by index.
+
+    Args:
+        rows: The padded token axis.
+        valid: Real rows in it.
+        sequences: Independent sequences laid end to end.
+
+    Returns:
+        The rows between one sequence's start and the next.
+
+    Raises:
+        ValueError: If a batch's sequences do not tile the padded axis.
+    """
+    if sequences == 1:
+        return rows
+    if valid % sequences or rows % (valid // sequences):
+        message = (
+            f"Unable to split {valid} real rows of {rows} into {sequences} "
+            f"sequences. A batch lays equal-length sequences end to end, and the "
+            f"padded axis must be a whole number of them."
+        )
+        raise ValueError(message)
+    return valid // sequences
+
+
+def _attention_mask(rows: int, heads: int, *, causal: bool, sequence: int,
+                    valid: int, span: int) -> DeviceTensor:
+    """Returns the additive mask for a shape, uploading it once.
+
+    Notes:
+        Three things are forbidden and all three are the same constant: a key past the end of the array, a key
+        in another sequence, and when causal a key after the query's own position. The second is why the batch
+        axis needs no kernel of its own. The constant is large and negative rather than -inf, the kernel
+        subtracting the row maximum before the exponential and inf - inf being a NaN.
+
+    Args:
+        rows: The padded token axis.
+        heads: Attention heads.
+        causal: Whether a query may only attend at or before its own position.
+        sequence: Rows one sequence owns.
+        valid: Real rows; the rest of the axis is padding no query may attend to.
+        span: Keys a score row covers.
+
+    Returns:
+        The [rows, heads * span] mask, resident.
+    """
+    key = (rows, heads, causal, sequence, valid, span)
+    d_cached = _ATTENTION_MASKS.get(key)
+    if d_cached is not None:
+        return d_cached
+
+    index = np.arange(rows)
+    forbidden = index[:, None] // sequence != index[None, :] // sequence
+    forbidden |= index[None, :] >= valid
+    if causal:
+        forbidden |= index[None, :] % sequence > index[:, None] % sequence
+    # A row may always attend to itself, which every real query does already and the padded rows need: a row
+    # forbidding everything leaves the softmax subtracting -1e30 from itself. Their output is discarded, so
+    # what matters is only that it is a number.
+    forbidden &= index[:, None] != index[None, :]
+
+    h_mask = np.zeros((rows, heads * span), dtype=np.float32)
+    for head in range(heads):
+        h_mask[:, head * span:(head + 1) * span][:, :rows][forbidden] = -1.0e30
+        h_mask[:, head * span:(head + 1) * span][:, rows:] = -1.0e30
+    d_cached = upload_activations(h_mask)
+    _ATTENTION_MASKS[key] = d_cached
+    return d_cached
+
+
+def _grouped_operands(rows: int, heads: int, head: int, span: int):
+    """Allocates the per-head K-transpose and V operands for a grouped attention.
+
+    Notes:
+        These replace the block-diagonal, which encodes independence by surrounding each head's operand with
+        zeros and costs a factor of `heads` in multiplies, where laying the same operands end to end costs a
+        loop level. They are `[heads, head_dim, span]` for the transposed keys and `[heads, span, head]` for
+        the values, which is what `build_looped_gemm(batch=heads)` walks.
+
+    Args:
+        rows: Padded rows attended over.
+        heads: Attention heads.
+        head: The head dimension.
+        span: Keys a score row covers, rows rounded up to whole VREGs.
+
+    Returns:
+        The key operand and the value operand, as `ResidentWeights` over the whole
+        stack, the GEMM being given the first problem's address and walking the rest.
+    """
+    key = (rows, heads, head, span)
+    if key in _GROUPED_OPERANDS:
+        return _GROUPED_OPERANDS[key]
+
+    # `depth` and `columns` describe ONE problem; the launch walks `heads` of them.
+    d_keys = ResidentWeights(minitpuMalloc(heads * head * span * _ELEMENT_BYTES),
+                             head, span, heads * head * span * _ELEMENT_BYTES)
+    d_values = ResidentWeights(minitpuMalloc(heads * span * head * _ELEMENT_BYTES),
+                               span, head, heads * span * head * _ELEMENT_BYTES)
+    for d_operand in (d_keys, d_values):
+        h_zero = minitpuHostAlloc(d_operand.nbytes)
+        h_zero.view[:d_operand.nbytes] = 0
+        minitpuMemcpy(d_operand.address, h_zero, d_operand.nbytes,
+                      MemcpyKind.HostToDevice)
+
+    _GROUPED_OPERANDS[key] = (d_keys, d_values)
+    return _GROUPED_OPERANDS[key]
+
+
+def _grouped_product(d_left, d_weights: ResidentWeights, *, heads: int, rows: int,
+                     columns: int, name: str) -> DeviceTensor:
+    """Runs `heads` independent products in one launch per token block.
+
+    Args:
+        d_left: The stacked left operands; problem h's is a contiguous slice.
+        d_weights: The stacked right operands, `heads` of them end to end.
+        heads: Problems in the launch.
+        rows: Padded token rows.
+        columns: Output columns of ONE problem.
+        name: Cache key prefix for the assembled image.
+
+    Returns:
+        The [rows, heads * columns] product, resident and packed.
+    """
+    depth = d_weights.depth
+    kernel, image_bytes = _kernel_and_image(
+        (name, columns // _TILE, depth, heads),
+        lambda: build_looped_gemm(
+            column_tiles=columns // _TILE, groups=1, activate=False,
+            fuse_groups=True, loop_blocks=depth // _BLOCK_DEPTH, batch=heads,
+            batch_activation_bytes=_BLOCK_TOKENS * depth * _ELEMENT_BYTES))
+    minitpuSetDevice(kernel.uio_name)
+    d_image = _stage_image(image_bytes)
+    d_out = _allocate_tensor(rows, heads * columns)
+    for block in range(rows // _BLOCK_TOKENS):
+        minitpuLaunchKernel(
+            d_image, len(image_bytes),
+            args=[d_left.operand(block), d_weights.address, d_out.d_drain(block)])
+    return d_out
+
+
+def _pad_rows_to_tile(h_rows: NDArray[np.float32]) -> NDArray[np.float32]:
+    """Zero-extends the row axis to a whole number of transpose tiles.
+
+    Notes:
+        The staging tile is square, so a transpose needs both dimensions to be a whole number of `_TILE`.
+        Padding with zeros is exact, the caller dropping the padded columns before they reach a score.
+    """
+    rows = h_rows.shape[0]
+    remainder = rows % _TILE
+    if remainder == 0:
+        return h_rows
+    extended = np.zeros((rows + _TILE - remainder, h_rows.shape[1]), dtype=np.float32)
+    extended[:rows] = h_rows
+    return extended
+
+
+def _pad_tokens_for_launch(rows: NDArray[np.float32]) -> NDArray[np.float32]:
+    """Zero-extends the token axis to the whole number of rows one launch covers."""
+    tokens = rows.shape[0]
+    remainder = tokens % _BLOCK_TOKENS
+    if remainder == 0:
+        return rows
+    extended = np.zeros((tokens + _BLOCK_TOKENS - remainder, rows.shape[1]), dtype=np.float32)
+    extended[:tokens] = rows
+    return extended
+
+
+def _pad_columns(values: NDArray[np.float32], columns: int) -> NDArray[np.float32]:
+    """Zero-extends an activation's contraction to `columns`, which pads with exact zeros."""
+    if values.shape[1] >= columns:
+        return values
+    extended = np.zeros((values.shape[0], columns), dtype=np.float32)
+    extended[:, : values.shape[1]] = values
+    return extended
+
+
+def _block_weights(model: int, seed: int) -> dict:
+    """Builds one block's parameters at GPT-2 initialisation scales, on the BF16 grid."""
+    rng = np.random.default_rng(seed)
+    hidden = 4 * model
+
+    def normal(shape: tuple, scale: float) -> NDArray[np.float32]:
+        return _on_bf16_grid(values=(rng.standard_normal(shape) * scale).astype(np.float32))
+
+    return {
+        "ln_1.g": _on_bf16_grid(values=np.ones(model, dtype=np.float32)),
+        "ln_1.b": normal((model,), 0.02),
+        "attn.qkv.w": normal((model, 3 * model), 0.02),
+        "attn.qkv.b": normal((3 * model,), 0.02),
+        "attn.proj.w": normal((model, model), 0.02),
+        "attn.proj.b": normal((model,), 0.02),
+        "ln_2.g": _on_bf16_grid(values=np.ones(model, dtype=np.float32)),
+        "ln_2.b": normal((model,), 0.02),
+        "mlp.fc.w": normal((model, hidden), 0.02),
+        "mlp.fc.b": normal((hidden,), 0.02),
+        "mlp.proj.w": normal((hidden, model), 0.02),
+        "mlp.proj.b": normal((model,), 0.02),
+    }
 
 
 def main() -> int:

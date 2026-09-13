@@ -143,7 +143,9 @@ if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
     chown root:"$SUDO_USER" "$uio_dev" /dev/udmabuf0
     chmod 660 "$uio_dev" /dev/udmabuf0
     for sync_node in /sys/class/u-dma-buf/udmabuf0/sync_for_device \
-                     /sys/class/u-dma-buf/udmabuf0/sync_for_cpu; do
+                     /sys/class/u-dma-buf/udmabuf0/sync_for_cpu \
+                     /sys/class/u-dma-buf/udmabuf0/sync_offset \
+                     /sys/class/u-dma-buf/udmabuf0/sync_size; do
         [[ -e "$sync_node" ]] || continue
         chown root:"$SUDO_USER" "$sync_node"
         chmod 660 "$sync_node"

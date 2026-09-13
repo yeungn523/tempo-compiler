@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Holds the GEMM kernel this compiler is exercised against, and writes the operand pair it runs on.
+"""Holds the GEMM kernels this compiler is exercised against, one per order their loops walk, and writes the
+operand pair they run on.
 
-Compiling the kernel needs only the declaration below, which `kernel_entry_point.py` reads by name. Running it
-needs numbers too, so this file writes an operand pair when it is executed rather than imported, into the directory
-named as its one argument. The pair comes from `bf16.build_operands`, which refuses a draw whose rows or columns
-repeat, because such a draw lets an image that reorders them look correct.
+Every kernel computes the same product and differs only in the order of its loops, which is what the compiler
+carries through to the block each launch covers and the launches a host issues. Compiling one needs the
+declaration alone, which `kernel_entry_point.py` reads by name. Running one needs numbers too, so this file writes
+an operand pair when it is executed rather than imported, into the directory named as its one argument. The pair
+comes from `bf16.build_operands`, which refuses a draw whose rows or columns repeat, because such a draw lets an
+image that reorders them look correct.
+
+A kernel walking its output tiles inside the reduction holds every one of them live until the contraction ends, so
+its block covers them all and its image grows with the width. Those kernels therefore state `_RESIDENT_COLUMNS`
+rather than the whole width, which is what the instruction memory holds at this depth.
 """
 
 from __future__ import annotations
@@ -24,13 +31,22 @@ sys.path.insert(0, str(_HERE / "board_package"))
 from bf16 import build_operands  # noqa: E402
 
 _ROWS: int = 64
-"""Token rows the whole product covers, which the operands are drawn at and the kernel walks in BLOCK_M steps."""
+"""Token rows every kernel covers, which the operands are drawn at and the kernels walk in BLOCK_M steps. This is
+what the register file stages at once, which a kernel walking its token blocks inside the reduction holds live."""
 
-_COLUMNS: int = 48
-"""Output columns the whole product covers, walked in BLOCK_N steps."""
+_COLUMNS: int = 3072
+"""Output columns the whole product covers, walked in BLOCK_N steps, being GPT-2's hidden width."""
 
-_DEPTH: int = 192
+_DEPTH: int = 768
 """The contraction both operands share, walked in BLOCK_K steps."""
+
+_RESIDENT_COLUMNS: int = 96
+"""Output columns a kernel walking its column tiles inside the reduction covers, being what one image holds
+live at this depth."""
+
+_RESIDENT_SQUARE_COLUMNS: int = 48
+"""Output columns a kernel walking both output axes inside its reduction covers, which shares one block with every
+token row the product holds."""
 
 _SEED: int = 0
 """Draw the operands are generated from, fixed so two runs compile the same numbers."""
@@ -54,7 +70,7 @@ def matmul_kernel(
     BLOCK_N: tl.constexpr = 16,
     BLOCK_K: tl.constexpr = 64,
 ):
-    """Multiplies an M by K activation by a K by N weight, one BLOCK_M by BLOCK_N output tile at a time.
+    """Multiplies an M by K activation by a K by N weight, walking the tokens, the columns, then the reduction.
 
     M, N and K are the extents of the whole product, and the three BLOCK extents are what one iteration of each
     loop covers, so their ratios are the trip counts the planner reports.
@@ -79,10 +95,184 @@ def matmul_kernel(
             tl.store(output_pointers, accumulator)
 
 
-def main() -> int:
-    """Writes the operand pair the kernel above runs on, at the extents it declares.
+@triton.jit
+def matmul_n_m_k(
+    activation_pointer,
+    weight_pointer,
+    output_pointer,
+    stride_am: tl.constexpr = _DEPTH,
+    stride_ak: tl.constexpr = 1,
+    stride_bk: tl.constexpr = _COLUMNS,
+    stride_bn: tl.constexpr = 1,
+    stride_cm: tl.constexpr = _COLUMNS,
+    stride_cn: tl.constexpr = 1,
+    M: tl.constexpr = _ROWS,
+    N: tl.constexpr = _COLUMNS,
+    K: tl.constexpr = _DEPTH,
+    BLOCK_M: tl.constexpr = 32,
+    BLOCK_N: tl.constexpr = 16,
+    BLOCK_K: tl.constexpr = 64,
+):
+    """Walks the columns, the tokens, then the reduction, which holds one column block's weights across the
+    token blocks a host issues against it."""
+    offs_k = tl.arange(0, BLOCK_K)
+    for tile in range(0, N, BLOCK_N):
+        offs_n = tile + tl.arange(0, BLOCK_N)
+        for block in range(0, M, BLOCK_M):
+            offs_m = block + tl.arange(0, BLOCK_M)
+            activation_pointers = activation_pointer + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+            weight_pointers = weight_pointer + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+            accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for _ in range(0, K, BLOCK_K):
+                accumulator += tl.dot(tl.load(activation_pointers), tl.load(weight_pointers))
+                activation_pointers += BLOCK_K * stride_ak
+                weight_pointers += BLOCK_K * stride_bk
+            output_pointers = output_pointer + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+            tl.store(output_pointers, accumulator)
 
-    The directory is taken from the one argument this accepts, defaulting to the working directory.
+
+@triton.jit
+def matmul_m_k_n(
+    activation_pointer,
+    weight_pointer,
+    output_pointer,
+    stride_am: tl.constexpr = _DEPTH,
+    stride_ak: tl.constexpr = 1,
+    stride_bk: tl.constexpr = _COLUMNS,
+    stride_bn: tl.constexpr = 1,
+    stride_cm: tl.constexpr = _COLUMNS,
+    stride_cn: tl.constexpr = 1,
+    M: tl.constexpr = _ROWS,
+    N: tl.constexpr = _RESIDENT_COLUMNS,
+    K: tl.constexpr = _DEPTH,
+    BLOCK_M: tl.constexpr = 32,
+    BLOCK_N: tl.constexpr = 16,
+    BLOCK_K: tl.constexpr = 64,
+):
+    """Walks the tokens, the reduction, then the columns, which keeps every column tile live to the end of the
+    contraction and accumulates each through memory."""
+    offs_k = tl.arange(0, BLOCK_K)
+    for block in range(0, M, BLOCK_M):
+        offs_m = block + tl.arange(0, BLOCK_M)
+        for depth in range(0, K, BLOCK_K):
+            for tile in range(0, N, BLOCK_N):
+                offs_n = tile + tl.arange(0, BLOCK_N)
+                activation_pointers = (activation_pointer + offs_m[:, None] * stride_am
+                                       + (depth + offs_k)[None, :] * stride_ak)
+                weight_pointers = (weight_pointer + (depth + offs_k)[:, None] * stride_bk
+                                   + offs_n[None, :] * stride_bn)
+                output_pointers = output_pointer + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+                tl.store(output_pointers, tl.load(output_pointers)
+                         + tl.dot(tl.load(activation_pointers), tl.load(weight_pointers)))
+
+
+@triton.jit
+def matmul_n_k_m(
+    activation_pointer,
+    weight_pointer,
+    output_pointer,
+    stride_am: tl.constexpr = _DEPTH,
+    stride_ak: tl.constexpr = 1,
+    stride_bk: tl.constexpr = _COLUMNS,
+    stride_bn: tl.constexpr = 1,
+    stride_cm: tl.constexpr = _COLUMNS,
+    stride_cn: tl.constexpr = 1,
+    M: tl.constexpr = _ROWS,
+    N: tl.constexpr = _COLUMNS,
+    K: tl.constexpr = _DEPTH,
+    BLOCK_M: tl.constexpr = 32,
+    BLOCK_N: tl.constexpr = 16,
+    BLOCK_K: tl.constexpr = 64,
+):
+    """Walks the columns, the reduction, then the tokens, which keeps every token block live to the end of the
+    contraction and accumulates each through memory."""
+    offs_k = tl.arange(0, BLOCK_K)
+    for tile in range(0, N, BLOCK_N):
+        offs_n = tile + tl.arange(0, BLOCK_N)
+        for depth in range(0, K, BLOCK_K):
+            for block in range(0, M, BLOCK_M):
+                offs_m = block + tl.arange(0, BLOCK_M)
+                activation_pointers = (activation_pointer + offs_m[:, None] * stride_am
+                                       + (depth + offs_k)[None, :] * stride_ak)
+                weight_pointers = (weight_pointer + (depth + offs_k)[:, None] * stride_bk
+                                   + offs_n[None, :] * stride_bn)
+                output_pointers = output_pointer + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+                tl.store(output_pointers, tl.load(output_pointers)
+                         + tl.dot(tl.load(activation_pointers), tl.load(weight_pointers)))
+
+
+@triton.jit
+def matmul_k_m_n(
+    activation_pointer,
+    weight_pointer,
+    output_pointer,
+    stride_am: tl.constexpr = _DEPTH,
+    stride_ak: tl.constexpr = 1,
+    stride_bk: tl.constexpr = _COLUMNS,
+    stride_bn: tl.constexpr = 1,
+    stride_cm: tl.constexpr = _COLUMNS,
+    stride_cn: tl.constexpr = 1,
+    M: tl.constexpr = _ROWS,
+    N: tl.constexpr = _RESIDENT_SQUARE_COLUMNS,
+    K: tl.constexpr = _DEPTH,
+    BLOCK_M: tl.constexpr = 32,
+    BLOCK_N: tl.constexpr = 16,
+    BLOCK_K: tl.constexpr = 64,
+):
+    """Walks the reduction, the tokens, then the columns, which keeps the whole block live to the end of the
+    contraction and accumulates it through memory."""
+    offs_k = tl.arange(0, BLOCK_K)
+    for depth in range(0, K, BLOCK_K):
+        for block in range(0, M, BLOCK_M):
+            offs_m = block + tl.arange(0, BLOCK_M)
+            for tile in range(0, N, BLOCK_N):
+                offs_n = tile + tl.arange(0, BLOCK_N)
+                activation_pointers = (activation_pointer + offs_m[:, None] * stride_am
+                                       + (depth + offs_k)[None, :] * stride_ak)
+                weight_pointers = (weight_pointer + (depth + offs_k)[:, None] * stride_bk
+                                   + offs_n[None, :] * stride_bn)
+                output_pointers = output_pointer + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+                tl.store(output_pointers, tl.load(output_pointers)
+                         + tl.dot(tl.load(activation_pointers), tl.load(weight_pointers)))
+
+
+@triton.jit
+def matmul_k_n_m(
+    activation_pointer,
+    weight_pointer,
+    output_pointer,
+    stride_am: tl.constexpr = _DEPTH,
+    stride_ak: tl.constexpr = 1,
+    stride_bk: tl.constexpr = _COLUMNS,
+    stride_bn: tl.constexpr = 1,
+    stride_cm: tl.constexpr = _COLUMNS,
+    stride_cn: tl.constexpr = 1,
+    M: tl.constexpr = _ROWS,
+    N: tl.constexpr = _RESIDENT_SQUARE_COLUMNS,
+    K: tl.constexpr = _DEPTH,
+    BLOCK_M: tl.constexpr = 32,
+    BLOCK_N: tl.constexpr = 16,
+    BLOCK_K: tl.constexpr = 64,
+):
+    """Walks the reduction, the columns, then the tokens, which keeps the whole block live to the end of the
+    contraction and accumulates it through memory."""
+    offs_k = tl.arange(0, BLOCK_K)
+    for depth in range(0, K, BLOCK_K):
+        for tile in range(0, N, BLOCK_N):
+            offs_n = tile + tl.arange(0, BLOCK_N)
+            for block in range(0, M, BLOCK_M):
+                offs_m = block + tl.arange(0, BLOCK_M)
+                activation_pointers = (activation_pointer + offs_m[:, None] * stride_am
+                                       + (depth + offs_k)[None, :] * stride_ak)
+                weight_pointers = (weight_pointer + (depth + offs_k)[:, None] * stride_bk
+                                   + offs_n[None, :] * stride_bn)
+                output_pointers = output_pointer + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+                tl.store(output_pointers, tl.load(output_pointers)
+                         + tl.dot(tl.load(activation_pointers), tl.load(weight_pointers)))
+
+
+def main() -> int:
+    """Writes the operand pair the kernels above run on, at the widest extents any of them declares.
 
     Returns:
         Zero once both files are written.

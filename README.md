@@ -96,9 +96,10 @@ so each one runs from the repository root with no `PYTHONPATH` export.
 | Entry point             | Purpose                                                                          |
 |-------------------------|----------------------------------------------------------------------------------|
 | `kernel_entry_point.py` | Reads any Triton kernel into the compiler and emits its image                    |
-| `sample_gemm.py`        | Holds the GEMM kernel the compiler is exercised against, and writes its operands |
+| `sample_gemm.py`        | Holds a GEMM kernel per loop order, and writes the operands they share           |
 | `tools/sim_gemm.py`     | Runs an emitted GEMM image against the RTL and reports its error                 |
 | `tools/gen_isa_doc.py`  | Regenerates or checks every artifact derived from the ISA source                 |
+| `tools/run_on_board.py` | Compiles one kernel or several and runs them over a single SSH session           |
 
 ### Compiling and Checking a Kernel
 
@@ -110,8 +111,8 @@ python3 kernel_entry_point.py --kernel sample_gemm.py:matmul_kernel \
 python3 tools/sim_gemm.py --image build/e2e/matmul_0.bin --operands build/e2e/matmul_0_operands.npz
 ```
 
-***Note,*** widening the sample to GPT-2's model width by four times it needs `--max-cycles` on the last line,
-because one token block then runs past the two million cycles the testbench allows a round by default.
+***Note,*** the sample covers GPT-2's hidden width, so the last line needs `--max-cycles` and runs long. The
+dimensions the paragraph below names check the emitter at a narrower extent in seconds.
 
 These three carry one kernel from its Triton declaration through the reader, the planner and the emitter, run the
 image they produce against the RTL, and compare the drained product against a float64 reference. The last line reports
@@ -123,55 +124,31 @@ prints every axis the plan pads and every operand it repacks. `--operands` says 
 for, which Triton has no syntax for a kernel to state. A kernel declaring its extents and strides as `tl.constexpr`
 states the rest itself, and `--dims`, `--constexprs` and `--strides` bind whichever of them it leaves open.
 
+`sample_gemm.py` declares one kernel per order its loops walk, named for that order after the colon. Every one of
+them covers the same token rows, being what the register file stages at once. A kernel walking its output tiles
+inside the reduction holds every one of them live until the contraction ends, so it covers the columns one image
+stages rather than the whole width, which is what its own constants state. Such a kernel computes a narrower product
+than the rest, so a comparison across the orders divides each figure by the output it covered.
+
 `tools/sim_gemm.py` also emits an image from dimensions alone, through `--rows`, `--depth` and `--columns`, which
 checks the emitter without a kernel in front of it. `--build-dir` keeps the simulation build across runs, which is
 what makes a sweep cheap.
 
-### Regenerating the ISA Artifacts
-
-```sh
-python3 tools/gen_isa_doc.py --check
-python3 tools/gen_isa_doc.py --write
-```
-
-`compiler/minitpuisa.td` is the single source of truth for the scheduling contract. `--write` regenerates the operation
-table in `docs/ISA_AND_INTERFACES.md`, the localparams in `tb/isa_latency_pkg.sv`, and the per-opcode facts in
-`board_package/isa_model.py`. `--check` exits non-zero when any of those, or any scheduling constant in
-`board_package/asm.py`, disagrees with the source. Edit the TableGen source and regenerate rather than editing an
-artifact, and run `--write` after a fresh clone, because `docs/` is untracked.
 
 ### Deploying to the Board
 
 ```sh
 tools/deploy_board.sh <netid> 187
-tools/deploy_board.sh <netid> 187 --program
 ```
 
 The first argument is your own login on the board and the second is the last octet of the board's address. Every file
 is copied and then verified by md5, because a `tar | ssh` deploy once reported success while writing zero byte files
-and every board check passed against the stale copies already there. `--program` additionally programs the PL and
-reads its password from `board.cred`.
+and every board check passed against the stale copies already there.
 
-Once the package is on the board, run its own targets there:
-
-```sh
-make check           # verify the package without touching hardware
-sudo make minitpu    # set the PL clock, program the PL, provision the runtime devices
-make kernels         # the sixteen board checks
-make reproduce       # every headline claim, in order
-```
-
-***Warning!*** Run `sudo make minitpu` from the deployed package rather than an older copy on the board. The Makefile
-sets the PL clock, and a board that programs the PL without that step runs the fabric at 99.999 MHz, where every check
-still passes and every time is about 1.8 times too slow. See [board_package/README.md](board_package/README.md) for
-what each target proves and what it costs.
-
-A compiled kernel is launched with `triton_kernel.bin` (the image) and `triton_operands.npz` (its operands):
-
-```sh
-scp build/e2e/matmul_0.bin <netid>@<board>:board_package/triton_kernel.bin
-scp build/e2e/matmul_0_operands.npz <netid>@<board>:board_package/triton_operands.npz
-```
+***Warning!*** Program the board with `sudo make minitpu` from the deployed package rather than with a script on its
+own. The Makefile sets the PL clock first, and a board that programs the PL without that step runs the fabric at
+99.999 MHz, where every check still passes and every time is about 1.8 times too slow. See
+[board_package/README.md](board_package/README.md) for the targets the package carries and what each one proves.
 
 ### Running the Tests
 
@@ -182,6 +159,44 @@ python3 -m unittest discover -s board_package/tests -t board_package/tests -q
 This runs 86 unit tests covering the assembler encodings, the scheduling distances, the operand rule, the address
 space, the drain, and the compiler path from a decorated Triton kernel through to the image its plan emits. The
 compiler tests import Triton, so they run on the host rather than on the board.
+
+Checking an emitted image against the board runs through `tools/run_on_board.py`, which compiles the kernel itself
+and launches it there over a single SSH session.
+
+```sh
+python3 sample_gemm.py build/e2e
+python3 tools/run_on_board.py --octet 187 --program \
+    --kernel sample_gemm.py:matmul_kernel \
+    --operands activation_pointer=*bf16,weight_pointer=*bf16,output_pointer=*fp32 \
+    --activations build/e2e/activations.npy --weights build/e2e/weights.npy
+```
+
+The first line writes the operands the second packs beside the image. A compile given no `--activations` and
+`--weights` writes the image alone, and the run then stops on the missing `matmul_0_operands.npz` before it reaches
+the board, including a run `--make` points at a target instead.
+
+`--kernel` repeats, which compiles several kernels and runs them in turn inside the one session, so a sweep over
+the orders `sample_gemm.py` declares sends the package once and asks for the sudo password once. A kernel that fails
+leaves the rest of the sweep measured and the session exits non-zero.
+
+```sh
+python3 tools/run_on_board.py --octet 187 \
+    --kernel sample_gemm.py:matmul_kernel --kernel sample_gemm.py:matmul_n_m_k \
+    --kernel sample_gemm.py:matmul_m_k_n --kernel sample_gemm.py:matmul_n_k_m \
+    --kernel sample_gemm.py:matmul_k_m_n --kernel sample_gemm.py:matmul_k_n_m \
+    --operands activation_pointer=*bf16,weight_pointer=*bf16,output_pointer=*fp32 \
+    --activations build/e2e/activations.npy --weights build/e2e/weights.npy
+```
+
+`--octet` selects the board, and the flags describing the launch are the ones `kernel_entry_point.py` takes. One
+session carries the compile, the copy and the launch together because a board erases the home directory and revokes
+the account's runtime devices once no session holds it, which leaves a package copied by one connection gone before a
+second one reaches it. `--make` runs one of the package's own targets in place of the launch, and
+[board_package/README.md](board_package/README.md) states what each one proves. `--program` stands in the first
+command because it sets the PL clock, programs the PL and provisions the runtime devices before the launch, which a
+board that has not been programmed since boot needs, and it reads its sudo password from the prompt. A board already
+carrying this bitstream at this clock drops the flag, and one still holding this account's session takes
+`--no-provision`.
 
 ___
 

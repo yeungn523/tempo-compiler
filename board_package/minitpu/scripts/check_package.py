@@ -19,16 +19,29 @@ BITSTREAM = MINITPU_DIR / "minitpu_zcu104.bit.bin"
 OVERLAY = MINITPU_DIR / "overlay.dtso"
 UDMABUF_MODULE = MINITPU_DIR / "u-dma-buf.ko"
 
+# A whole ZCU104 bitstream is about 18 MiB, so this floor clears the one this package
+# ships while any materially cut copy of it falls short.
+BITSTREAM_MINIMUM_BYTES = 16 * 1024 * 1024
+
 # The one file that is empty on purpose: a namespace marker.
 DELIBERATELY_EMPTY = {"minitpu_runtime/minitpu/__init__.py"}
 
 
-def require(path: pathlib.Path) -> bool:
-    if path.is_file() and path.stat().st_size:
-        print(f"  {path.relative_to(HERE)} ({path.stat().st_size} bytes)")
-        return True
-    print(f"  MISSING: {path.relative_to(HERE)}")
-    return False
+def require(path: pathlib.Path, *, minimum_bytes: int = 1) -> bool:
+    """Report whether the file is present and clears the given size floor.
+
+    A blob large enough to survive a truncating deploy can still arrive cut rather than empty, which a
+    non-zero size alone reads as success.
+    """
+    if not path.is_file():
+        print(f"  MISSING: {path.relative_to(HERE)}")
+        return False
+    size = path.stat().st_size
+    if size < minimum_bytes:
+        print(f"  TRUNCATED: {path.relative_to(HERE)} ({size} bytes, expected {minimum_bytes} or more)")
+        return False
+    print(f"  {path.relative_to(HERE)} ({size} bytes)")
+    return True
 
 
 def check_sources_are_not_truncated() -> bool:
@@ -88,7 +101,8 @@ def check_kernels_assemble() -> bool:
 
 def main() -> int:
     print("board-time files:")
-    blobs = require(BITSTREAM) and require(OVERLAY) and require(UDMABUF_MODULE)
+    blobs = (require(BITSTREAM, minimum_bytes=BITSTREAM_MINIMUM_BYTES)
+             and require(OVERLAY) and require(UDMABUF_MODULE))
     print("\npackage integrity:")
     sources = check_sources_are_not_truncated()
     kernels = check_kernels_assemble() if sources else False

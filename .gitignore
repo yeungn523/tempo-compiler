@@ -222,6 +222,7 @@ docs/
 
 # FPGA bitstreams
 *.bit.bin
+!board_package/minitpu/minitpu_zcu104.bit.bin
 
 AGENTS.md
 CLAUDE.md

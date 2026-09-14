@@ -30,7 +30,7 @@ import emit  # noqa: E402
 from bf16 import (_BLOCK_DEPTH, _BLOCK_TOKENS, _BLOCK_WEIGHT_BYTES, _ELEMENT_BYTES, _TILE,  # noqa: E402
                   _ZERO_TILE_WORDS, build_operands, from_bf16_words, pack_activations, pack_weights,
                   reduce_drain)
-from compiler.compile import Launch  # noqa: E402
+from compiler.ir import Launch  # noqa: E402
 
 _TOLERANCE: float = 0.02
 """Relative error the BF16 accumulate chain is allowed, which the board check also holds to."""

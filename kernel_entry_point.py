@@ -19,7 +19,7 @@ sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE / "board_package"))
 
 from compiler import ProgramError, compile_launch, plan, read_program, signature_of, stage  # noqa: E402
-from compiler.compile import FusedLaunch  # noqa: E402
+from compiler.ir import FusedLaunch  # noqa: E402
 from asm import BUNDLE_BYTES, IRAM_DEPTH  # noqa: E402
 from bf16 import (  # noqa: E402
     _BLOCK_TOKENS,

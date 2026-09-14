@@ -25,7 +25,7 @@ import kernels  # noqa: E402
 import sample_triton  # noqa: E402
 from bf16 import _BLOCK_DEPTH, _BLOCK_TOKENS, _TILE  # noqa: E402
 from compiler import ProgramError, compile_launch, plan, read_program, signature_of  # noqa: E402
-from compiler.compile import FusedLaunch  # noqa: E402
+from compiler.ir import FusedLaunch  # noqa: E402
 from compiler_tests.test_layout import renaming_onto  # noqa: E402
 from layout import register_map  # noqa: E402
 

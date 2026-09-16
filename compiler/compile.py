@@ -57,6 +57,10 @@ def compile_launch(launch: Launch | FusedLaunch) -> tuple[bytes, Staging]:
         try:
             return AsmKernel(name="fused_ffn", bundles=bundles).to_bytes(pad_to=4), staging
         except ValueError as error:
+            try:
+                return AsmKernel(name="fused_ffn", bundles=bundles, placement="pack").to_bytes(pad_to=4), staging
+            except ValueError:
+                pass
             message = (
                 f"Fused launch cannot fit in hardware IRAM: {error}\n"
                 f"Note: Kernel image ({len(bundles)} bundles) exceeds the 4096 IRAM capacity."
@@ -77,6 +81,10 @@ def compile_launch(launch: Launch | FusedLaunch) -> tuple[bytes, Staging]:
     try:
         return AsmKernel(name="looped_gemm", bundles=bundles).to_bytes(pad_to=4), staging
     except ValueError as error:
+        try:
+            return AsmKernel(name="looped_gemm", bundles=bundles, placement="pack").to_bytes(pad_to=4), staging
+        except ValueError:
+            pass
         message = (
             f"Launch cannot fit in hardware IRAM: {error}\n"
             f"Note: Unrolling {launch.output_tiles} output tiles for BLOCK_N={launch.block_n} "

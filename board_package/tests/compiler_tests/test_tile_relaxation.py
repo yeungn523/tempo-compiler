@@ -194,13 +194,22 @@ class TileRelaxationTest(unittest.TestCase):
         self.assertGreater(len(image), 0)
         self.assertEqual(launch.block_n, 64)
 
-    def test_excessive_iram_raises_error(self) -> None:
-        """Asserts that unrolling too many output tiles catches IRAM overflow cleanly."""
+    def test_large_tile_decomposes_and_compiles(self) -> None:
+        """Asserts that large tile sizes (e.g. BLOCK_N=128) decompose to hardware-safe micro-tiles and compile."""
         _, planned = _compile_helper(gemm_excessive_n)
         launch = planned.launches[0]
-        with self.assertRaises(ProgramError) as ctx:
-            compile_launch(launch)
-        self.assertIn("IRAM", str(ctx.exception))
+        self.assertLessEqual(launch.block_n, 128)
+        image, staging = compile_launch(launch)
+        self.assertGreater(len(image), 0)
+
+    def test_large_m_decomposes_and_compiles(self) -> None:
+        """Asserts that large row blocks (e.g. BLOCK_M=128) decompose to row_blocks and compile."""
+        _, planned = _compile_helper(gemm_excessive_m)
+        launch = planned.launches[0]
+        self.assertLessEqual(launch.block_m, 64)
+        self.assertEqual(launch.row_blocks, 4)
+        image, staging = compile_launch(launch)
+        self.assertGreater(len(image), 0)
 
     def test_single_iteration_folded_loop_plans(self) -> None:
         """Asserts that a kernel whose loop runs once (folded by Triton) plans without error."""

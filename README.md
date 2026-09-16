@@ -254,6 +254,7 @@ ___
 ## Authors
 
 - Natalie Yeung ([yeungn523](https://github.com/yeungn523))
+- Duke Gandin
 
 ___
 

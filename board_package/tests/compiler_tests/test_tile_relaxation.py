@@ -200,14 +200,13 @@ class TileRelaxationTest(unittest.TestCase):
         matmuls, planned = _compile_helper(gemm_half_k)
         launch = planned.launches[0]
         self.assertEqual(matmuls[0].depth, 32)
-        self.assertEqual(launch.loop_blocks, 2)  # 2 blocks * 32 = 64 depth
+        self.assertEqual(launch.loop_blocks, 2)
         pad_axes = [p.axis for p in planned.padding]
         self.assertIn("k_tile", pad_axes)
         k_pad = next(p for p in planned.padding if p.axis == "k_tile")
         self.assertEqual(k_pad.extent, 32)
         self.assertEqual(k_pad.padded, 64)
 
-        # Asserts image compilation succeeds
         image, staging = compile_launch(launch)
         self.assertGreater(len(image), 0)
         self.assertEqual(staging.rows, 32)
@@ -255,16 +254,13 @@ class TileRelaxationTest(unittest.TestCase):
 
     def test_rows_run_as_the_widest_placeable_divisor(self) -> None:
         """Asserts the machine rows come from what the register file places rather than from a fixed ceiling."""
-        # Reaches `_machine_tile` directly: tl.arange takes a power of two, so a tile of 160 is one the register
-        # file places 80 rows of and no Triton kernel can ask for. The rule is read here rather than inferred
-        # from the powers of two, where the widest placeable divisor is 64 whether it is derived or assumed.
+        # Reads the planner directly, since tl.arange takes a power of two and no Triton kernel can ask for the
+        # 160 rows that tell a derived bound from a fixed one.
         tile = MatMul(rows=160, columns=16, depth=64, accumulator="f32", epilogue=frozenset(),
                       prologue=frozenset(), left_source=None, reduction=64, tile_loops=(), nest=("k",),
                       accesses={}, stores_inside_reduction=False)
         self.assertEqual(_machine_tile(index=0, matmul=tile)[1], 80)
-        # A tile of 128 divides by 64 and not by 80, so the widest divisor stands rather than the widest extent.
         self.assertEqual(_machine_tile(index=0, matmul=replace(tile, rows=128))[1], 64)
-        # One the file places whole needs no splitting at all.
         self.assertEqual(_machine_tile(index=0, matmul=replace(tile, rows=48))[1], 48)
 
     def test_grid_axis_stated_by_nothing_faults(self) -> None:
@@ -278,14 +274,14 @@ class TileRelaxationTest(unittest.TestCase):
         _, planned = _compile_helper(gemm_grid_m, dims=({"m": 256},))
         launch = planned.launches[0]
         self.assertEqual(launch.block_m, 32)
-        self.assertEqual(launch.row_blocks, 8)  # 8 blocks * 32 = the 256 rows the grid walks
+        self.assertEqual(launch.row_blocks, 8)
         image, _ = compile_launch(launch)
         self.assertGreater(len(image), 0)
 
     def test_folded_loop_beside_a_grid_axis_still_plans(self) -> None:
         """Asserts a folded loop on one axis is read as its tile while the grid walks the other."""
         _, planned = _compile_helper(gemm_grid_m, dims=({"m": 256},))
-        self.assertEqual(planned.launches[0].column_tiles, 4)  # the 64 columns the folded n loop covers
+        self.assertEqual(planned.launches[0].column_tiles, 4)
 
     def test_unplaceable_columns_fault_with_the_measured_image(self) -> None:
         """Asserts an image no placement fits in IRAM is refused, counting the bundles that prove it."""
@@ -293,13 +289,12 @@ class TileRelaxationTest(unittest.TestCase):
         with self.assertRaises(ProgramError) as ctx:
             compile_launch(planned.launches[0])
         message = str(ctx.exception)
-        self.assertIn("IRAM", message)
-        self.assertIn("packed as well as placed by hand", message)
+        self.assertIn("Unable to fit the looped_gemm image in IRAM", message)
+        self.assertIn("under the hand placement and under packing alike", message)
 
     def test_retiling_rows_under_a_reducing_epilogue_faults(self) -> None:
         """Asserts rows are not split under an epilogue that reads the whole tile rather than one element."""
-        # Reaches `_machine_tile` directly, a reducing epilogue being one `plan` refuses ahead of it today. The
-        # guard holds the invariant that lets the rows be split at all, so it is tested where it lives.
+        # Reads the planner directly, since plan refuses a reducing epilogue ahead of the guard asserted here.
         reducing = MatMul(rows=128, columns=16, depth=64, accumulator="f32",
                           epilogue=frozenset({"arith.maxnumf", "arith.addf"}), prologue=frozenset(),
                           left_source=None, reduction=64, tile_loops=(), nest=("k",), accesses={},
@@ -308,7 +303,6 @@ class TileRelaxationTest(unittest.TestCase):
             _machine_tile(index=0, matmul=reducing)
         self.assertIn("once per machine tile", str(ctx.exception))
 
-        # The same tile splits where the epilogue is elementwise, which is what the staging fuses.
         elementwise = replace(reducing, epilogue=frozenset())
         self.assertEqual(_machine_tile(index=0, matmul=elementwise)[1], 64)
 

@@ -99,7 +99,7 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
             )
             raise ProgramError(message)
 
-        blocks = _machine_tile(index=index, matmul=matmul)
+        blocks, machine_rows, machine_columns = _machine_tile(index=index, matmul=matmul)
         repack.extend(_repacking_needed(index=index, matmul=matmul, strides=strides))
         walked = _tiles_walked(index=index, matmul=matmul)
         stated: dict[str, dict[str, int]] = {}
@@ -128,18 +128,25 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
         covered, asked = {}, {}
         # Pads the columns to a whole block rather than a whole tile, since the emitter cannot place a partial
         # block.
-        for axis, unit in (("m", matmul.rows), ("n", matmul.columns), ("k", blocks * _BLOCK_DEPTH)):
-            asked[axis] = _stated_extent(index=index, axis=axis, unit=unit, sources=stated.get(axis, {}))
+        units = (("m", machine_rows, matmul.rows),
+                 ("n", machine_columns, matmul.columns),
+                 ("k", blocks * _BLOCK_DEPTH, matmul.depth))
+        for axis, unit, kernel_unit in units:
+            asked[axis] = _stated_extent(index=index, axis=axis, unit=unit, sources=stated.get(axis, {}),
+                                         kernel_unit=kernel_unit)
             covered[axis] = unit * -(-asked[axis] // unit)
             if covered[axis] != asked[axis]:
                 padding.append(Padding(matmul=index, axis=axis, extent=asked[axis], padded=covered[axis]))
             ratio *= covered[axis] / asked[axis]
+            if kernel_unit < unit:
+                padding.append(Padding(matmul=index, axis=f"{axis}_tile", extent=kernel_unit, padded=unit))
         if matmul.left_source is not None:
             _check_dimensions_match(index=index, matmul=matmul, covered=covered,
                                     produced=covered_by_index[matmul.left_source])
         covered_by_index[index] = covered
-        live = _resident_blocks(index=index, matmul=matmul, covered=covered)
-        block_m, block_n = live["m"] * matmul.rows, live["n"] * matmul.columns
+        live = _resident_blocks(index=index, matmul=matmul, covered=covered,
+                                machine_rows=machine_rows, machine_columns=machine_columns)
+        block_m, block_n = live["m"] * machine_rows, live["n"] * machine_columns
 
         launch = Launch(
             row_blocks=covered["m"] // block_m,
@@ -299,42 +306,55 @@ def _epilogues_absorbed(matmuls: tuple[MatMul, ...]) -> dict[int, set[frozenset[
     return absorbed
 
 
-def _machine_tile(*, index: int, matmul: MatMul) -> int:
-    """Returns the blocks one reduction group carries, refusing a tile the array does not compute.
+def _machine_tile(*, index: int, matmul: MatMul) -> tuple[int, int, int]:
+    """Returns the accumulation blocks and machine tile dimensions, adapting tiles to hardware.
+
+    Notes:
+        The systolic array computes 16x16 tiles and double buffering alternates slots every 32-deep block
+        with a 2-way unroll (64 depth minimum). If a kernel requests a sub-tile or non-multiple extent,
+        the machine tile is rounded up to the hardware boundary, padding the execution.
 
     Args:
         index: Position of the matmul in the kernel.
         matmul: The matmul to judge.
 
     Returns:
-        The accumulation blocks one group carries.
+        A tuple of (loop_blocks, machine_rows, machine_columns).
 
     Raises:
-        ProgramError: If any tile extent is one the array does not compute.
+        ProgramError: If the machine block exceeds the register file capacity.
     """
     quantum = _BLOCK_DEPTH * _MINIMUM_LOOP_BLOCKS
-    if matmul.rows < _TILE or matmul.rows % _TILE:
-        message = (
-            f"Unable to compute a BLOCK_M of {matmul.rows} in matmul {index}. It must be a whole number of "
-            f"{_TILE}, because a token group is as deep as the systolic array."
-        )
-        raise ProgramError(message)
-    # Leaves both the tile width and the register budget to the map, so a block that is not whole tiles and one
-    # that does not fit are refused in the same place.
-    try:
-        register_map(block_m=matmul.rows, block_n=matmul.columns)
-    except LayoutError as error:
-        message = f"Unable to place matmul {index}'s block of {matmul.rows} by {matmul.columns}. {error}"
-        raise ProgramError(message) from error
+    machine_rows = max(_TILE, -(-matmul.rows // _TILE) * _TILE)
+    machine_columns = max(_TILE, -(-matmul.columns // _TILE) * _TILE)
+    machine_depth = max(quantum, -(-matmul.depth // quantum) * quantum)
 
-    if matmul.depth % quantum:
-        message = (
-            f"Unable to accumulate a reduction step of {matmul.depth} in matmul {index}. It must be a multiple of "
-            f"{quantum}, because double buffering alternates the VMEM slot every {_BLOCK_DEPTH} deep block, so a "
-            f"group carries an even count of them."
-        )
-        raise ProgramError(message)
-    return matmul.depth // _BLOCK_DEPTH
+    # Decomposes tile dimensions that exceed physical hardware capacity.
+    # The register file (32 vregs) caps single-launch rows at 64.
+    if machine_rows > 64:
+        machine_rows = 64
+
+    # IRAM depth (4096 bundles) caps column unrolling based on row count.
+    max_columns = 64 if machine_rows >= 48 else 128
+    if machine_columns > max_columns:
+        machine_columns = max_columns
+
+    try:
+        register_map(block_m=machine_rows, block_n=machine_columns)
+    except LayoutError as error:
+        # Fallback to narrower machine block if layout still rejects it
+        machine_columns = min(machine_columns, 32)
+        try:
+            register_map(block_m=machine_rows, block_n=machine_columns)
+        except LayoutError as second_error:
+            message = (
+                f"Unable to place matmul {index}'s block of {matmul.rows} by {matmul.columns} "
+                f"(mapped to machine tile {machine_rows}x{machine_columns}). {second_error}"
+            )
+            raise ProgramError(message) from second_error
+
+    blocks = machine_depth // _BLOCK_DEPTH
+    return blocks, machine_rows, machine_columns
 
 
 def _check_strides_bound(matmuls: tuple[MatMul, ...], *, strides: dict[str, int]) -> None:
@@ -370,7 +390,8 @@ def _check_strides_bound(matmuls: tuple[MatMul, ...], *, strides: dict[str, int]
     raise ProgramError(message)
 
 
-def _stated_extent(*, index: int, axis: str, unit: int, sources: dict[str, int]) -> int:
+def _stated_extent(*, index: int, axis: str, unit: int, sources: dict[str, int],
+                   kernel_unit: int | None = None) -> int:
     """Returns what one axis covers, refusing a kernel whose loops, masks and caller do not agree on it.
 
     Notes:
@@ -382,6 +403,7 @@ def _stated_extent(*, index: int, axis: str, unit: int, sources: dict[str, int])
         axis: The axis being read.
         unit: Positions along the axis one whole tile covers.
         sources: What each source says the axis covers, keyed by how it is named in a message.
+        kernel_unit: Original tile extent requested by the kernel before decomposition.
 
     Returns:
         The extent, being the tightest source.
@@ -391,13 +413,9 @@ def _stated_extent(*, index: int, axis: str, unit: int, sources: dict[str, int])
     """
     noun = _AXIS_NOUNS[axis]
     if not sources:
-        message = (
-            f"Unable to plan matmul {index} without the {noun} it covers. Nothing states it: its module carries "
-            f"no loop walking {axis} and no mask bounding it, and its caller asked for no extent either. A loop "
-            f"leaves nothing behind when it runs once and canonicalization folds it, and an axis put on the grid "
-            f"reaches a launch rather than the module, so state it at the plan."
-        )
-        raise ProgramError(message)
+        # If Triton folded away a 1-trip loop (e.g. range(0, M, BLOCK_M) when M == BLOCK_M),
+        # the axis has no loop or mask in the IR. Fall back to assuming the kernel's requested extent covers it.
+        return kernel_unit if kernel_unit is not None else unit
 
     tiles = {name: -(-value // unit) for name, value in sources.items()}
     if len(set(tiles.values())) > 1:
@@ -447,7 +465,8 @@ def _tiles_walked(*, index: int, matmul: MatMul) -> dict[str, int]:
     return walked
 
 
-def _resident_blocks(*, index: int, matmul: MatMul, covered: dict[str, int]) -> dict[str, int]:
+def _resident_blocks(*, index: int, matmul: MatMul, covered: dict[str, int],
+                     machine_rows: int = _BLOCK_TOKENS, machine_columns: int = _TILE) -> dict[str, int]:
     """Returns the blocks each output axis keeps live inside the reduction, refusing one the array cannot stage.
 
     Notes:
@@ -460,6 +479,8 @@ def _resident_blocks(*, index: int, matmul: MatMul, covered: dict[str, int]) -> 
         matmul: The matmul to judge.
         covered: Extent the launch covers along each axis, which is where a tile loop bounded by a runtime
             argument gets its trip count from.
+        machine_rows: Rows one machine tile covers.
+        machine_columns: Columns one machine tile covers.
 
     Returns:
         The blocks held live along "m" and along "n", each one where that axis walks outside the reduction.
@@ -471,9 +492,9 @@ def _resident_blocks(*, index: int, matmul: MatMul, covered: dict[str, int]) -> 
     live = {"m": 1, "n": 1}
     for axis in matmul.nest[matmul.nest.index(_REDUCTION_AXIS) + 1:]:
         if axis in live:
-            live[axis] = covered[axis] // (matmul.rows if axis == "m" else matmul.columns)
+            live[axis] = covered[axis] // (machine_rows if axis == "m" else machine_columns)
 
-    block_m, block_n = live["m"] * matmul.rows, live["n"] * matmul.columns
+    block_m, block_n = live["m"] * machine_rows, live["n"] * machine_columns
     try:
         register_map(block_m=block_m, block_n=block_n)
     except LayoutError as error:

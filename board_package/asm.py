@@ -97,6 +97,10 @@ W_SFU: int = RTL_PARAMS["WB_W_SFU"]
 W_REDUCE: int = RTL_PARAMS["WB_W_REDUCE"]
 """Writeback offset of a reduction tree result."""
 
+W_LANERED: int = RTL_PARAMS["WB_W_LANERED"]
+"""Writeback offset of a per-sublane reduction, whose 16 wide tree is four levels where the register wide one is
+six."""
+
 W_VLD: int = RTL_PARAMS["WB_W_VLD"]
 """Writeback offset of a VMEM load."""
 
@@ -176,6 +180,12 @@ _VREG_SELECT_W: int = 5
 
 _X_ROW_W: int = 13
 """Bits the X slot's VMEM row field holds, which reaches one slot rather than both."""
+
+_LANE_SUM: int = 0
+"""rb value selecting the sum of a lane reduction."""
+
+_LANE_MAX: int = 1
+"""rb value selecting the maximum of a lane reduction."""
 
 assert _DELAY_SHIFT == COMPUTE_RESERVED_W, (
     "compute payload field positions disagree with the slot widths")
@@ -405,6 +415,21 @@ class AsmBuilder:
     def vredmax(self, vd: int, va: int) -> int:
         """Returns an E-slot word taking the maximum of one VREG's elements through the reduction tree."""
         return _compute_e(10, vd, va, 0)
+
+    def vlanesum(self, vd: int, va: int) -> int:
+        """Returns an E-slot word summing each sublane's own 16 lanes through the lane reduction tree.
+
+        The result is broadcast across the lanes of the sublane it was reduced from, so a row of a popped matrix
+        tile reduces where it already lies. `vredsum` spans the sublanes instead and so fuses four rows into one.
+        """
+        return _compute_e(_OPCODES["vlanered"], vd, va, _LANE_SUM)
+
+    def vlanemax(self, vd: int, va: int) -> int:
+        """Returns an E-slot word taking each sublane's maximum over its own 16 lanes.
+
+        Shares `vlanesum`'s opcode, the two being told apart by rb[0], which a reduction never reads as a register.
+        """
+        return _compute_e(_OPCODES["vlanered"], vd, va, _LANE_MAX)
 
     def vmatload(self, vreg: int) -> int:
         """Returns an M-slot word streaming four consecutive VREGs into the array's weight input.
@@ -861,6 +886,9 @@ _E_SFU_OPS: set[int] = _e_opcodes(w=W_SFU)
 _E_REDUCE_OPS: set[int] = _e_opcodes(w=W_REDUCE)
 """E opcodes carrying reduction latency, each reading port A alone."""
 
+_E_LANE_REDUCE_OPS: set[int] = _e_opcodes(w=W_LANERED)
+"""E opcodes carrying per-sublane reduction latency, which is shallower than the register wide tree's."""
+
 _M_OCCUPANCY: dict[int, int] = {_OPCODES[name]: cycles for name, cycles in MATRIX_OCCUPANCY.items()}
 """Cycles the matrix controller is busy per M subop, keyed by opcode.
 
@@ -1150,6 +1178,9 @@ def _decode(word: int) -> dict:
             d["writes"].append((rd, W_SFU))
         elif op in _E_REDUCE_OPS:
             d["writes"].append((rd, W_REDUCE))
+        elif op in _E_LANE_REDUCE_OPS:
+            # rb carries the sum/max selector rather than a register, so it is read as neither.
+            d["writes"].append((rd, W_LANERED))
         elif op == _E_TXOUT:
             # Reads the staging tile rather than a VREG, so the port-A read recorded above is spurious. Keeping
             # it costs a scheduling gap alone, which is the safe direction here.

@@ -6,6 +6,7 @@ from __future__ import annotations
 import pathlib
 import sys
 import unittest
+from dataclasses import replace
 
 _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_HERE))
@@ -16,6 +17,8 @@ import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
 from compiler import ProgramError, compile_launch, plan, read_program, signature_of  # noqa: E402
+from compiler.ir import MatMul  # noqa: E402
+from compiler.planner import _machine_tile  # noqa: E402
 
 
 @triton.jit
@@ -138,16 +141,55 @@ def gemm_excessive_m(ap, wp, op, stride_am, stride_ak, stride_bk, stride_bn, str
             tl.store(op + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, accumulator)
 
 
+@triton.jit
+def gemm_grid_m(ap, wp, op, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+                M: tl.constexpr = 256, N: tl.constexpr = 64, K: tl.constexpr = 192,
+                BLOCK_M: tl.constexpr = 32, BLOCK_N: tl.constexpr = 16, BLOCK_K: tl.constexpr = 64):
+    """Multiplies with the token axis on the grid, where the module states no extent along m at all."""
+    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+    for tile in range(0, N, BLOCK_N):
+        offs_n = tile + tl.arange(0, BLOCK_N)
+        a = ap + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        b = wp + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for _ in range(0, K, BLOCK_K):
+            accumulator += tl.dot(tl.load(a), tl.load(b))
+            a += BLOCK_K * stride_ak
+            b += BLOCK_K * stride_bk
+        tl.store(op + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, accumulator)
+
+
+@triton.jit
+def gemm_unplaceable_n(ap, wp, op, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+                       M: tl.constexpr = 256, N: tl.constexpr = 256, K: tl.constexpr = 192,
+                       BLOCK_M: tl.constexpr = 64, BLOCK_N: tl.constexpr = 256, BLOCK_K: tl.constexpr = 64):
+    """Multiplies with BLOCK_N=256, whose unrolled image overflows IRAM under either placement."""
+    offs_k = tl.arange(0, BLOCK_K)
+    for block in range(0, M, BLOCK_M):
+        offs_m = block + tl.arange(0, BLOCK_M)
+        for tile in range(0, N, BLOCK_N):
+            offs_n = tile + tl.arange(0, BLOCK_N)
+            a = ap + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+            b = wp + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+            accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for _ in range(0, K, BLOCK_K):
+                accumulator += tl.dot(tl.load(a), tl.load(b))
+                a += BLOCK_K * stride_ak
+                b += BLOCK_K * stride_bk
+            tl.store(op + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, accumulator)
+
+
 _OPERANDS = {"ap": "*bf16", "wp": "*bf16", "op": "*fp32"}
 _STRIDE_NAMES = ("stride_am", "stride_ak", "stride_bk", "stride_bn", "stride_cm", "stride_cn")
 
 
-def _compile_helper(kernel):
+def _compile_helper(kernel, *, dims=None):
     constexprs = {p.name: p.default for p in kernel.params if p.is_constexpr}
     matmuls = read_program(kernel, signature=signature_of(kernel, operands=_OPERANDS), constexprs=constexprs)
     width = constexprs["N"]
     strides = dict(zip(_STRIDE_NAMES, (matmuls[0].reduction, 1, width, 1, width, 1), strict=True))
-    return matmuls, plan(matmuls, strides=strides)
+    return matmuls, plan(matmuls, strides=strides, dims=dims)
 
 
 class TileRelaxationTest(unittest.TestCase):
@@ -194,11 +236,11 @@ class TileRelaxationTest(unittest.TestCase):
         self.assertGreater(len(image), 0)
         self.assertEqual(launch.block_n, 64)
 
-    def test_large_tile_decomposes_and_compiles(self) -> None:
-        """Asserts that large tile sizes (e.g. BLOCK_N=128) decompose to hardware-safe micro-tiles and compile."""
+    def test_wide_columns_stand_as_written_where_the_image_fits(self) -> None:
+        """Asserts a BLOCK_N of 128 runs at the width the kernel asked for, the columns spilling to VMEM."""
         _, planned = _compile_helper(gemm_excessive_n)
         launch = planned.launches[0]
-        self.assertLessEqual(launch.block_n, 128)
+        self.assertEqual(launch.block_n, 128)
         image, staging = compile_launch(launch)
         self.assertGreater(len(image), 0)
 
@@ -210,6 +252,65 @@ class TileRelaxationTest(unittest.TestCase):
         self.assertEqual(launch.row_blocks, 4)
         image, staging = compile_launch(launch)
         self.assertGreater(len(image), 0)
+
+    def test_rows_run_as_the_widest_placeable_divisor(self) -> None:
+        """Asserts the machine rows come from what the register file places rather than from a fixed ceiling."""
+        # Reaches `_machine_tile` directly: tl.arange takes a power of two, so a tile of 160 is one the register
+        # file places 80 rows of and no Triton kernel can ask for. The rule is read here rather than inferred
+        # from the powers of two, where the widest placeable divisor is 64 whether it is derived or assumed.
+        tile = MatMul(rows=160, columns=16, depth=64, accumulator="f32", epilogue=frozenset(),
+                      prologue=frozenset(), left_source=None, reduction=64, tile_loops=(), nest=("k",),
+                      accesses={}, stores_inside_reduction=False)
+        self.assertEqual(_machine_tile(index=0, matmul=tile)[1], 80)
+        # A tile of 128 divides by 64 and not by 80, so the widest divisor stands rather than the widest extent.
+        self.assertEqual(_machine_tile(index=0, matmul=replace(tile, rows=128))[1], 64)
+        # One the file places whole needs no splitting at all.
+        self.assertEqual(_machine_tile(index=0, matmul=replace(tile, rows=48))[1], 48)
+
+    def test_grid_axis_stated_by_nothing_faults(self) -> None:
+        """Asserts an axis the grid walks is refused rather than read as one tile of it."""
+        with self.assertRaises(ProgramError) as ctx:
+            _compile_helper(gemm_grid_m)
+        self.assertIn("grid walks m", str(ctx.exception))
+
+    def test_grid_axis_stated_at_the_plan_covers_it(self) -> None:
+        """Asserts the same kernel plans every row block once its caller states the axis."""
+        _, planned = _compile_helper(gemm_grid_m, dims=({"m": 256},))
+        launch = planned.launches[0]
+        self.assertEqual(launch.block_m, 32)
+        self.assertEqual(launch.row_blocks, 8)  # 8 blocks * 32 = the 256 rows the grid walks
+        image, _ = compile_launch(launch)
+        self.assertGreater(len(image), 0)
+
+    def test_folded_loop_beside_a_grid_axis_still_plans(self) -> None:
+        """Asserts a folded loop on one axis is read as its tile while the grid walks the other."""
+        _, planned = _compile_helper(gemm_grid_m, dims=({"m": 256},))
+        self.assertEqual(planned.launches[0].column_tiles, 4)  # the 64 columns the folded n loop covers
+
+    def test_unplaceable_columns_fault_with_the_measured_image(self) -> None:
+        """Asserts an image no placement fits in IRAM is refused, counting the bundles that prove it."""
+        _, planned = _compile_helper(gemm_unplaceable_n)
+        with self.assertRaises(ProgramError) as ctx:
+            compile_launch(planned.launches[0])
+        message = str(ctx.exception)
+        self.assertIn("IRAM", message)
+        self.assertIn("packed as well as placed by hand", message)
+
+    def test_retiling_rows_under_a_reducing_epilogue_faults(self) -> None:
+        """Asserts rows are not split under an epilogue that reads the whole tile rather than one element."""
+        # Reaches `_machine_tile` directly, a reducing epilogue being one `plan` refuses ahead of it today. The
+        # guard holds the invariant that lets the rows be split at all, so it is tested where it lives.
+        reducing = MatMul(rows=128, columns=16, depth=64, accumulator="f32",
+                          epilogue=frozenset({"arith.maxnumf", "arith.addf"}), prologue=frozenset(),
+                          left_source=None, reduction=64, tile_loops=(), nest=("k",), accesses={},
+                          stores_inside_reduction=False)
+        with self.assertRaises(ProgramError) as ctx:
+            _machine_tile(index=0, matmul=reducing)
+        self.assertIn("once per machine tile", str(ctx.exception))
+
+        # The same tile splits where the epilogue is elementwise, which is what the staging fuses.
+        elementwise = replace(reducing, epilogue=frozenset())
+        self.assertEqual(_machine_tile(index=0, matmul=elementwise)[1], 64)
 
     def test_single_iteration_folded_loop_plans(self) -> None:
         """Asserts that a kernel whose loop runs once (folded by Triton) plans without error."""

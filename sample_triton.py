@@ -63,7 +63,7 @@ def matmul_kernel(
     N: tl.constexpr = _COLUMNS,
     K: tl.constexpr = _DEPTH,
     BLOCK_M: tl.constexpr = 2048,
-    BLOCK_N: tl.constexpr = 256,
+    BLOCK_N: tl.constexpr = 64,
     BLOCK_K: tl.constexpr = 64,
 ):
     """Multiplies an M by K activation by a K by N weight, walking the tokens, the columns, then the reduction.

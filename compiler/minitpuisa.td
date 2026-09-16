@@ -146,20 +146,6 @@ def VectorReduce : OpGroup<"E", ["vredsum", "vredmax"]>
     let rtl_enumerators = ["E_VREDSUM", "E_VREDMAX"];
 }
 
-def VectorLaneReduce : OpGroup<"E", ["vlanered"]>
-{
-    let vreg_reads = "A, each sublane's own 16 lanes";
-    let vreg_writes = "1 sublane-broadcast VREG";
-    let issue_requirement = "II=1; four 16-lane trees, one per sublane, so source-valid latency is 9; W=11 includes the two registered writeback boundaries; rb[0] selects the sum from the max";
-    let writeback_offset = 11;
-    let rtl_parameter = "WB_W_LANERED";
-    let opcodes = [15];
-    let register_reads = ["ra"];
-    let register_write = "rd";
-    let claims_read_port_a = 1;
-    let rtl_enumerators = ["E_VLANERED"];
-}
-
 def TransposeIn : OpGroup<"E", ["vtxin"]>
 {
     let vreg_reads = "A";
@@ -291,7 +277,6 @@ class RtlParameter<string parameter_name, int offset_cycles>
 def WritebackAlu : RtlParameter<"WB_W_ALU", 5>;
 def WritebackSfu : RtlParameter<"WB_W_SFU", 7>;
 def WritebackReduce : RtlParameter<"WB_W_REDUCE", 15>;
-def WritebackLaneReduce : RtlParameter<"WB_W_LANERED", 11>;
 def WritebackVectorLoad : RtlParameter<"WB_W_VLD", 6>;
 def WritebackMatrixPopFirst : RtlParameter<"WB_W_MPOP_FIRST", 3>;
 def WritebackMatrixPopLast : RtlParameter<"WB_W_MPOP_LAST", 6>;
@@ -465,14 +450,12 @@ class EmissionOrder
 
 def IsaOrder : EmissionOrder
 {
-    let operations = [VectorAlu, VectorMove, VectorSfu, VectorReduce, VectorLaneReduce,
-                      TransposeIn, TransposeOut,
+    let operations = [VectorAlu, VectorMove, VectorSfu, VectorReduce, TransposeIn, TransposeOut,
                       VectorLoad, VectorStore,
                       MatrixLoad, MatrixPush, MatrixPop,
                       Scalar, Descriptor, Control];
 
-    let rtl_parameters = [WritebackAlu, WritebackSfu, WritebackReduce, WritebackLaneReduce,
-                          WritebackVectorLoad,
+    let rtl_parameters = [WritebackAlu, WritebackSfu, WritebackReduce, WritebackVectorLoad,
                           WritebackMatrixPopFirst, WritebackMatrixPopLast];
 
     let matrix_commands = [MatrixLoadCommand, MatrixPushCommand, MatrixPopCommand];

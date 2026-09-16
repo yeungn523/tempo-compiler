@@ -18,8 +18,8 @@ FEATURE_TILE = "feature_tile"
 class LayoutError(ValueError):
     """Reports a layout the machine cannot express, or two that do not compose.
 
-    Raised rather than repaired, because an inserted relayout is a launch and a launch costs about 1.2 ms of fixed
-    time however little it moves. The message names both layouts and the cheapest fix.
+    Raised rather than repaired, because an inserted relayout is a launch and a launch costs about 1.2 ms of fixed time
+    however little it moves.
     """
 
 
@@ -64,7 +64,11 @@ class Tiled:
             )
             raise LayoutError(message)
 
-    # -- the layouts the pass actually uses ---------------------------------
+    def __str__(self) -> str:
+        tag = ", replicated" if self.replicated else ""
+        return (f"Tiled(shape={self.shape}, strides={self.strides}, "
+                f"tile_stride={self.tile_stride}{tag})")
+
 
     @staticmethod
     def packed(rows: int, features: int) -> "Tiled":
@@ -85,8 +89,7 @@ class Tiled:
     def token_major(rows: int, features: int) -> "Tiled":
         """Returns the layout the packed softmax stages, being `row = token * stride + tile`.
 
-        The transpose of `packed`, so an access walking feature tiles reads consecutive rows. The stride is
-        `rows_per_token` of the tiles a token owns.
+        The transpose of `packed`, so an access walking feature tiles reads consecutive rows.
         """
         return Tiled((rows, features), (rows_per_token(features // _NUM_LANES),), 1)
 
@@ -100,7 +103,6 @@ class Tiled:
         """Returns `count` packed operands end to end, each starting `stride` rows past the last."""
         return Tiled((count, rows, features), (stride, 1), rows)
 
-    # -- what the compiler derives ------------------------------------------
 
     @property
     def feature_tiles(self) -> int:
@@ -124,10 +126,7 @@ class Tiled:
     def rows_between_sublanes(self, axis: str) -> int:
         """Returns the rows between consecutive sublanes of a VREG walking `axis`.
 
-        One means the access is readable as it lies: a `vld` reads
-        NUM_SUBLANES CONSECUTIVE rows. Anything else has to be closed by the
-        layout, by packing DMEM or by landing the rows where the reader walks,
-        because the sublanes read consecutive rows and nothing else.
+        One means the access is readable as it lies, a `vld` reading NUM_SUBLANES consecutive rows and nothing else.
         """
         if axis == TOKEN:
             return self.token_stride
@@ -178,19 +177,14 @@ class Tiled:
         )
         raise LayoutError(message)
 
-    def __str__(self) -> str:
-        tag = ", replicated" if self.replicated else ""
-        return (f"Tiled(shape={self.shape}, strides={self.strides}, "
-                f"tile_stride={self.tile_stride}{tag})")
 
 
 @dataclass(frozen=True)
 class RegisterMap:
     """Holds where each of a GEMM step's operands lives in the vector register file.
 
-    The regions are laid end to end from register zero, so the registers a tiling leaves free are contiguous and the
-    next tiling can claim them. A step stages one output tile's weights and pops one output tile's results at a
-    time, so only the accumulators scale with the block's width.
+    Only the accumulators scale with the block's width, since a step stages one weight tile and pops one result tile at
+    a time.
 
     Attributes:
         accumulator: First register of the accumulators, which hold `resident` output tiles.
@@ -272,12 +266,117 @@ class VmemRegion:
         return self.base + tile * self.tile_stride + offset
 
 
+@dataclass(frozen=True, slots=True)
+class FusedRegisterMap:
+    """Holds where the fused feed-forward layer's tiles live in the vector register file.
+
+    Attributes:
+        hidden: First register of each token group's hidden tile, which the up projection accumulates, the
+            activation rewrites in place and the down projection pushes.
+        output: First register of each token group's output tile, read and written per output tile swept.
+        staged: First register of each token group's staged input tile.
+        weight: First register of the staged weight tile, being the base a vmatload streams from.
+        result: First register a matrix result pops into.
+    """
+
+    hidden: tuple[int, ...]
+    output: tuple[int, ...]
+    staged: tuple[int, ...]
+    weight: int
+    result: int
+
+    @property
+    def used(self) -> int:
+        """Returns the registers the map hands out."""
+        return self.result + _TILE_VREGS
+
+
+@dataclass(frozen=True, slots=True)
+class FlashRegisterMap:
+    """Holds where one attention block's tiles live in the vector register file.
+
+    The running statistics and the accumulator are rewritten by every key block, so they hold their registers
+    throughout. Everything else dies with the phase that wrote it, so the phases share one transient region rather than
+    each reserving its own.
+
+    Attributes:
+        transient: First register of the region the phases share.
+        row_max: First register of the running row maxima, held broadcast across each sublane's lanes.
+        row_sum: First register of the running row sums, held the same way.
+        accumulator: First register of the output accumulators, which hold `resident` output tiles.
+        scratch: First register of the tile a spilled accumulator is rescaled through, or None when none spills.
+        token_groups: Token groups one block covers, being its queries over the tile.
+        output_tiles: Output tiles the head covers, being its width over the tile.
+        resident: Output tiles the accumulators hold in registers. The rest accumulate in VMEM.
+    """
+
+    transient: int
+    row_max: int
+    row_sum: int
+    accumulator: int
+    scratch: int | None
+    token_groups: int
+    output_tiles: int
+    resident: int
+
+    @property
+    def per_tile(self) -> int:
+        """Returns the registers one tile of every token group occupies."""
+        return self.token_groups * _TILE_VREGS
+
+    @property
+    def weight(self) -> int:
+        """Returns the first register of the stationary operand a vmatload streams from."""
+        return self.transient
+
+    @property
+    def pushed(self) -> int:
+        """Returns the first register of the tile a vmatpush streams into the array."""
+        return self.transient + _TILE_VREGS
+
+    @property
+    def result(self) -> int:
+        """Returns the first register a matrix result pops into."""
+        return self.pushed + self.per_tile
+
+    @property
+    def scores(self) -> int:
+        """Returns the first register of the score tile, which reuses the matrix phase's registers."""
+        return self.transient
+
+    @property
+    def staged(self) -> int:
+        """Returns the first register of the tiles vtxout transposes a score tile into."""
+        return self.scores + self.per_tile
+
+    @property
+    def running(self) -> int:
+        """Returns the first register of the running reduction partials, one per token group."""
+        return self.staged + self.per_tile
+
+    @property
+    def transient_span(self) -> int:
+        """Returns the registers the shared region spans, being the widest phase's demand."""
+        return max(_TILE_VREGS + 2 * self.per_tile, 2 * self.per_tile + self.token_groups)
+
+    @property
+    def used(self) -> int:
+        """Returns the registers the map hands out."""
+        if self.scratch is None:
+            return self.accumulator + self.resident * self.per_tile
+        return self.scratch + _TILE_VREGS
+
+    @property
+    def spilled(self) -> int:
+        """Returns the output tiles that accumulate in VMEM rather than in registers."""
+        return self.output_tiles - self.resident
+
+
 class VmemAllocator:
     """Hands out disjoint VMEM regions, so two staged tensors cannot overlap.
 
-    Bump allocation, because a launch's regions all live as long as the launch. Slot selection stays explicit: a
-    descriptor names its VMEM slot in the immediate, so an allocator spanning slots would produce addresses the D
-    slot and the X slot disagree about.
+    Bump allocation, because a launch's regions all live as long as the launch. A descriptor names its VMEM slot in its
+    immediate, so an allocator spanning slots would produce addresses the D slot and the X slot disagree about.
     """
 
     def __init__(self, *, slot: int = 0,
@@ -339,9 +438,8 @@ class VmemAllocator:
     def token_major_region(self, name: str, tokens: int, *, tiles: int) -> VmemRegion:
         """Reserves `tokens` rows of `tiles` consecutive feature tiles each.
 
-        A token is contiguous here, so an access walking its tiles reads consecutive rows and the tokens are what
-        sit a stride apart. That stride is a power of two, because the AGU reaches a token by shifting the loop
-        index rather than multiplying it.
+        A token is contiguous here, so an access walking its tiles reads consecutive rows and the tokens are what sit a
+        stride apart.
 
         Args:
             name: What is being staged, for collision and overflow reports.
@@ -381,9 +479,7 @@ class VmemAllocator:
     def check_disjoint(self) -> None:
         """Raises if any two regions overlap.
 
-        Bump allocation cannot produce an overlap, so this exists to catch a
-        hand-placed region being mixed in with allocated ones during the migration
-        off the constants -- which is exactly when a silent clobber would appear.
+        Bump allocation cannot produce an overlap, so this catches a hand-placed region mixed in with allocated ones.
         """
         ordered = sorted(self._regions, key=lambda r: r.base)
         for earlier, later in zip(ordered, ordered[1:]):
@@ -395,34 +491,6 @@ class VmemAllocator:
                     f"boundary does not clear VMEM, so the collision is silent."
                 )
                 raise LayoutError(message)
-
-
-@dataclass(frozen=True, slots=True)
-class FusedRegisterMap:
-    """Holds where the fused feed-forward layer's tiles live in the vector register file.
-
-    The regions are laid end to end from register zero, one pair of tiles per token group for each of the three
-    the layer carries across a chunk, then the single tiles the array streams through.
-
-    Attributes:
-        hidden: First register of each token group's hidden tile, which the up projection accumulates, the
-            activation rewrites in place and the down projection pushes.
-        output: First register of each token group's output tile, read and written per output tile swept.
-        staged: First register of each token group's staged input tile.
-        weight: First register of the staged weight tile, being the base a vmatload streams from.
-        result: First register a matrix result pops into.
-    """
-
-    hidden: tuple[int, ...]
-    output: tuple[int, ...]
-    staged: tuple[int, ...]
-    weight: int
-    result: int
-
-    @property
-    def used(self) -> int:
-        """Returns the registers the map hands out."""
-        return self.result + _TILE_VREGS
 
 
 def fused_register_map(*, token_groups: int) -> FusedRegisterMap:
@@ -460,9 +528,8 @@ def fused_register_map(*, token_groups: int) -> FusedRegisterMap:
 def register_map(*, block_m: int, block_n: int) -> RegisterMap:
     """Returns where a block's operands live in the register file, and how much of it accumulates in registers.
 
-    A step stages one activation set per token group, one weight tile and one result tile, so those are placed first
-    and the registers left over decide how many output tiles accumulate in registers. The rest accumulate in VMEM,
-    which costs a scratch tile to read them into and one fewer resident with it.
+    The registers a step's own staging leaves over decide how many output tiles stay resident, the rest accumulating in
+    VMEM through a scratch tile.
 
     Args:
         block_m: Rows one block covers, a whole number of the tile.
@@ -526,11 +593,74 @@ def register_map(*, block_m: int, block_n: int) -> RegisterMap:
                        scratch=result + _TILE_VREGS if scratch_rows else None, scratch_tiles=scratch_tiles)
 
 
+def flash_register_map(*, queries: int, head: int) -> FlashRegisterMap:
+    """Returns where one attention block's tiles sit, refusing an allocation the file cannot hold.
+
+    Notes:
+        A key block's width does not enter this budget, its scores staging in VMEM and being read back one tile at a
+        time. The head's width is what the accumulator costs, and the accumulator is what spills.
+
+    Args:
+        queries: Queries one block covers, a whole number of tiles.
+        head: Width of the head the block accumulates, a whole number of tiles.
+
+    Returns:
+        The map.
+
+    Raises:
+        LayoutError: If either extent is not a whole number of tiles, if the transient region and the running
+            statistics do not fit in the register file, or if a spilling block has no room for its scratch tile.
+    """
+    for name, extent in (("queries", queries), ("head", head)):
+        if extent < _TILE or extent % _TILE:
+            message = (
+                f"Unable to map a {name} of {extent}. A block covers a whole number of {_TILE} wide tiles, "
+                f"because the transpose array and the systolic array are both that wide."
+            )
+            raise LayoutError(message)
+
+    token_groups, output_tiles = queries // _TILE, head // _TILE
+    per_tile = token_groups * _TILE_VREGS
+    entries = PROFILE["vreg_entry_count"]
+
+    # The phases take turns, so the shared region is the widest of them rather than their sum.
+    transient_span = max(_TILE_VREGS + 2 * per_tile, 2 * per_tile + token_groups)
+    row_max = transient_span
+    row_sum = row_max + per_tile
+    accumulator = row_sum + per_tile
+
+    if accumulator > entries:
+        message = (
+            f"Unable to stage a block of {queries} queries: its shared phase region and running statistics want "
+            f"{accumulator} of the {entries} registers present, before the accumulator it carries across the key "
+            f"loop. Narrow the block's queries."
+        )
+        raise LayoutError(message)
+
+    fields = dict(transient=0, row_max=row_max, row_sum=row_sum, accumulator=accumulator,
+                  token_groups=token_groups, output_tiles=output_tiles)
+    free = entries - accumulator
+    if free // per_tile >= output_tiles:
+        return FlashRegisterMap(**fields, scratch=None, resident=output_tiles)
+
+    # A tile the registers cannot hold accumulates in VMEM, which needs somewhere to be rescaled against, so a
+    # block that spills any of them buys that scratch out of what it could otherwise keep resident.
+    if free < _TILE_VREGS:
+        message = (
+            f"Unable to spill a block of {queries} queries by a head of {head}: its staging takes {accumulator} "
+            f"of the {entries} registers present, which leaves no room for the {_TILE_VREGS} register scratch "
+            f"tile a spilled accumulator is rescaled through. Narrow the block's queries."
+        )
+        raise LayoutError(message)
+
+    resident = (free - _TILE_VREGS) // per_tile
+    return FlashRegisterMap(**fields, scratch=accumulator + resident * per_tile, resident=resident)
+
+
 def rows_per_token(tiles: int) -> int:
     """Returns the VMEM rows one token owns when its feature tiles land consecutively.
 
-    Rounded up to a power of two, because the AGU reaches a token by shifting the loop index rather than multiplying
-    it. The padding never exceeds `tiles` rows a token and costs nothing to walk.
+    Rounded up to a power of two, because the AGU reaches a token by shifting the loop index rather than multiplying it.
 
     Args:
         tiles: Feature tiles one token's row covers.

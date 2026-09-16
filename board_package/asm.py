@@ -97,10 +97,6 @@ W_SFU: int = RTL_PARAMS["WB_W_SFU"]
 W_REDUCE: int = RTL_PARAMS["WB_W_REDUCE"]
 """Writeback offset of a reduction tree result."""
 
-W_LANERED: int = RTL_PARAMS["WB_W_LANERED"]
-"""Writeback offset of a per-sublane reduction, whose 16 wide tree is four levels where the register wide one is
-six."""
-
 W_VLD: int = RTL_PARAMS["WB_W_VLD"]
 """Writeback offset of a VMEM load."""
 
@@ -181,11 +177,74 @@ _VREG_SELECT_W: int = 5
 _X_ROW_W: int = 13
 """Bits the X slot's VMEM row field holds, which reaches one slot rather than both."""
 
-_LANE_SUM: int = 0
-"""rb value selecting the sum of a lane reduction."""
+_E_OPCODES_BY_W: dict[int, set[int]] = {
+    width: {opcode
+            for group in OPERATIONS
+            if group["slot"] == "E" and group["w"] == width
+            for opcode in group["opcodes"]}
+    for width in {group["w"] for group in OPERATIONS if group["slot"] == "E"}
+    if isinstance(width, int)
+}
+"""E opcodes sharing each writeback offset, keyed by that offset. A group reserving no write port carries no
+entry."""
 
-_LANE_MAX: int = 1
-"""rb value selecting the maximum of a lane reduction."""
+_E_BINARY_OPS: set[int] = {
+    opcode
+    for group in OPERATIONS
+    if group["slot"] == "E" and "rb" in group["reads"]
+    for opcode in group["opcodes"]
+}
+"""E opcodes reading both source registers."""
+
+_E_ALU_OPS: set[int] = _E_OPCODES_BY_W[W_ALU]
+"""E opcodes carrying ALU latency, which adds the unary vmov to the binary set.
+
+vmax and vmin ride the ALU's move stages, so every opcode in the set keeps one latency."""
+
+_E_TXOUT: int = _OPCODES["vtxout"]
+"""E opcode draining the transpose tile, which writes a VREG and reads none."""
+
+_F_FLUSH: int = _OPCODES["flush_slot"]
+"""F opcode blocking until every DMA slot its mask names reports done."""
+
+_E_SFU_OPS: set[int] = _E_OPCODES_BY_W[W_SFU]
+"""E opcodes carrying SFU latency, each reading port A alone."""
+
+_E_REDUCE_OPS: set[int] = _E_OPCODES_BY_W[W_REDUCE]
+"""E opcodes carrying reduction latency, each reading port A alone."""
+
+_M_OCCUPANCY: dict[int, int] = {_OPCODES[name]: cycles for name, cycles in MATRIX_OCCUPANCY.items()}
+"""Cycles the matrix controller is busy per M subop, keyed by opcode.
+
+A vmatpush retires on beat acceptance, so its entry is the controller's occupancy rather than its result latency."""
+
+_M_HOLDS_PORT_A: set[int] = {_OPCODES[name] for name in MATRIX_PORT_A}
+"""M subops owning VREG read port A while they run, which vmatpop stays out of by never asserting vreg_read_valid_o."""
+
+_M_RESULT_LATENCY: int = MATRIX_RESULT_LATENCY
+"""Cycles from a vmatpush to its first result.
+
+Results leave the array in push order and one vmatpop drains exactly one vmatpush's worth, so the wait is tracked
+as a queue where a pop waits for the oldest un-popped push."""
+
+_MXU_OUTPUT_FIFO_DEPTH: int = 32
+"""Entries in each lane's MXU output FIFO, mirroring mxu.sv gen_lane_output's OUTPUT_FIFO_DEPTH.
+
+Overflow drops results silently, with no replay or recovery, as vpu_fifo.sv's header states."""
+
+_MXU_ENTRIES_PER_PUSH: int = 4
+"""Entries one vmatpush produces, being the NUM_SUBLANES activation rows it streams."""
+
+_MXU_ENTRIES_PER_POP: int = 4
+"""Entries one vmatpop consumes across its masked beats."""
+
+_SCHEDULE_CACHE_MAGIC: bytes = b"MTSC1"
+"""Header for a remembered schedule, carrying `MTSC` and a format number so a file written by a different layout is
+rejected rather than misread."""
+
+_PLACEMENTS: tuple[str, ...] = ("", "place", "pack")
+"""Re-placement passes `MINITPU_PACK` selects between, where "" keeps the builder's own hand placement. The pass
+itself is resolved where it runs, the functions implementing it being defined below."""
 
 assert _DELAY_SHIFT == COMPUTE_RESERVED_W, (
     "compute payload field positions disagree with the slot widths")
@@ -415,21 +474,6 @@ class AsmBuilder:
     def vredmax(self, vd: int, va: int) -> int:
         """Returns an E-slot word taking the maximum of one VREG's elements through the reduction tree."""
         return _compute_e(10, vd, va, 0)
-
-    def vlanesum(self, vd: int, va: int) -> int:
-        """Returns an E-slot word summing each sublane's own 16 lanes through the lane reduction tree.
-
-        The result is broadcast across the lanes of the sublane it was reduced from, so a row of a popped matrix
-        tile reduces where it already lies. `vredsum` spans the sublanes instead and so fuses four rows into one.
-        """
-        return _compute_e(_OPCODES["vlanered"], vd, va, _LANE_SUM)
-
-    def vlanemax(self, vd: int, va: int) -> int:
-        """Returns an E-slot word taking each sublane's maximum over its own 16 lanes.
-
-        Shares `vlanesum`'s opcode, the two being told apart by rb[0], which a reduction never reads as a register.
-        """
-        return _compute_e(_OPCODES["vlanered"], vd, va, _LANE_MAX)
 
     def vmatload(self, vreg: int) -> int:
         """Returns an M-slot word streaming four consecutive VREGs into the array's weight input.
@@ -847,79 +891,6 @@ def check_dma_exclusive(slots: dict[str, int]) -> None:
         raise ValueError(message)
 
 
-def _e_opcodes(*, reads_b: bool | None = None, w: int | None = None) -> set[int]:
-    """Returns the E opcodes matching an operand shape, a writeback offset, or both.
-
-    Args:
-        reads_b: Selects opcodes by whether they read the second source register, or None to ignore it.
-        w: Selects opcodes by writeback offset, or None to ignore it.
-
-    Returns:
-        The matching opcodes.
-    """
-    return {
-        opcode
-        for group in OPERATIONS
-        for opcode in (group["opcodes"] if group["slot"] == "E" else ())
-        if (reads_b is None or ("rb" in group["reads"]) == reads_b)
-        and (w is None or group["w"] == w)
-    }
-
-
-_E_BINARY_OPS: set[int] = _e_opcodes(reads_b=True)
-"""E opcodes reading both source registers."""
-
-_E_ALU_OPS: set[int] = _e_opcodes(w=W_ALU)
-"""E opcodes carrying ALU latency, which adds the unary vmov to the binary set.
-
-vmax and vmin ride the ALU's move stages, so every opcode in the set keeps one latency."""
-
-_E_TXOUT: int = _OPCODES["vtxout"]
-"""E opcode draining the transpose tile, which writes a VREG and reads none."""
-
-_F_FLUSH: int = _OPCODES["flush_slot"]
-"""F opcode blocking until every DMA slot its mask names reports done."""
-
-_E_SFU_OPS: set[int] = _e_opcodes(w=W_SFU)
-"""E opcodes carrying SFU latency, each reading port A alone."""
-
-_E_REDUCE_OPS: set[int] = _e_opcodes(w=W_REDUCE)
-"""E opcodes carrying reduction latency, each reading port A alone."""
-
-_E_LANE_REDUCE_OPS: set[int] = _e_opcodes(w=W_LANERED)
-"""E opcodes carrying per-sublane reduction latency, which is shallower than the register wide tree's."""
-
-_M_OCCUPANCY: dict[int, int] = {_OPCODES[name]: cycles for name, cycles in MATRIX_OCCUPANCY.items()}
-"""Cycles the matrix controller is busy per M subop, keyed by opcode.
-
-A vmatpush retires on beat acceptance, so its entry is the controller's occupancy rather than its result latency."""
-
-_M_HOLDS_PORT_A: set[int] = {_OPCODES[name] for name in MATRIX_PORT_A}
-"""M subops owning VREG read port A while they run, which vmatpop stays out of by never asserting
-vreg_read_valid_o."""
-
-_M_RESULT_LATENCY: int = MATRIX_RESULT_LATENCY
-"""Cycles from a vmatpush to its first result.
-
-Results leave the array in push order and one vmatpop drains exactly one vmatpush's worth, so the wait is tracked
-as a queue where a pop waits for the oldest un-popped push."""
-
-_MXU_OUTPUT_FIFO_DEPTH: int = 32
-"""Entries in each lane's MXU output FIFO, mirroring mxu.sv gen_lane_output's OUTPUT_FIFO_DEPTH.
-
-Overflow drops results silently, with no replay or recovery, as vpu_fifo.sv's header states."""
-
-_MXU_ENTRIES_PER_PUSH: int = 4
-"""Entries one vmatpush produces, being the NUM_SUBLANES activation rows it streams."""
-
-_MXU_ENTRIES_PER_POP: int = 4
-"""Entries one vmatpop consumes across its masked beats."""
-
-_SCHEDULE_CACHE_MAGIC: bytes = b"MTSC1"
-"""Header for a remembered schedule, carrying `MTSC` and a format number so a file written by a different layout is
-rejected rather than misread."""
-
-
 def _bundle(value: int) -> int:
     """Validates that one assembled word fits a physical bundle.
 
@@ -1178,9 +1149,6 @@ def _decode(word: int) -> dict:
             d["writes"].append((rd, W_SFU))
         elif op in _E_REDUCE_OPS:
             d["writes"].append((rd, W_REDUCE))
-        elif op in _E_LANE_REDUCE_OPS:
-            # rb carries the sum/max selector rather than a register, so it is read as neither.
-            d["writes"].append((rd, W_LANERED))
         elif op == _E_TXOUT:
             # Reads the staging tile rather than a VREG, so the port-A read recorded above is spurious. Keeping
             # it costs a scheduling gap alone, which is the safe direction here.
@@ -1676,12 +1644,6 @@ def _remember_schedule(digest: str, words: tuple[int, ...]) -> None:
         return
 
 
-_PLACEMENTS: dict[str, Callable[[list[int]], list[int]] | None] = {
-    "": None, "place": place, "pack": pack,
-}
-"""Re-placement passes `MINITPU_PACK` selects between, where "" keeps the builder's own hand placement."""
-
-
 def _placement() -> str:
     """Returns the re-placement pass `MINITPU_PACK` selects, where "1" is an accepted spelling of "pack".
 
@@ -1720,15 +1682,15 @@ def _scheduled(name: str, bundles: tuple[int, ...], placement: str) -> tuple[int
     if placement not in _PLACEMENTS:
         message = (
             f"Unable to schedule {name}. MINITPU_PACK must name one of "
-            f"{', '.join(repr(key) for key in sorted(_PLACEMENTS))}, but got {placement!r}."
+            f"{', '.join(repr(name) for name in sorted(_PLACEMENTS))}, but got {placement!r}."
         )
         raise ValueError(message)
     digest = _schedule_digest(bundles, placement)
     words = _remembered_schedule(digest)
     if words is None:
         stream = list(bundles)
-        if _PLACEMENTS[placement] is not None:
-            stream = _PLACEMENTS[placement](stream)
+        if placement:
+            stream = {"place": place, "pack": pack}[placement](stream)
         words = tuple(schedule(stream))
         _remember_schedule(digest, words)
     return words

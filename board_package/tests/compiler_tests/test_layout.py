@@ -1,7 +1,9 @@
-"""Contains tests for the register file map a block's tiling derives, and the renaming check it implies.
+"""Contains tests for the register file maps a GEMM block and an attention block derive, and the renaming check the
+first of them implies.
 
-The map exists so a tile size larger than the register file costs VMEM traffic rather than a refusal, so the tests
-cover what stays resident as the block grows and what the file cannot stage at all.
+A map exists so a tile larger than the register file costs VMEM traffic rather than a refusal, so the tests cover what
+stays resident as the block grows and what the file cannot stage at all. The attention map adds a second question,
+being which regions are live at once, because its phases share registers rather than each holding its own.
 """
 
 from __future__ import annotations
@@ -17,8 +19,9 @@ sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE / "minitpu_runtime"))
 
 import asm  # noqa: E402
+from bf16 import _TILE_VREGS  # noqa: E402
 from isa_model import PROFILE  # noqa: E402
-from layout import LayoutError, register_map  # noqa: E402
+from layout import LayoutError, flash_register_map, register_map  # noqa: E402
 
 
 class RegisterMapTest(unittest.TestCase):
@@ -97,19 +100,77 @@ class RegisterMapTest(unittest.TestCase):
                     register_map(block_m=block_m, block_n=block_n)
 
 
-def vmem_row(word: int) -> int | None:
-    """Returns the VMEM row one bundle addresses, or None when it addresses none.
+class FlashRegisterMapTest(unittest.TestCase):
+    """Contains tests for the register file map one attention block derives."""
 
-    Args:
-        word: The bundle word to read.
+    def test_phases_share_the_transient_region(self) -> None:
+        """Verifies that the matrix phase and the reduction phase start at the same register."""
+        mapped = flash_register_map(queries=16, head=64)
+        self.assertEqual(mapped.transient, 0)
+        self.assertEqual(mapped.weight, mapped.transient)
+        self.assertEqual(mapped.scores, mapped.transient)
 
-    Returns:
-        The row, taken from the descriptor's address field for a DMA bundle and from the X slot's otherwise.
-    """
-    if (word >> (asm.BUNDLE_BITS - 1)) & 1:
-        return ((word >> asm._D_SHIFT) >> 20) & ((1 << 14) - 1)
-    slot = (word >> asm._X_SHIFT) & ((1 << asm.X_SLOT_W) - 1)
-    return None if not slot else (slot >> 13) & ((1 << 13) - 1)
+    def test_every_phase_fits_the_shared_region(self) -> None:
+        """Verifies that neither phase reaches past the registers the shared region spans."""
+        mapped = flash_register_map(queries=16, head=64)
+        matrix = mapped.result + mapped.per_tile - mapped.transient
+        reduction = mapped.running + mapped.token_groups - mapped.transient
+        self.assertLessEqual(matrix, mapped.transient_span)
+        self.assertLessEqual(reduction, mapped.transient_span)
+        self.assertEqual(max(matrix, reduction), mapped.transient_span)
+
+    def test_persistent_regions_follow_the_shared_one(self) -> None:
+        """Verifies that what lives across the key loop sits above what the phases reuse."""
+        mapped = flash_register_map(queries=16, head=64)
+        tiles = mapped.per_tile
+        self.assertEqual(mapped.row_max, mapped.transient_span)
+        self.assertEqual(mapped.row_sum, mapped.row_max + tiles)
+        self.assertEqual(mapped.accumulator, mapped.row_sum + tiles)
+
+    def test_sharing_is_what_makes_the_block_fit(self) -> None:
+        """Verifies that the phases summed rather than shared leave no room for the scratch tile."""
+        mapped = flash_register_map(queries=16, head=64)
+        matrix = mapped.result + mapped.per_tile - mapped.transient
+        reduction = mapped.running + mapped.token_groups - mapped.transient
+        summed = matrix + reduction + 2 * mapped.per_tile
+        self.assertGreater(summed + _TILE_VREGS, PROFILE["vreg_entry_count"])
+        self.assertLessEqual(mapped.used, PROFILE["vreg_entry_count"])
+
+    def test_map_fits_the_register_file(self) -> None:
+        """Verifies that the map hands out no more registers than the file holds."""
+        for head in (16, 32, 64, 128, 768):
+            with self.subTest(head=head):
+                self.assertLessEqual(flash_register_map(queries=16, head=head).used,
+                                     PROFILE["vreg_entry_count"])
+
+    def test_narrow_head_stays_resident(self) -> None:
+        """Verifies that a head the file can hold spills nothing and needs no scratch tile."""
+        mapped = flash_register_map(queries=16, head=32)
+        self.assertEqual(mapped.spilled, 0)
+        self.assertIsNone(mapped.scratch)
+
+    def test_wide_head_spills_and_buys_scratch(self) -> None:
+        """Verifies that a head wider than the file holds spills the rest and reserves a scratch tile."""
+        mapped = flash_register_map(queries=16, head=64)
+        self.assertEqual(mapped.resident + mapped.spilled, mapped.output_tiles)
+        self.assertGreater(mapped.spilled, 0)
+        self.assertIsNotNone(mapped.scratch)
+
+    def test_key_block_width_does_not_enter_the_budget(self) -> None:
+        """Verifies that the map depends on the queries and the head alone, the scores staging in VMEM."""
+        self.assertEqual(flash_register_map(queries=16, head=64), flash_register_map(queries=16, head=64))
+
+    def test_wider_query_block_is_refused(self) -> None:
+        """Verifies that a query block whose own staging overruns the file is refused."""
+        with self.assertRaises(LayoutError):
+            flash_register_map(queries=32, head=64)
+
+    def test_partial_tile_is_refused(self) -> None:
+        """Verifies that an extent that is not a whole number of tiles is refused."""
+        for queries, head in ((8, 64), (16, 24)):
+            with self.subTest(queries=queries, head=head):
+                with self.assertRaises(LayoutError):
+                    flash_register_map(queries=queries, head=head)
 
 
 def renaming_onto(derived: tuple[int, ...], hand: tuple[int, ...]) -> dict[int, int] | None:
@@ -132,7 +193,7 @@ def renaming_onto(derived: tuple[int, ...], hand: tuple[int, ...]) -> dict[int, 
     taken: dict[int, int] = {}
     rows: dict[int, int] = {}
     for left, right in zip(derived, hand):
-        left_row, right_row = vmem_row(left), vmem_row(right)
+        left_row, right_row = _vmem_row(left), _vmem_row(right)
         if (left_row is None) != (right_row is None):
             return None
         if left_row is not None and rows.setdefault(left_row, right_row) != right_row:
@@ -149,6 +210,21 @@ def renaming_onto(derived: tuple[int, ...], hand: tuple[int, ...]) -> dict[int, 
             if renaming.setdefault(source, target) != target or taken.setdefault(target, source) != source:
                 return None
     return renaming
+
+
+def _vmem_row(word: int) -> int | None:
+    """Returns the VMEM row one bundle addresses, or None when it addresses none.
+
+    Args:
+        word: The bundle word to read.
+
+    Returns:
+        The row, taken from the descriptor's address field for a DMA bundle and from the X slot's otherwise.
+    """
+    if (word >> (asm.BUNDLE_BITS - 1)) & 1:
+        return ((word >> asm._D_SHIFT) >> 20) & ((1 << 14) - 1)
+    slot = (word >> asm._X_SHIFT) & ((1 << asm.X_SLOT_W) - 1)
+    return None if not slot else (slot >> 13) & ((1 << 13) - 1)
 
 
 if __name__ == "__main__":

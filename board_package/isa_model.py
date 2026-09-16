@@ -17,7 +17,6 @@ RTL_PARAMS: dict[str, int] = {
     "WB_W_ALU": 5,
     "WB_W_SFU": 7,
     "WB_W_REDUCE": 15,
-    "WB_W_LANERED": 11,
     "WB_W_VLD": 6,
     "WB_W_MPOP_FIRST": 3,
     "WB_W_MPOP_LAST": 6,
@@ -72,15 +71,6 @@ OPERATIONS: tuple[dict, ...] = (
         "reads": ["ra"],
         "writes": "rd",
         "w": 15,
-        "port_a": True,
-    },
-    {
-        "slot": "E",
-        "ops": ["vlanered"],
-        "opcodes": [15],
-        "reads": ["ra"],
-        "writes": "rd",
-        "w": 11,
         "port_a": True,
     },
     {

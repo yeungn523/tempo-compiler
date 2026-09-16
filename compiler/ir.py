@@ -102,6 +102,10 @@ class MatMul:
         accesses: How each operand is addressed, keyed by role.
         stores_inside_reduction: Determines whether the kernel writes its accumulator to memory on every step of
             the contraction, rather than carrying it across the whole of it.
+        grid_axes: Output axes the kernel's grid walks, named as the loops are. An axis the grid carries is
+            walked outside the module, so it reaches a launch rather than the module and states no extent the
+            plan can read from the loops. This is what tells such an axis from one whose single trip loop
+            canonicalization folded, which states the tile it asked for and nothing else.
     """
 
     rows: int
@@ -116,6 +120,7 @@ class MatMul:
     nest: tuple[str, ...]
     accesses: dict[str, Access]
     stores_inside_reduction: bool
+    grid_axes: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)

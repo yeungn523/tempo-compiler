@@ -5,11 +5,11 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
-from asm import AsmKernel
-from bf16 import _TILE
+from asm import IRAM_DEPTH, AsmKernel
+from bf16 import _BLOCK_DEPTH, _TILE
 from emit import Staging, fused_ffn_stream, looped_gemm_stream
 
-from .ir import FusedLaunch, Launch, MatMul
+from .ir import FusedLaunch, Launch, MatMul, ProgramError
 
 
 def stage(left: NDArray[np.float32], right: NDArray[np.float32], *, matmul: MatMul,
@@ -26,7 +26,7 @@ def stage(left: NDArray[np.float32], right: NDArray[np.float32], *, matmul: MatM
         The staged pair.
     """
     rows = launch.row_blocks * launch.block_m
-    depth = launch.groups * matmul.depth
+    depth = launch.groups * launch.loop_blocks * _BLOCK_DEPTH
     columns = launch.column_tiles * _TILE
     staged = []
     for operand, shape in ((left, (rows, depth)), (right, (depth, columns))):
@@ -49,21 +49,53 @@ def compile_launch(launch: Launch | FusedLaunch) -> tuple[bytes, Staging]:
 
     Raises:
         NotImplementedError: If a plain launch activates its staged tiles, which the emitter does not place.
+        ProgramError: If the compiled bundles exceed the IRAM depth limit under either placement.
     """
     if isinstance(launch, FusedLaunch):
         bundles, staging = fused_ffn_stream(chunks=launch.chunks, steps=launch.steps,
                                             output_tiles=launch.output_tiles)
-        return AsmKernel(name="fused_ffn", bundles=bundles).to_bytes(pad_to=4), staging
+        return _assemble(name="fused_ffn", bundles=bundles,
+                         remedy="narrow the output the layer covers"), staging
 
     if launch.activate:
         message = (
-            "Unable to compile a launch that activates its staged tiles. The emitter places the staging, the "
-            "matrix commands and the drain only, so such a launch comes from `kernels.build_looped_gemm` until "
-            "the activation is placed here too."
+            "Unable to compile a launch activating its staged tiles outside a fused pair. The activation rides "
+            "the staging of the matmul consuming the product, which is the fused stream rather than this one."
         )
         raise NotImplementedError(message)
-    counts = dict(column_tiles=launch.image_blocks * launch.output_tiles, groups=launch.groups,
+
+    counts = dict(column_tiles=launch.column_tiles, groups=launch.groups,
                   loop_blocks=launch.loop_blocks,
                   fuse_groups=launch.fuse_groups, block_m=launch.block_m, block_n=launch.block_n)
     bundles, staging = looped_gemm_stream(**counts)
-    return AsmKernel(name="looped_gemm", bundles=bundles).to_bytes(pad_to=4), staging
+    remedy = (
+        f"narrow the tile width, where a BLOCK_N of {launch.block_n} unrolls {launch.output_tiles} output tiles"
+    )
+    return _assemble(name="looped_gemm", bundles=bundles, remedy=remedy), staging
+
+
+def _assemble(*, name: str, bundles: tuple[int, ...], remedy: str) -> bytes:
+    """Returns one kernel's image, packing its bundles where the hand placement overflows IRAM.
+
+    Args:
+        name: The name the kernel's error messages carry.
+        bundles: The bundle words the emitter placed, in program order.
+        remedy: What a refusal asks the caller to narrow, the tile that fits being the kernel's own choice.
+
+    Returns:
+        The image bytes padded to the loader's boundary.
+
+    Raises:
+        ProgramError: If neither placement fits the image in IRAM.
+    """
+    overflow: ValueError | None = None
+    for placement in (None, "pack"):
+        try:
+            return AsmKernel(name=name, bundles=bundles, placement=placement).to_bytes(pad_to=4)
+        except ValueError as error:
+            overflow = error
+    message = (
+        f"Unable to fit the {name} image in IRAM. Its {len(bundles)} bundles exceed the {IRAM_DEPTH} the memory "
+        f"holds under the hand placement and under packing alike, so {remedy}. {overflow}"
+    )
+    raise ProgramError(message) from overflow

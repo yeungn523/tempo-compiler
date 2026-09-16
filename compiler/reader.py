@@ -238,6 +238,29 @@ class _Graph:
             return "n"
         return None
 
+    def axis_of_grid(self, operation, *, pointers: dict[str, object]) -> str | None:
+        """Returns the output axis one program id walks, read from which operand's address it reaches.
+
+        A grid carries its axis the way a loop carries one, the tile it lands on being whichever operand its
+        identifier addresses, so this reads it the same way `axis_of_loop` reads a loop.
+
+        Args:
+            operation: The tt.get_program_id operation to name.
+            pointers: The activation's and the weight's pointer values, keyed by role.
+
+        Returns:
+            "m" when the identifier addresses the activation, "n" when it addresses the weight, or None when it
+            reaches neither or both.
+        """
+        value = operation.get_result(0)
+        reached = {role for role, pointer in pointers.items()
+                   if pointer is not None and self.addresses_with(pointer, variable=value)}
+        if reached == {"activation"}:
+            return "m"
+        if reached == {"weight"}:
+            return "n"
+        return None
+
     def trace(self, value, *, among: list) -> tuple[object | None, frozenset[str]]:
         """Traces a value back to whichever of the given operations produced it.
 
@@ -698,8 +721,30 @@ def read_program(kernel: JITFunction, *, signature: dict[str, str],
             # accumulator the kernel keeps in memory rather than in registers.
             stores_inside_reduction=(index < len(stores)
                                      and len(graph.enclosing_loops(stores[index])) > at),
+            grid_axes=_grid_axes(graph=graph, pointers=pointers),
         ))
     return tuple(matmuls)
+
+
+def _grid_axes(*, graph: _Graph, pointers: dict[str, object]) -> frozenset[str]:
+    """Returns the output axes a kernel's grid walks, being the ones its program ids address an operand along.
+
+    An identifier reaching neither operand or both names no axis of its own, so it stands for either of them
+    rather than for none: an axis the plan cannot rule out being on the grid is one it cannot read a single trip
+    loop from either.
+
+    Args:
+        graph: The module being read.
+        pointers: The activation's and the weight's pointer values, keyed by role.
+
+    Returns:
+        The axes the grid walks, empty for a kernel launching on one program.
+    """
+    axes: set[str] = set()
+    for operation in graph.by_name("tt.get_program_id"):
+        axis = graph.axis_of_grid(operation, pointers=pointers)
+        axes.update({"m", "n"} if axis is None else {axis})
+    return frozenset(axes)
 
 
 def _reduction_position(*, index: int, graph: _Graph, loops: list, steps: list[int],

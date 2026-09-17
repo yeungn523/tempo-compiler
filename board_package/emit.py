@@ -901,7 +901,7 @@ def flash_steps(*, steps: int, tiles: int) -> tuple[Step, ...]:
                  Accumulate(kind="vadd", tile=tile, operand="result")]
     return tuple(body)
 
-def step_footprint(step: Step) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+def classify_register_use(step: Step) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
     """Returns the register regions one step reads, the ones it leaves a value in, and the ones it spends.
 
     Args:
@@ -943,7 +943,7 @@ def check_steps(body: tuple[Step, ...]) -> None:
     """
     spent_at: dict[str, int] = {}
     for index, step in enumerate(body):
-        reads, writes, spent = step_footprint(step)
+        reads, writes, spent = classify_register_use(step)
         for region in reads:
             if region in spent_at:
                 message = (

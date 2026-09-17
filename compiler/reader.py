@@ -319,10 +319,32 @@ class _Graph:
                 found.add(named)
                 chain[id(operation)] = Operation(
                     name=named, position=self._positions[id(operation)], result=operation.get_result(0).id(),
-                    operands=tuple(operation.get_operand(index).id()
+                    operands=tuple(self.resolve_reshape(operation.get_operand(index))
                                    for index in range(operation.get_num_operands())))
             pending.extend(operation.get_operand(index) for index in range(operation.get_num_operands()))
         return source, frozenset(found), tuple(sorted(chain.values(), key=lambda step: step.position))
+
+    def resolve_reshape(self, value) -> int:
+        """Returns the identifier of the value one reshaped view carries, which is the view's own where it is none.
+
+        A broadcast and an expand state a value in another shape, so a consumer naming one of those names the
+        value behind it rather than a second value of its own.
+
+        Args:
+            value: The value to resolve.
+
+        Returns:
+            The identifier reached.
+        """
+        current = value
+        seen: set[int] = set()
+        while current.id() not in seen:
+            seen.add(current.id())
+            operation = self._definitions.get(current.id())
+            if operation is None or operation.get_name() not in _RESHAPES:
+                return current.id()
+            current = operation.get_operand(0)
+        return current.id()
 
     def carried_values(self, loop, *, among: list) -> tuple[Carried, ...]:
         """Returns the values one loop hands from each trip to the next.

@@ -411,10 +411,10 @@ class StepBodyTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             emit.check_steps(moved)
 
-    def test_every_step_states_a_footprint(self) -> None:
-        """Verifies that every step the attention body runs reports the regions it touches."""
+    def test_every_step_states_the_registers_it_uses(self) -> None:
+        """Verifies that every step the attention body runs reports the register regions it touches."""
         for step in emit.flash_steps(steps=4, tiles=4):
-            reads, writes, spent = emit.step_footprint(step)
+            reads, writes, spent = emit.classify_register_use(step)
             self.assertIsInstance(reads | writes | spent, frozenset)
 
 

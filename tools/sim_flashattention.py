@@ -23,7 +23,7 @@ sys.path.insert(0, str(_HERE.parent / "board_package"))
 sys.path.insert(0, str(_HERE.parent / "board_package" / "minitpu_runtime"))
 
 from bf16 import (_NUM_LANES, _TILE, _VREG_ELEMENTS, as_bf16_words,  # noqa: E402
-                  attention_bf16_reference, from_bf16_words)
+                  attention_bf16_reference, from_bf16_words, pack_attention)
 from compiler import FlashLaunch, compile_launch  # noqa: E402
 from sim_gemm import _run_image  # noqa: E402
 
@@ -38,20 +38,6 @@ _SPREAD: float = 2.0
 
 _SEED: int = 0
 """Seed the operands are drawn under, so a failure is reproducible."""
-
-
-def _tiled(matrix: NDArray[np.float32]) -> NDArray[np.float32]:
-    """Returns one operand as the 16 wide tiles the image stages, each tile a run of 16 rows.
-
-    Args:
-        matrix: The operand, whose columns are a whole number of tiles.
-
-    Returns:
-        The stacked tiles.
-    """
-    width = matrix.shape[1]
-    return np.concatenate([matrix[:, tile * _TILE: (tile + 1) * _TILE]
-                           for tile in range(width // _TILE)], axis=0)
 
 
 def _operands(*, key_blocks: int, head: int, seed: int) -> tuple[NDArray[np.float32], ...]:
@@ -93,19 +79,11 @@ def simulate(*, key_blocks: int = 2, head: int = _VREG_ELEMENTS, seed: int = _SE
     image, _ = compile_launch(FlashLaunch(row_blocks=1, key_blocks=key_blocks, queries=_TILE, head=head))
     query, key, value = _operands(key_blocks=key_blocks, head=head, seed=seed)
 
-    initial = np.full((_TILE, _NUM_LANES), _INITIAL_MAXIMUM, dtype=np.float32)
-    staged = np.concatenate([_tiled(query), initial, np.zeros((_TILE, _NUM_LANES), dtype=np.float32)], axis=0)
-
-    blocks = []
-    for block in range(key_blocks):
-        rows = slice(block * _TILE, (block + 1) * _TILE)
-        transposed = np.concatenate([key[rows, tile * _TILE: (tile + 1) * _TILE].T
-                                     for tile in range(head // _TILE)], axis=0)
-        blocks.extend([transposed, _tiled(value[rows])])
+    staged, streamed = pack_attention(query, key, value, initial_maximum=_INITIAL_MAXIMUM)
 
     dump = _run_image(image=image,
-                      activations=as_bf16_words(staged).tobytes(),
-                      weights=as_bf16_words(np.concatenate(blocks, axis=0)).tobytes(),
+                      activations=staged.tobytes(),
+                      weights=streamed.tobytes(),
                       drain_bytes=head * _NUM_LANES * 2, build_dir=build_dir, max_cycles=max_cycles,
                       what=f"attention over {key_blocks} key blocks of a head of {head}")
     drained = from_bf16_words(np.frombuffer(dump, dtype="<u2")[: head * _NUM_LANES])

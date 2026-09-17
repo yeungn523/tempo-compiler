@@ -19,7 +19,7 @@ sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE / "board_package"))
 
 from compiler import ProgramError, compile_launch, plan, read_program, signature_of, stage  # noqa: E402
-from compiler.ir import FusedLaunch  # noqa: E402
+from compiler.ir import FlashLaunch, FusedLaunch  # noqa: E402
 from asm import BUNDLE_BYTES, IRAM_DEPTH  # noqa: E402
 from bf16 import (  # noqa: E402
     _BLOCK_TOKENS,
@@ -326,6 +326,16 @@ def main() -> int:
     written = pathlib.Path(arguments.output).expanduser().resolve() if arguments.output else None
     if written is not None:
         written.mkdir(parents=True, exist_ok=True)
+
+    attention = [position for position, launch in enumerate(planned.launches)
+                 if isinstance(launch, FlashLaunch)]
+    if attention:
+        message = (
+            f"Unable to pack launch {attention[0]}, which is an attention block. Its queries, keys and values are "
+            f"packed a query block at a time and its drain carries no clearing tile, so compile it through "
+            f"flash_entry_point.py."
+        )
+        raise ProgramError(message)
 
     covered = _matmuls_covered(matmuls, planned.launches)
     for index, launch in enumerate(planned.launches):

@@ -19,7 +19,7 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent
 
 sys.path.insert(0, str(_HERE / "minitpu_runtime"))
 
-from bf16 import from_bf16_words, reduce_drain  # noqa: E402
+from bf16 import _ELEMENT_BYTES, from_bf16_words, reduce_drain  # noqa: E402
 from runtime import (  # noqa: E402
     MemcpyKind,
     minitpuFree,
@@ -227,6 +227,79 @@ def _run_fused_on_device(*, image: bytes,
     return product, Measurement(launches=blocks, cycles=cycles, bundles=bundles, seconds=elapsed)
 
 
+def _run_attention_on_device(*, image: bytes,
+                             operands: np.lib.npyio.NpzFile) -> tuple[NDArray[np.float32], Measurement]:
+    """Copies an attention block's operands to the device, launches the image per query block, and reads back.
+
+    Args:
+        image: The kernel image the host compiler produced, already padded to the loader's boundary.
+        operands: The packed operands and the sizes the host derived for them.
+
+    Returns:
+        The float32 attended output and what the run cost.
+    """
+    queries = operands["queries"]
+    streamed = operands["operands"]
+    drain_bytes = int(operands["drain_bytes"])
+    drain_words = int(operands["drain_words"])
+    shape = tuple(int(extent) for extent in operands["drain_shape"])
+    blocks, head = int(operands["row_blocks"]), int(operands["head"])
+    rows = shape[3]
+    # One launch stages its own block's queries and the two tiles it enters the key loop from.
+    span = queries.size // blocks
+    attended = np.empty((blocks * rows, head), dtype=np.float32)
+
+    minitpuSetDevice("minitpu")
+    minitpuHostReset()
+    owned: list[int] = []
+    cycles = bundles = 0
+    try:
+        host_image = minitpuHostAlloc(len(image))
+        host_image.view[: len(image) // 4] = np.frombuffer(image, dtype="<u4")
+        device_image = minitpuMalloc(len(image))
+        owned.append(device_image)
+        minitpuMemcpy(device_image, host_image, len(image), MemcpyKind.HostToDevice)
+
+        host_streamed = minitpuHostAlloc(streamed.nbytes)
+        host_streamed.view.view("<u2")[: streamed.size] = streamed
+        device_streamed = minitpuMalloc(streamed.nbytes)
+        owned.append(device_streamed)
+        minitpuMemcpy(device_streamed, host_streamed, streamed.nbytes, MemcpyKind.HostToDevice)
+
+        host_queries = minitpuHostAlloc(span * _ELEMENT_BYTES)
+        device_queries = minitpuMalloc(span * _ELEMENT_BYTES)
+        owned.append(device_queries)
+
+        host_drain = minitpuHostAlloc(drain_bytes)
+        device_drain = minitpuMalloc(drain_bytes)
+        owned.append(device_drain)
+
+        opened = time.perf_counter()
+        for block in range(blocks):
+            staged = queries[block * span : (block + 1) * span]
+            host_queries.view.view("<u2")[: staged.size] = staged
+            minitpuMemcpy(device_queries, host_queries, staged.nbytes, MemcpyKind.HostToDevice)
+            # The image reads the keys and values from their own pointer, advancing it a block at a time itself.
+            minitpuMemcpy(device_streamed, host_streamed, streamed.nbytes, MemcpyKind.HostToDevice)
+
+            minitpuLaunchKernel(device_image, len(image),
+                                args=[device_queries, device_streamed, device_drain])
+            minitpuMemcpy(host_drain, device_drain, drain_bytes, MemcpyKind.DeviceToHost)
+
+            sample = read_perf()
+            cycles += sample.cycles
+            bundles += sample.instrs
+
+            drained = from_bf16_words(words=host_drain.view.view("<u2")[:drain_words])
+            attended[block * rows : (block + 1) * rows] = reduce_drain(drained, shape=shape)
+        elapsed = time.perf_counter() - opened
+    finally:
+        for address in owned:
+            minitpuFree(address)
+        minitpuHostReset()
+    return attended, Measurement(launches=blocks, cycles=cycles, bundles=bundles, seconds=elapsed)
+
+
 def main() -> int:
     """Launches the compiled image and reports its error against the reference the host computed.
 
@@ -251,9 +324,14 @@ def main() -> int:
     expected: NDArray[np.float32] = operands["expected"]
 
     print(f"image    {len(image)} bytes, {len(image) // 16} bundles")
-    # A fused layer states the width it drains, a plain product the tiles and partials it leaves.
+    # An attention block states the key blocks it walks, a fused layer the width it drains, and a plain product
+    # the tiles and partials it leaves.
+    attention = "key_blocks" in operands.files
     fused = "output_columns" in operands.files
-    if fused:
+    if attention:
+        print(f"attend   {expected.shape[0]} by {expected.shape[1]}, "
+              f"{int(operands['key_blocks'])} key blocks in one image per query block")
+    elif fused:
         print(f"layer    {expected.shape[0]} by {expected.shape[1]}, both projections and the activation "
               f"between them in one image")
     else:
@@ -261,7 +339,7 @@ def main() -> int:
         print(f"product  {expected.shape[0]} by {expected.shape[1]}, {blocks * output_tiles} column tiles in "
               f"{blocks} blocks, draining {groups} each")
 
-    run = _run_fused_on_device if fused else _run_on_device
+    run = _run_attention_on_device if attention else (_run_fused_on_device if fused else _run_on_device)
     product, measured = run(image=image, operands=operands)
     error = float(np.abs(product - expected).max() / np.abs(expected).max())
     # A layer contracts twice, so the format costs more over it than the tolerance one product is allowed. The

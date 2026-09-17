@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from dataclasses import dataclass
 
 _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent.parent
 """Stores the path to the repository's root directory."""
@@ -24,19 +25,55 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent.parent
 _ADDRESS: str = "132.236.59."
 """Network the course boards sit on, which the last octet selects one of."""
 
-_FORWARDED: tuple[str, ...] = ("operands", "constexprs", "strides", "dims", "activations", "weights",
-                               "up-weight", "down-weight")
-"""Flags this passes to the compiler entry point untouched, being the ones that describe the launch. A fused
-feed-forward layer names its two projections rather than one weight, so both spellings are carried."""
+_SHARED: tuple[str, ...] = ("operands", "constexprs", "strides", "dims")
+"""Flags every operation passes to its entry point untouched, being the ones describing the launch rather than
+the data it reads."""
 
 
-def compile_kernel(*, kernel: str, forwarded: dict[str, str], written: pathlib.Path) -> pathlib.Path:
+@dataclass(frozen=True, slots=True)
+class _Operation:
+    """Describes one workload a board runs.
+
+    Attributes:
+        entry: The compiler entry point this operation's kernels are compiled through.
+        artifact: The name the entry point gives the image and the operands beside it.
+        buffers: Flag naming each .npy file the operation reads, in the order its entry point declares them.
+        kernels: The kernels it covers when a call names none.
+    """
+
+    entry: str
+    artifact: str
+    buffers: tuple[str, ...]
+    kernels: tuple[str, ...]
+
+
+_OPERATIONS: dict[str, _Operation] = {
+    "gemm": _Operation(
+        entry="kernel_entry_point.py", artifact="matmul_0", buffers=("activations", "weights"),
+        kernels=("sample_triton.py:matmul_kernel", "sample_triton.py:matmul_n_m_k",
+                 "sample_triton.py:matmul_m_k_n", "sample_triton.py:matmul_n_k_m",
+                 "sample_triton.py:matmul_k_m_n", "sample_triton.py:matmul_k_n_m")),
+    "ffn": _Operation(
+        entry="kernel_entry_point.py", artifact="matmul_0",
+        buffers=("activations", "up-weight", "down-weight"),
+        kernels=("sample_triton.py:fused_ffn_kernel",)),
+    "flashattention": _Operation(
+        entry="flash_entry_point.py", artifact="attention", buffers=("query", "key", "value"),
+        kernels=("sample_flashattention.py:flash_attention_kernel",)),
+}
+"""Every operation a board runs, keyed by the name a call selects it under. A GEMM covers each loop order its
+sample declares, which is the sweep a board check walks."""
+
+
+def compile_kernel(*, kernel: str, forwarded: dict[str, str], written: pathlib.Path,
+                   operation: str = "gemm") -> pathlib.Path:
     """Emits one kernel's image and operands, returning the image.
 
     Args:
         kernel: The kernel to compile, as the entry point names it.
         forwarded: Value of each compiler flag this call carries through.
         written: Directory the image and operands are written to.
+        operation: Which of `_OPERATIONS` the kernel is, naming the entry point that compiles it.
 
     Returns:
         The path to the emitted image.
@@ -44,14 +81,14 @@ def compile_kernel(*, kernel: str, forwarded: dict[str, str], written: pathlib.P
     Raises:
         SystemExit: If the compiler refuses the kernel, whose message it has already printed.
     """
-    command = [sys.executable, str(_HERE / "kernel_entry_point.py"), "--kernel", kernel,
-               "--output", str(written)]
+    covered = _OPERATIONS[operation]
+    command = [sys.executable, str(_HERE / covered.entry), "--kernel", kernel, "--output", str(written)]
     for name, value in forwarded.items():
         if value:
             command += [f"--{name}", value]
     if subprocess.run(command, check=False).returncode:
         raise SystemExit("compile failed")
-    return written / "matmul_0.bin"
+    return written / f"{covered.artifact}.bin"
 
 
 def payload(*, images: dict[str, pathlib.Path]) -> bytes:
@@ -73,8 +110,35 @@ def payload(*, images: dict[str, pathlib.Path]) -> bytes:
         archive.add(_HERE / "board_package", arcname="board_package")
         for name, image in images.items():
             archive.add(image, arcname=f"board_package/kernels/{name}.bin")
-            archive.add(image.with_name("matmul_0_operands.npz"), arcname=f"board_package/kernels/{name}.npz")
+            archive.add(image.with_name(f"{image.stem}_operands.npz"),
+                        arcname=f"board_package/kernels/{name}.npz")
     return buffer.getvalue()
+
+
+def _forwarded(arguments, *, operation: str) -> dict[str, str]:
+    """Returns the flags one operation's entry point takes, refusing a buffer it does not read.
+
+    Args:
+        arguments: The parsed command line.
+        operation: Which of `_OPERATIONS` the call selected.
+
+    Returns:
+        Value of each flag the entry point is given, holding only the ones a call named.
+
+    Raises:
+        SystemExit: If the call names a buffer this operation does not read.
+    """
+    covered = _OPERATIONS[operation]
+    named = {flag for operations in _OPERATIONS.values() for flag in operations.buffers
+             if getattr(arguments, flag.replace("-", "_"))}
+    refused = sorted(named - set(covered.buffers))
+    if refused:
+        raise SystemExit(
+            f"{operation} reads {', '.join(covered.buffers)}, so it has nowhere to put "
+            f"{', '.join(refused)}. Name the buffers this operation reads, or select the one that reads those."
+        )
+    return {name: getattr(arguments, name.replace("-", "_"))
+            for name in (*_SHARED, *covered.buffers)}
 
 
 def _session(*, privileged: str, target: str, command: str = "", names: tuple[str, ...] = ()) -> str:
@@ -117,9 +181,12 @@ def main() -> int:
         What the board's own run returned.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--kernel", required=True, action="append", metavar="FILE:NAME",
+    parser.add_argument("--operation", default="gemm", choices=sorted(_OPERATIONS),
+                        help="which operation to run, selecting the entry point that compiles it, the buffers "
+                             "it reads and the kernels it covers when none are named")
+    parser.add_argument("--kernel", action="append", metavar="FILE:NAME",
                         help="the kernel to compile, as a Python file and the name it is declared under, repeated "
-                             "to run several in the one session")
+                             "to run several in the one session, defaulting to the ones the workload declares")
     parser.add_argument("--octet", required=True, help=f"last octet of the board's address, under {_ADDRESS}0/24")
     parser.add_argument("--user", default=getpass.getuser(), help="the account the board authorises, being a netid")
     parser.add_argument("--run", default="", metavar="COMMAND",
@@ -133,17 +200,17 @@ def main() -> int:
     parser.add_argument("--no-provision", action="store_true",
                         help="launch without granting the runtime devices first, for a board already holding this "
                              "account's session")
-    for name in _FORWARDED:
-        parser.add_argument(f"--{name}", default="", help=f"passed to kernel_entry_point.py as --{name}")
+    for name in (*_SHARED, *dict.fromkeys(flag for covered in _OPERATIONS.values() for flag in covered.buffers)):
+        parser.add_argument(f"--{name}", default="", help=f"passed to the entry point as --{name}")
     arguments = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as scratch:
-        forwarded = {name: getattr(arguments, name.replace("-", "_")) for name in _FORWARDED}
+        forwarded = _forwarded(arguments, operation=arguments.operation)
         images = {}
-        for kernel in arguments.kernel:
+        for kernel in arguments.kernel or _OPERATIONS[arguments.operation].kernels:
             # Names each pair by the kernel it came from, which one file declaring several leaves after the colon.
             name = kernel.rpartition(":")[2] or pathlib.Path(kernel).stem
-            images[name] = compile_kernel(kernel=kernel, forwarded=forwarded,
+            images[name] = compile_kernel(kernel=kernel, forwarded=forwarded, operation=arguments.operation,
                                           written=pathlib.Path(scratch) / name)
         stream = payload(images=images)
 

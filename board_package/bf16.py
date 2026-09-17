@@ -432,6 +432,62 @@ def pack_fused_ffn(activations: NDArray[np.float32], up_weight: NDArray[np.float
     return staged, np.concatenate(chunks)
 
 
+def pack_attention(query: NDArray[np.float32], key: NDArray[np.float32], value: NDArray[np.float32], *,
+                   initial_maximum: float) -> tuple[NDArray[np.uint16], NDArray[np.uint16]]:
+    """Lays one attention block's operands out in the order its image visits them.
+
+    Args:
+        query: The block's queries, whose rows are tokens and columns the head.
+        key: Every key the block attends over, laid out as the queries are.
+        value: Every value the block attends over, laid out as the queries are.
+        initial_maximum: Value the running maximum enters below, which every score clears.
+
+    Returns:
+        The query words of each block followed by the initial maximum and the zeros that block clears from, and
+        the key and value words, each key block's transposed keys ahead of its values.
+
+    Raises:
+        ValueError: If a dimension is not a whole number of tiles, or if the three operands disagree on the head
+            or the keys on their count.
+    """
+    queries, head = query.shape
+    if queries % _TILE or head % _TILE:
+        message = (
+            f"Unable to pack a query block of shape [{queries},{head}]. Both dimensions must be a whole number "
+            f"of the {_TILE} wide tiles the array computes."
+        )
+        raise ValueError(message)
+    if key.shape != value.shape or key.shape[1] != head:
+        message = (
+            f"Unable to pack keys of shape {key.shape} against values of shape {value.shape} and a head of "
+            f"{head}. The keys and the values cover the same positions of the same head."
+        )
+        raise ValueError(message)
+    if key.shape[0] % _TILE:
+        message = (
+            f"Unable to pack {key.shape[0]} keys. The loop walks them a tile at a time, so they are a whole "
+            f"number of {_TILE}."
+        )
+        raise ValueError(message)
+
+    # One launch stages the queries of its own block, so each block carries the two tiles it enters the loop
+    # from and a host reaches the next by advancing one block's worth of rows.
+    initial = np.full((_TILE, _NUM_LANES), initial_maximum, dtype=np.float32)
+    cleared = np.zeros((_TILE, _NUM_LANES), dtype=np.float32)
+    staged = np.concatenate([piece for block in range(queries // _TILE)
+                             for piece in (_by_tile(query[block * _TILE: (block + 1) * _TILE]),
+                                           initial, cleared)], axis=0)
+
+    blocks: list[NDArray[np.float32]] = []
+    for block in range(key.shape[0] // _TILE):
+        rows = slice(block * _TILE, (block + 1) * _TILE)
+        # The array wants the keys transposed, its stationary operand being the contraction by the keys.
+        blocks.append(np.concatenate([key[rows, tile * _TILE: (tile + 1) * _TILE].T
+                                      for tile in range(head // _TILE)], axis=0))
+        blocks.append(_by_tile(value[rows]))
+    return as_bf16_words(values=staged), as_bf16_words(values=np.concatenate(blocks, axis=0))
+
+
 def fused_ffn_reference(activations: NDArray[np.float32], up_weight: NDArray[np.float32],
                         down_weight: NDArray[np.float32]) -> NDArray[np.float64]:
     """Returns the layer the fused kernel computes, in float64, for a drained image to be held against.
@@ -617,6 +673,20 @@ def _require_norm_operands(*, width: int, **operands: NDArray[np.float32]) -> No
                 f"{width} features."
             )
             raise ValueError(message)
+
+
+def _by_tile(matrix: NDArray[np.float32]) -> NDArray[np.float32]:
+    """Returns one operand as the tiles an image stages, each tile a run of `_TILE` rows.
+
+    Args:
+        matrix: The operand, whose columns are a whole number of tiles.
+
+    Returns:
+        The stacked tiles.
+    """
+    width = matrix.shape[1]
+    return np.concatenate([matrix[:, tile * _TILE: (tile + 1) * _TILE]
+                           for tile in range(width // _TILE)], axis=0)
 
 
 def _erf(values: NDArray[np.float64]) -> NDArray[np.float64]:

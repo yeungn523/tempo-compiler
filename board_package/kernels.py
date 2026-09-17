@@ -7,6 +7,7 @@ carry it. `asm.schedule` enforces what it can and rejects what it cannot fix.
 
 from __future__ import annotations
 
+import functools
 import pathlib
 import sys
 
@@ -39,8 +40,13 @@ from bf16 import (  # noqa: E402
     _ROW_ACTIVATION,
     _ROW_BYTES,
     _ROW_OUTPUT,
+    _ROW_FLASH_BASE,
     _ROW_SCORES,
     _ROW_SOFTMAX_OUT,
+    _ROW_STAT_IN,
+    _ROW_STAT_OUT,
+    _ROW_STAT_SCRATCH,
+    _STAT_OUT_ROWS,
     _ROW_WEIGHT,
     _ROW_ZERO,
     _STEPS,
@@ -54,11 +60,9 @@ from bf16 import (  # noqa: E402
     _WIDTH_ROWS,
     _ZERO_TILE_BYTES,
 )
-from isa_model import MATRIX_OCCUPANCY, RTL_PARAMS  # noqa: E402
+from isa_model import MATRIX_OCCUPANCY  # noqa: E402
+from layout import FlashRegisterMap, flash_register_map  # noqa: E402
 from runtime import MinitpuKernel, minitpu  # noqa: E402
-
-_MATLOAD_AFTER_LOADS: int = (_TILE_VREGS - 1) + RTL_PARAMS["WB_W_VLD"] + 1
-"""Bundles a weight load waits after the tile's first vld, being the cycle its last register has landed."""
 
 _MATLOAD_SLOTS: int = MATRIX_OCCUPANCY["vmatload"] + 1
 """Bundles a weight load holds the matrix controller, being its occupancy and the cycle past it."""
@@ -75,21 +79,53 @@ _WEIGHT_TILE: int = 24
 _SCRATCH_TILE: int = 28
 """First VREG of the tile a vmatpop lands in, which the accumulate that follows reads and the next pop reuses."""
 
-_INNER_LEVEL: int = 1
-"""Loop the step and output-tile indexes ride, the chunk loop enclosing them occupying level 0."""
+_TXIN_II: int = 2
+"""Bundles between consecutive vtxin, carrying build_tile_transpose's verified spacing."""
 
-_INPUT_STEP_SHIFT: int = (_TOKEN_GROUPS * _TILE).bit_length() - 1
-"""Shift the AGU walks the input by per step, one step reading a token block of rows."""
+_TXIN_TO_TXOUT: int = 4
+"""Bundles the first vtxout waits after the last vtxin. The hazard model covers vector and scalar registers, so
+the staging array's own dependency is held by the schedule."""
 
-_WEIGHT_STEP_SHIFT: int = _TILE.bit_length() - 1
-"""Shift the AGU walks a weight matrix by per iteration, one iteration reading one tile."""
+_TXOUT_II: int = 6
+"""Bundles between consecutive vtxout, carrying build_tile_transpose's verified spacing."""
 
-_OUTPUT_TILE_SHIFT: int = (_TOKEN_GROUPS * _TILE).bit_length() - 1
-"""Shift the AGU walks the output by per tile, one tile covering a token block of rows."""
+_PUSH_II: int = 6
+"""Bundles between consecutive vmatpush, being the command's initiation interval."""
 
-_FFN_OUTPUT_TILES: tuple[int, ...] = (8, 20)
-"""First VREG of each token group's output tile in the fused layer, the two the plain GEMM leaves free. They sit
-apart because the registers between them stage the input every hidden chunk re-reads."""
+_POP_II: int = 5
+"""Bundles between consecutive vmatpop, being the command's initiation interval."""
+
+_VMEM_TURNAROUND: int = 8
+"""Bundles an access waits after the one whose VMEM rows it reads, carrying the distance build_tile_transpose
+holds between its stores and the descriptor reading them."""
+
+_SUBLANE_FOLDS: tuple[int, ...] = tuple(_NUM_SUBLANES >> (step + 1)
+                                        for step in range(_NUM_SUBLANES.bit_length() - 1))
+"""Sublanes each step of the cross-sublane fold reads over, halving until sublane zero holds the whole row."""
+
+_SUBLANE_ZERO: int = 1
+"""Sublane mask selecting the one sublane a folded row ends in."""
+
+_STRIDE_REGISTER: int = 3
+"""Scalar register holding the host row stride every descriptor reads."""
+
+_STAT_SCORES: tuple[int, ...] = (0, 1, 2, 3)
+"""VREGs holding the score tile, register v carrying queries 4v through 4v+3."""
+
+_STAT_TRANSPOSED: tuple[int, ...] = (4, 5, 6, 7)
+"""VREGs a score tile transposes into, every lane carrying a query and every sublane a key."""
+
+_STAT_WORK: tuple[int, int] = (8, 9)
+"""VREGs the fold rewrites in place, being the running partials and the register they are read back into."""
+
+_STAT_MAXIMA: tuple[int, ...] = (14, 15, 16, 17)
+"""VREGs holding each query's row maximum along a whole row, laid out as the scores are."""
+
+_STAT_PROBABILITIES: tuple[int, ...] = (18, 19, 20, 21)
+"""VREGs holding the exponentiated scores, laid out as the scores are."""
+
+_STAT_SUMS: tuple[int, ...] = (22, 23, 24, 25)
+"""VREGs holding each query's row sum along a whole row, laid out as the scores are."""
 
 
 @minitpu.asm
@@ -1052,6 +1088,219 @@ def build_softmax_packed(tokens: int, heads: int, *,
     return minitpu.asm(softmax_packed)
 
 
+def build_row_statistics(*, turnaround: int = _VMEM_TURNAROUND) -> MinitpuKernel:
+    """Assembles the row maxima and row sums one attention block's online softmax carries, over one score tile.
+
+    Args:
+        turnaround: Bundles an access waits after the one whose VMEM rows it reads.
+
+    Returns:
+        The program, taking the score tile's pointer and the output pointer, leaving the broadcast maxima, the
+        probabilities and the broadcast sums, a tile each.
+    """
+    def row_statistics() -> None:
+        """Reduces one score tile to its row maxima and row sums, exponentiating between the two."""
+        bundles: dict[int, dict[str, int]] = {}
+
+        def put(slot: int, **slots: int) -> None:
+            """Merges slots into one bundle so co-issue reads at the call site."""
+            bundles.setdefault(slot, {}).update(slots)
+
+        slot = 0
+        put(slot, s=minitpu.smovi(_STRIDE_REGISTER, _ROW_BYTES)); slot += 1
+        put(slot, s=minitpu.smov_arg(0, 0)); slot += 1             # sreg0 = scores
+        put(slot, s=minitpu.smov_arg(1, 2)); slot += 1             # sreg1 = output
+        slot += 1                                                  # scalar writeback latency
+        put(slot, d=minitpu.dma_load(0, _ROW_STAT_IN, _TILE, 0, _STRIDE_REGISTER)); slot += 1
+        put(slot, f=minitpu.flush_slot(1)); slot += 1
+        for quarter, register in enumerate(_STAT_SCORES):
+            put(slot, x=minitpu.vld(register, _ROW_STAT_IN + _NUM_SUBLANES * quarter)); slot += 1
+
+        slot = _emit_row_reduce(put, slot, source=_STAT_SCORES, transposed=_STAT_TRANSPOSED, work=_STAT_WORK,
+                                combine=minitpu.vmax, destination=_STAT_MAXIMA,
+                                scratch_row=_ROW_STAT_SCRATCH, turnaround=turnaround)
+
+        # Subtracts each query's own maximum, the maxima being laid out as the scores are.
+        for quarter, register in enumerate(_STAT_PROBABILITIES):
+            put(slot, e=minitpu.vsub(register, _STAT_SCORES[quarter], _STAT_MAXIMA[quarter])); slot += 1
+        for register in _STAT_PROBABILITIES:
+            put(slot, e=minitpu.vexp(register, register)); slot += 1
+
+        slot = _emit_row_reduce(put, slot, source=_STAT_PROBABILITIES, transposed=_STAT_TRANSPOSED,
+                                work=_STAT_WORK, combine=minitpu.vadd, destination=_STAT_SUMS,
+                                scratch_row=_ROW_STAT_SCRATCH, turnaround=turnaround)
+
+        for tile, group in enumerate((_STAT_MAXIMA, _STAT_PROBABILITIES, _STAT_SUMS)):
+            for quarter, register in enumerate(group):
+                put(slot, x=minitpu.vst(register, _tile_row(_ROW_STAT_OUT, tile, quarter))); slot += 1
+        slot += turnaround
+        put(slot, d=minitpu.dma_store(0, _ROW_STAT_OUT, _STAT_OUT_ROWS, 1, _STRIDE_REGISTER)); slot += 1
+        put(slot, f=minitpu.flush_slot(1)); slot += 1
+        put(slot, f=minitpu.halt()); slot += 1
+        for index in range(slot):
+            minitpu.bundle(**bundles.get(index, {}))
+
+    # Keeps the hand placement: this schedule's gaps carry VMEM and staging array dependencies the hazard model
+    # cannot see, so packing would move a load ahead of the store it reads.
+    return minitpu.asm(row_statistics, placement="")
+
+
+def build_flash_attention(key_blocks: int, *, queries: int = _TILE, head: int = _VREG_ELEMENTS,
+                          turnaround: int = _VMEM_TURNAROUND) -> MinitpuKernel:
+    """Assembles one attention block's whole key loop, the scores never reaching DMEM.
+
+    Notes:
+        The rescale precedes the row sum because both want the registers the transpose stages through.
+
+    Args:
+        key_blocks: Blocks the loop walks, `_TILE` keys each.
+        queries: Queries one block covers, a whole number of tiles.
+        head: Width of the head, a whole number of tiles.
+        turnaround: Bundles an access waits after the one whose VMEM rows it reads.
+
+    Returns:
+        The program, taking the query pointer, the key and value pointer and the output pointer.
+
+    Raises:
+        ValueError: If the loop runs no blocks, if a block's operands overrun a descriptor, or if the queries
+            cover more than one token group.
+    """
+    if key_blocks < 1:
+        message = f"Unable to attend over {key_blocks} key blocks. At least one is needed."
+        raise ValueError(message)
+    if 2 * head > _MAX_DESCRIPTOR_ROWS:
+        message = (
+            f"Unable to stage a head of {head} in one descriptor. A block reads its keys and values together, "
+            f"which is {2 * head} rows against the {_MAX_DESCRIPTOR_ROWS} one descriptor moves."
+        )
+        raise ValueError(message)
+
+    registers = flash_register_map(queries=queries, head=head)
+    if registers.token_groups != 1:
+        message = (
+            f"Unable to attend over {queries} queries, which is {registers.token_groups} token groups. The row "
+            f"reduction transposes one tile at a time, so a block covers {_TILE} queries."
+        )
+        raise ValueError(message)
+
+    rows = _flash_vmem_map(head=head)
+    steps, tiles = head // _TILE, registers.output_tiles
+    work = (registers.running, registers.running + 1)
+    scores, staged = _tile_registers(registers.scores), _tile_registers(registers.staged)
+    partial, maximum = _tile_registers(registers.partial), _tile_registers(registers.row_max)
+    total = _tile_registers(registers.row_sum)
+
+    def flash_attention() -> None:
+        """Runs one query block against every key block, accumulating the attended output."""
+        bundles: dict[int, dict[str, int]] = {}
+
+        def put(slot: int, **slots: int) -> None:
+            """Merges slots into one bundle so co-issue reads at the call site."""
+            bundles.setdefault(slot, {}).update(slots)
+
+        slot = 0
+        put(slot, s=minitpu.smovi(_STRIDE_REGISTER, _ROW_BYTES)); slot += 1
+        put(slot, s=minitpu.smov_arg(0, 0)); slot += 1            # sreg0 = queries
+        put(slot, s=minitpu.smov_arg(1, 1)); slot += 1            # sreg1 = keys and values
+        put(slot, s=minitpu.smov_arg(2, 2)); slot += 1            # sreg2 = output
+        slot += 1                                                 # scalar writeback latency
+        put(slot, d=minitpu.dma_load(0, rows["query"], head + 2 * _TILE, 0, _STRIDE_REGISTER)); slot += 1
+        put(slot, f=minitpu.flush_slot(1)); slot += 1
+
+        # Enters the maximum below every score, so the first rescale multiplies by zero.
+        for vreg in range(_TILE_VREGS):
+            put(slot, x=minitpu.vld(maximum[vreg], rows["initial"] + _NUM_SUBLANES * vreg)); slot += 1
+            put(slot, x=minitpu.vld(total[vreg], rows["zero"] + _NUM_SUBLANES * vreg)); slot += 1
+            if registers.spilled:
+                put(slot, x=minitpu.vld(registers.scratch + vreg, rows["zero"] + _NUM_SUBLANES * vreg))
+                slot += 1
+        for tile in range(tiles):
+            for vreg in range(_TILE_VREGS):
+                cleared = (minitpu.vld(registers.accumulator + tile * _TILE_VREGS + vreg,
+                                       rows["zero"] + _NUM_SUBLANES * vreg) if tile < registers.resident
+                           else minitpu.vst(registers.scratch + vreg, _tile_row(rows["output"], tile, vreg)))
+                put(slot, x=cleared); slot += 1
+
+        put(slot, f=minitpu.lbegin(key_blocks)); slot += 1
+        put(slot, d=minitpu.dma_load(0, rows["key"], 2 * head, 1, _STRIDE_REGISTER)); slot += 1
+        put(slot, f=minitpu.flush_slot(1)); slot += 1
+
+        # Sums the steps' partials into the cleared tile, the head being deeper than the array is wide.
+        for vreg in range(_TILE_VREGS):
+            put(slot, x=minitpu.vld(partial[vreg], rows["zero"] + _NUM_SUBLANES * vreg)); slot += 1
+        for step in range(steps):
+            for vreg in range(_TILE_VREGS):
+                put(slot, x=minitpu.vld(registers.weight + vreg, _tile_row(rows["key"], step, vreg))); slot += 1
+                put(slot, x=minitpu.vld(registers.pushed + vreg, _tile_row(rows["query"], step, vreg)))
+                slot += 1
+            put(slot, m=minitpu.vmatload(registers.weight)); slot += _MATLOAD_SLOTS
+            slot = _emit_pipelined_matrix(put, slot, close_loop=False, push_tiles=(registers.pushed,),
+                                          accumulators=(registers.partial,), scratch=registers.result)
+
+        for vreg in range(_TILE_VREGS):
+            put(slot, e=minitpu.vmov(scores[vreg], partial[vreg])); slot += 1
+        slot = _emit_row_reduce(put, slot, source=scores, transposed=staged, work=work, combine=minitpu.vmax,
+                                destination=partial, scratch_row=rows["scratch"], turnaround=turnaround)
+
+        for vreg in range(_TILE_VREGS):
+            put(slot, e=minitpu.vmax(partial[vreg], partial[vreg], maximum[vreg])); slot += 1
+        for vreg in range(_TILE_VREGS):
+            put(slot, e=minitpu.vsub(staged[vreg], maximum[vreg], partial[vreg])); slot += 1
+        for vreg in range(_TILE_VREGS):
+            put(slot, e=minitpu.vexp(staged[vreg], staged[vreg])); slot += 1
+        for vreg in range(_TILE_VREGS):
+            put(slot, e=minitpu.vmov(maximum[vreg], partial[vreg])); slot += 1
+
+        for vreg in range(_TILE_VREGS):
+            put(slot, e=minitpu.vsub(scores[vreg], scores[vreg], maximum[vreg])); slot += 1
+        for vreg in range(_TILE_VREGS):
+            put(slot, e=minitpu.vexp(scores[vreg], scores[vreg])); slot += 1
+
+        # Corrects ahead of the row sum, which reuses the registers the correction is held in.
+        for vreg in range(_TILE_VREGS):
+            put(slot, e=minitpu.vmul(total[vreg], total[vreg], staged[vreg])); slot += 1
+        for tile in range(tiles):
+            slot = _emit_tile_update(put, slot, 0, close_loop=False, tile=tile, registers=registers,
+                                     operation=minitpu.vmul, operand=registers.staged, row=rows["output"],
+                                     turnaround=turnaround)
+
+        slot = _emit_row_reduce(put, slot, source=scores, transposed=staged, work=work, combine=minitpu.vadd,
+                                destination=partial, scratch_row=rows["scratch"], turnaround=turnaround)
+        for vreg in range(_TILE_VREGS):
+            put(slot, e=minitpu.vadd(total[vreg], total[vreg], partial[vreg])); slot += 1
+
+        for tile in range(tiles):
+            for vreg in range(_TILE_VREGS):
+                put(slot, x=minitpu.vld(registers.partial + vreg, _tile_row(rows["value"], tile, vreg)))
+                slot += 1
+            put(slot, m=minitpu.vmatload(registers.partial)); slot += _MATLOAD_SLOTS
+            slot = _emit_pipelined_matrix(
+                put, slot, close_loop=False, push_tiles=(registers.scores,), scratch=registers.result,
+                accumulate=functools.partial(_emit_tile_update, tile=tile, registers=registers,
+                                             operation=minitpu.vadd, operand=registers.result,
+                                             row=rows["output"], turnaround=turnaround))
+
+        put(slot, s=minitpu.saddi(1, 1, 2 * head * _ROW_BYTES)); slot += 1
+        slot += 2                                                 # scalar writeback, before the next descriptor
+        put(slot, f=minitpu.loop_end()); slot += 1
+
+        for vreg in range(_TILE_VREGS):
+            put(slot, e=minitpu.vrecip(staged[vreg], total[vreg])); slot += 1
+        for tile in range(tiles):
+            slot = _emit_tile_update(put, slot, 0, close_loop=False, tile=tile, registers=registers,
+                                     operation=minitpu.vmul, operand=registers.staged, row=rows["output"],
+                                     turnaround=turnaround, store=True)
+        slot += turnaround
+        put(slot, d=minitpu.dma_store(0, rows["output"], head, 2, _STRIDE_REGISTER)); slot += 1
+        put(slot, f=minitpu.flush_slot(1)); slot += 1
+        put(slot, f=minitpu.halt()); slot += 1
+        for index in range(slot):
+            minitpu.bundle(**bundles.get(index, {}))
+
+    # Keeps the hand placement, whose gaps carry the VMEM and staging array dependencies the model cannot see.
+    return minitpu.asm(flash_attention, placement="")
+
+
 def build_layernorm_rows(rows: int, *, packed: bool = False) -> MinitpuKernel:
     """Assembles LayerNorm over several hidden rows, one per loop iteration.
 
@@ -1163,192 +1412,9 @@ def build_layernorm_rows(rows: int, *, packed: bool = False) -> MinitpuKernel:
         for index in range(pc):
             minitpu.bundle(**bundles.get(index, {}))
 
-    # Packs, because this kernel waits on a dependent chain of E-slot reductions rather than on the matrix array.
+    # Packs because this kernel waits on a dependent chain of E-slot reductions rather than on the matrix array.
     # Co-issuing the independent work between those links is what shortens it.
     return minitpu.asm(layernorm_rows_kernel, placement="pack")
-
-
-def build_fused_ffn(chunks: int, *, steps: int = _STEPS, output_tiles: int = 1) -> MinitpuKernel:
-    """Assembles both projections of a feed-forward layer in one image, the activation between them.
-
-    Each hidden chunk is contracted into the resident tiles, activated where it lies, and then pushed once per
-    output tile, so the intermediate never reaches VMEM and the up projection runs once however wide the output
-    is. The output itself accumulates in VMEM, a register file of 32 holding nothing like the tiles it covers.
-
-    Args:
-        chunks: Tiles the hidden width covers, being the trip count of the loop both products sit inside.
-        steps: Tiles the up projection's contraction covers, each one a `vmatload` and a round of pushes.
-        output_tiles: Tiles the layer's output covers, each one a push of the activated chunk.
-
-    Returns:
-        The program, taking the packed input, the packed weights and the drain pointer as its three arguments.
-
-    Raises:
-        ValueError: If an extent is not positive, or if the staging overruns one VMEM slot.
-    """
-    for name, extent in (("chunks", chunks), ("steps", steps), ("output tiles", output_tiles)):
-        if extent < 1:
-            message = f"Unable to run a feed-forward layer over {extent} {name}. At least one."
-            raise ValueError(message)
-
-    input_rows = steps * _TOKEN_GROUPS * _TILE
-    output_rows = output_tiles * _TOKEN_GROUPS * _TILE
-    row_input = _ROW_ZERO + _TILE
-    row_up = row_input + input_rows
-    row_down = row_up + steps * _TILE
-    row_output = row_down + output_tiles * _TILE
-    wanted = row_output + output_rows
-    if wanted > _VMEM_ENTRIES_PER_LANE:
-        message = (
-            f"Unable to stage a feed-forward layer of {steps} contraction tiles and {output_tiles} output "
-            f"tiles. Its input, weights and output want {wanted} of the {_VMEM_ENTRIES_PER_LANE} rows one VMEM "
-            f"slot holds."
-        )
-        raise ValueError(message)
-    # Both weight matrices ride one staging, which leaves a scalar register for the input and one for the drain.
-    weight_rows = steps * _TILE + output_tiles * _TILE
-
-    def fused_ffn() -> None:
-        """Contracts and activates one hidden chunk per iteration, sweeping every output tile before the next."""
-        bundles: dict[int, dict[str, int]] = {}
-
-        def put(slot: int, **slots: int) -> None:
-            """Merges slots into one bundle so co-issue reads at the call site."""
-            bundles.setdefault(slot, {}).update(slots)
-
-        def emit_transfer(pc: int, *, slot: int, first_row: int, rows: int, pointer: int,
-                          store: bool = False) -> int:
-            """Moves the given rows, splitting them over as many descriptors as the row field needs.
-
-            Each descriptor is waited on before the slot it rides is reused, and each pointer advance follows
-            the descriptor that reads it, the scalar unit taking two bundles to write back and interlocking
-            nothing.
-            """
-            moved = 0
-            while moved < rows:
-                span = min(rows - moved, _MAX_DESCRIPTOR_ROWS)
-                descriptor = (minitpu.dma_store if store else minitpu.dma_load)(
-                    slot, first_row + moved, span, pointer, 3)
-                bundles[pc] = {"d": descriptor}; pc += 1
-                bundles[pc] = {"s": minitpu.saddi(pointer, pointer, span * _ROW_BYTES)}; pc += 1
-                pc += 1
-                bundles[pc] = {"f": minitpu.flush_slot(1 << slot)}; pc += 1
-                moved += span
-            return pc
-
-        def emit_load_tile(pc: int, first_vreg: int, row: int, *, shift: int = 0, level: int = _INNER_LEVEL) -> int:
-            """Reads one tile out of VMEM, a VREG per bundle, the AGU walking it over the named loop."""
-            for vreg in range(_TILE_VREGS):
-                put(slot=pc + vreg, x=minitpu.vld(first_vreg + vreg, row + _NUM_SUBLANES * vreg,
-                                                  agu=shift > 0, shift=shift, level=level))
-            return pc + _TILE_VREGS
-
-        def emit_clear(pc: int, tiles: tuple[int, ...]) -> int:
-            """Clears the given tiles from the clearing tile, which stays in VMEM throughout."""
-            for group, first_vreg in enumerate(tiles):
-                for vreg in range(_TILE_VREGS):
-                    put(slot=pc + _TILE_VREGS * group + vreg,
-                        x=minitpu.vld(first_vreg + vreg, _ROW_ZERO + _NUM_SUBLANES * vreg))
-            return pc + len(tiles) * _TILE_VREGS
-
-        def emit_output_tile(pc: int, *, store: bool, level: int = _INNER_LEVEL) -> int:
-            """Moves the output tile this iteration accumulates between VMEM and the registers holding it.
-
-            The level names the loop the AGU walks with, a clear standing outside the chunk loop riding its own
-            index rather than the sweep's.
-            """
-            for group, first_vreg in enumerate(_FFN_OUTPUT_TILES):
-                for vreg in range(_TILE_VREGS):
-                    row = row_output + group * _TILE + _NUM_SUBLANES * vreg
-                    access = (minitpu.vst if store else minitpu.vld)(
-                        first_vreg + vreg, row, agu=True, shift=_OUTPUT_TILE_SHIFT, level=level)
-                    put(slot=pc, x=access)
-                    pc += 1
-            return pc
-
-        pc = 0
-        bundles[pc] = {"s": minitpu.smovi(3, _ROW_BYTES)}; pc += 1        # sreg3 = the stride every descriptor reads
-        bundles[pc] = {"s": minitpu.smov_arg(1, 2)}; pc += 1              # sreg1 = drain buffer base
-        pc += 1                                                          # scalar writeback latency
-        bundles[pc] = {"d": minitpu.dma_load(0, _ROW_ZERO, _TILE, 1, 3)}; pc += 1
-        bundles[pc] = {"f": minitpu.flush_slot(1)}; pc += 1
-        bundles[pc] = {"s": minitpu.smov_arg(0, 0)}; pc += 1              # sreg0 = packed input pointer
-        bundles[pc] = {"s": minitpu.smov_arg(2, 1)}; pc += 1              # sreg2 = packed weight pointer
-        bundles[pc] = {"s": minitpu.saddi(1, 1, _ZERO_TILE_BYTES)}; pc += 1
-        pc += 1                                                          # scalar writeback latency
-
-        # Stages the input once, every hidden chunk contracting the same tokens.
-        pc = emit_transfer(pc, slot=0, first_row=row_input, rows=input_rows, pointer=0)
-
-        # Clears the output in VMEM, where it accumulates, the register file holding one tile of it at a time.
-        pc = emit_clear(pc, _FFN_OUTPUT_TILES)
-        bundles[pc] = {"f": minitpu.lbegin(output_tiles)}; pc += 1
-        pc = emit_output_tile(pc, store=True, level=0)
-        bundles[pc - 1] = {**bundles[pc - 1], "f": minitpu.loop_end()}
-
-        bundles[pc] = {"f": minitpu.lbegin(chunks)}; pc += 1
-        pc = emit_transfer(pc, slot=1, first_row=row_up, rows=weight_rows, pointer=2)
-        pc = emit_clear(pc, _RESIDENT_TILES)
-
-        # The up projection. One step body serves every contraction tile, the AGU walking its operands, and
-        # the first step's weights are read ahead of the loop so a step opens on its weight load.
-        pc = emit_load_tile(pc, _WEIGHT_TILE, row_up, level=0)
-
-        bundles[pc] = {"f": minitpu.lbegin(steps)}; pc += 1
-        matload_at = pc
-        put(slot=matload_at, m=minitpu.vmatload(_WEIGHT_TILE))
-        # The operands ride the window the weight load holds, which reads no VMEM of its own.
-        for group in range(_TOKEN_GROUPS):
-            emit_load_tile(matload_at + 1 + _TILE_VREGS * group, _STAGED_TILES[group],
-                           row_input + group * _TILE, shift=_INPUT_STEP_SHIFT)
-
-        def prefetch_weights(group: int, vreg: int) -> int | None:
-            """Reads the next step's weight tile under this step's pushes, past the load streaming it now."""
-            if group:
-                return None
-            return minitpu.vld(_WEIGHT_TILE + vreg, row_up + _TILE + _NUM_SUBLANES * vreg,
-                               agu=True, shift=_WEIGHT_STEP_SHIFT, level=_INNER_LEVEL)
-
-        pc = _emit_pipelined_matrix(put, matload_at + _MATLOAD_SLOTS, stage_next=prefetch_weights,
-                                    close_loop=True)
-
-        # Activates ahead of the output loop, a vgelu riding the launch bundles inside it rewriting the
-        # chunk once per tile.
-        activations = [vreg for tile in _RESIDENT_TILES for vreg in range(tile, tile + _TILE_VREGS)]
-        for vreg in activations:
-            put(slot=pc, e=minitpu.vgelu(vreg, vreg))
-            pc += 1
-
-        # The down projection, the activated chunk pushed once per output tile against a weight tile of its own.
-        pc = emit_load_tile(pc, _WEIGHT_TILE, row_down, level=0)
-
-        bundles[pc] = {"f": minitpu.lbegin(output_tiles)}; pc += 1
-        matload_at = pc
-        put(slot=matload_at, m=minitpu.vmatload(_WEIGHT_TILE))
-        # The tile this iteration accumulates into is read under the same window, its adds an array latency on.
-        emit_output_tile(matload_at + 1, store=False)
-
-        def prefetch_output_weights(group: int, vreg: int) -> int | None:
-            """Reads the next tile's weights under this tile's pushes, as the step loop does with its own."""
-            if group:
-                return None
-            return minitpu.vld(_WEIGHT_TILE + vreg, row_down + _TILE + _NUM_SUBLANES * vreg,
-                               agu=True, shift=_WEIGHT_STEP_SHIFT, level=_INNER_LEVEL)
-
-        pc = _emit_pipelined_matrix(put, matload_at + _MATLOAD_SLOTS, stage_next=prefetch_output_weights,
-                                    close_loop=False, push_tiles=_RESIDENT_TILES,
-                                    accumulators=_FFN_OUTPUT_TILES)
-        pc = emit_output_tile(pc, store=True)
-        bundles[pc - 1] = {**bundles[pc - 1], "f": minitpu.loop_end()}
-        bundles[pc] = {"f": minitpu.loop_end()}; pc += 1
-
-        pc = emit_transfer(pc, slot=0, first_row=row_output, rows=output_rows, pointer=1, store=True)
-        bundles[pc] = {"f": minitpu.halt()}; pc += 1
-
-        for index in range(pc):
-            minitpu.bundle(**bundles.get(index, {}))
-
-    return minitpu.asm(fused_ffn)
 
 
 def _advance(bundles: dict, pc: int, register: int, delta: int) -> int:
@@ -1425,6 +1491,164 @@ def _require_norm_fits(*, name: str, width_rows: int, const_rows: int, out_row: 
             f"block, or stage the row in pieces."
         )
         raise ValueError(message)
+
+
+def _tile_registers(base: int) -> tuple[int, ...]:
+    """Returns the VREGs one tile occupies, counting from the given register."""
+    return tuple(base + vreg for vreg in range(_TILE_VREGS))
+
+
+def _tile_row(first: int, tile: int, vreg: int) -> int:
+    """Returns the VMEM row one register of one tile occupies within a region."""
+    return first + _TILE * tile + _NUM_SUBLANES * vreg
+
+
+def _emit_row_reduce(put: Callable[..., None], slot: int, *, source: tuple[int, ...],
+                     transposed: tuple[int, ...], work: tuple[int, int],
+                     combine: Callable[[int, int, int], int], destination: tuple[int, ...],
+                     scratch_row: int, turnaround: int) -> int:
+    """Reduces each row of one tile across its 16 lanes, leaving the result broadcast back along them.
+
+    Args:
+        put: The bundle merger the calling builder assembles its schedule with.
+        slot: The bundle index the reduction starts at.
+        source: VREGs holding the tile, register v carrying rows 4v through 4v+3.
+        transposed: VREGs the tile transposes into.
+        work: The folded partials and the register they are read back into, rewritten in place.
+        combine: The operation the rows fold under, being vmax or vadd.
+        destination: VREGs the broadcast result lands in, laid out as the source is.
+        scratch_row: First VMEM row the fold turns its partials through.
+        turnaround: Bundles an access waits after the one whose VMEM rows it reads.
+
+    Returns:
+        The next free bundle index.
+    """
+    folded, shifted = work
+    slot = _emit_transpose(put, slot, source=source, destination=transposed)
+
+    # Combines the registers elementwise, every lane now carrying a row, to one partial per sublane.
+    put(slot=slot, e=combine(folded, transposed[0], transposed[1]))
+    slot += 1
+    for register in transposed[2:]:
+        put(slot=slot, e=combine(folded, folded, register))
+        slot += 1
+
+    # Halves the sublanes through VMEM, whose sublanes read consecutive rows, nothing reducing across them.
+    # Leaves stale rows past each shift, so only sublane zero is read on.
+    for step, distance in enumerate(_SUBLANE_FOLDS):
+        row = scratch_row + 2 * _NUM_SUBLANES * step
+        put(slot=slot, x=minitpu.vst(folded, row))
+        slot += 1 + turnaround
+        put(slot=slot, x=minitpu.vld(shifted, row + distance))
+        slot += 1
+        put(slot=slot, e=combine(folded, folded, shifted))
+        slot += 1
+
+    # Spreads sublane zero over consecutive rows, which one load reads back as agreeing sublanes.
+    broadcast = scratch_row + 2 * _NUM_SUBLANES * len(_SUBLANE_FOLDS)
+    for offset in range(_NUM_SUBLANES):
+        put(slot=slot, x=minitpu.vst(folded, broadcast + offset, mask=_SUBLANE_ZERO))
+        slot += 1
+    slot += turnaround
+    put(slot=slot, x=minitpu.vld(shifted, broadcast))
+    slot += 1
+    return _emit_transpose(put, slot, source=(shifted,) * _NUM_SUBLANES, destination=destination)
+
+
+def _emit_transpose(put: Callable[..., None], slot: int, *, source: tuple[int, ...],
+                    destination: tuple[int, ...]) -> int:
+    """Stages one tile into the transpose array and drains its columns back out.
+
+    The staging array is neither a VREG nor an SREG, so the schedule holds the distance between the two halves
+    rather than the hazard model.
+
+    Args:
+        put: The bundle merger the calling builder assembles its schedule with.
+        slot: The bundle index the first vtxin occupies.
+        source: VREGs staged in, one per quarter, repeating where one register fills the tile.
+        destination: VREGs the columns drain into.
+
+    Returns:
+        The next free bundle index.
+    """
+    for quarter, register in enumerate(source):
+        put(slot=slot, e=minitpu.vtxin(register, quarter))
+        slot += _TXIN_II
+    slot += _TXIN_TO_TXOUT
+    for quarter, register in enumerate(destination):
+        put(slot=slot, e=minitpu.vtxout(register, quarter))
+        slot += _TXOUT_II
+    return slot
+
+
+def _emit_tile_update(put: Callable[..., None], slot: int, group: int, *, close_loop: bool, tile: int,
+                      registers: FlashRegisterMap, operation: Callable[[int, int, int], int], operand: int,
+                      row: int, turnaround: int, store: bool = False) -> int:
+    """Applies one elementwise operation to an output tile, reading a spilled tile through the scratch tile.
+
+    Notes:
+        Absorbs the group and the closing flag `_emit_pipelined_matrix` hands its fold, an attention block
+        walking one token group and closing its loop elsewhere.
+
+    Args:
+        put: The bundle merger the calling builder assembles its schedule with.
+        slot: The bundle index the update starts at.
+        group: Token group the fold drained.
+        close_loop: Whether the fold carries a loop's closing bundle.
+        tile: Which output tile is being updated.
+        registers: The register map the block is placed under.
+        operation: The operation applied, being vmul for a rescale and vadd for a product.
+        operand: First VREG of the right operand.
+        row: First VMEM row of the output accumulator.
+        turnaround: Bundles an access waits after the one whose VMEM rows it reads.
+        store: Determines whether a resident tile is written back to VMEM, which the drain needs.
+
+    Returns:
+        The next free bundle index.
+    """
+    if tile < registers.resident:
+        base = registers.accumulator + tile * _TILE_VREGS
+        for vreg in range(_TILE_VREGS):
+            put(slot=slot, e=operation(base + vreg, base + vreg, operand + vreg))
+            slot += 1
+        if not store:
+            return slot
+        for vreg in range(_TILE_VREGS):
+            put(slot=slot, x=minitpu.vst(base + vreg, _tile_row(row, tile, vreg)))
+            slot += 1
+        return slot
+
+    for vreg in range(_TILE_VREGS):
+        put(slot=slot, x=minitpu.vld(registers.scratch + vreg, _tile_row(row, tile, vreg)))
+        slot += 1
+    for vreg in range(_TILE_VREGS):
+        put(slot=slot, e=operation(registers.scratch + vreg, registers.scratch + vreg, operand + vreg))
+        slot += 1
+    for vreg in range(_TILE_VREGS):
+        put(slot=slot, x=minitpu.vst(registers.scratch + vreg, _tile_row(row, tile, vreg)))
+        slot += 1
+    return slot + turnaround
+
+
+def _flash_vmem_map(*, head: int) -> dict[str, int]:
+    """Returns the first VMEM row of each region one attention block stages.
+
+    Args:
+        head: Width of the head the block accumulates, which is the rows every operand of it spans.
+
+    Returns:
+        The first row of each region, keyed by what it stages.
+    """
+    spans = (("query", head), ("initial", _TILE), ("zero", _TILE), ("key", head),
+             ("value", head), ("output", head), ("scratch", _TILE * 2))
+    rows, cursor = {}, _ROW_FLASH_BASE
+    for name, span in spans:
+        rows[name] = cursor
+        cursor += span
+    return rows
+
+
+
 
 
 def _emit_gemm_step(
@@ -1512,8 +1736,10 @@ def _emit_gelu_gemm_step(
 
 
 def _emit_pipelined_matrix(
-    put: Callable[..., None], slot: int, *, stage_next: Callable[[int, int], int | None], close_loop: bool,
+    put: Callable[..., None], slot: int, *, close_loop: bool,
+    stage_next: Callable[[int, int], int | None] | None = None,
     push_tiles: tuple[int, ...] = _STAGED_TILES, accumulators: tuple[int, ...] = _RESIDENT_TILES,
+    scratch: int = _SCRATCH_TILE, accumulate: Callable[..., int] | None = None,
     ride_push: Callable[[int], int | None] | None = None
 ) -> int:
     """Pushes every token group as early as the MXU output FIFO allows, draining only when it must.
@@ -1538,11 +1764,13 @@ def _emit_pipelined_matrix(
     Args:
         put: The bundle merger the calling builder assembles its schedule with.
         slot: The bundle index the first push occupies.
-        stage_next: Given a group and VREG, the X-slot word to co-issue on that push, or None. Pushes
-            read VREG port A and no VMEM, so a load rides underneath one for free.
+        stage_next: Given a group and VREG, the X-slot word to co-issue on that push, or None throughout.
+            Pushes read VREG port A and no VMEM, so a load rides underneath one for free.
         close_loop: Determines whether the last accumulate carries the loop's closing bundle.
-        push_tiles: First VREG of each token group's pushed tile.
-        accumulators: First VREG of each token group's accumulator.
+        push_tiles: First VREG of each token group's pushed tile, whose count is the groups one pass walks.
+        accumulators: First VREG of each token group's accumulator, which the default fold adds into.
+        scratch: First VREG a popped tile lands in.
+        accumulate: Emits one drained tile's fold, or None to add it into its accumulator.
         ride_push: Given a push's ordinal, the E-slot word to co-issue on it, or None. A push claims read port
             A only from the cycle after issue, which leaves its own bundle to one E-slot operand.
 
@@ -1553,6 +1781,8 @@ def _emit_pipelined_matrix(
     POP_II = 5              # vmatpop command initiation interval
     ADD_POP_GAP = 2         # keeps the accumulate clear of the next pop's write window
 
+    folding = accumulate or functools.partial(_emit_accumulate, accumulators=accumulators, scratch=scratch)
+    groups = len(push_tiles)
     depth, per_push, per_pop = asm_module.mxu_output_fifo()
     outstanding = 0
     popped = 0             # pops issued, which names the group and VREG each one drains
@@ -1567,9 +1797,8 @@ def _emit_pipelined_matrix(
         """
         if pending[0] < 0:
             return
-        last = pending[0] == _TOKEN_GROUPS - 1
-        slot_ref[0] = _emit_accumulate(put, slot_ref[0], pending[0], close_loop=close_loop and last,
-                                       accumulators=accumulators)
+        last = pending[0] == groups - 1
+        slot_ref[0] = folding(put, slot_ref[0], pending[0], close_loop=close_loop and last)
         if not last:
             slot_ref[0] += ADD_POP_GAP
         pending[0] = -1
@@ -1580,7 +1809,7 @@ def _emit_pipelined_matrix(
         vreg = popped % _TILE_VREGS
         if vreg == 0:
             flush_accumulate()      # before this pop reuses V28..V31
-        put(slot=slot_ref[0], m=minitpu.vmatpop(_SCRATCH_TILE + vreg))
+        put(slot=slot_ref[0], m=minitpu.vmatpop(scratch + vreg))
         slot_ref[0] += POP_II
         outstanding -= per_pop
         popped += 1
@@ -1588,12 +1817,12 @@ def _emit_pipelined_matrix(
             pending[0] = popped // _TILE_VREGS - 1
 
     pushed = 0
-    for group in range(_TOKEN_GROUPS):
+    for group in range(groups):
         for vreg in range(_TILE_VREGS):
             while outstanding + per_push > depth:
                 drain_one()
             slots = {"m": minitpu.vmatpush(push_tiles[group] + vreg)}
-            staged = stage_next(group, vreg)
+            staged = None if stage_next is None else stage_next(group, vreg)
             if staged is not None:
                 slots["x"] = staged
             rider = None if ride_push is None else ride_push(pushed)
@@ -1610,7 +1839,7 @@ def _emit_pipelined_matrix(
 
 
 def _emit_accumulate(put: Callable[..., None], slot: int, group: int, *, close_loop: bool,
-                     accumulators: tuple[int, ...] = _RESIDENT_TILES) -> int:
+                     accumulators: tuple[int, ...] = _RESIDENT_TILES, scratch: int = _SCRATCH_TILE) -> int:
     """Adds one popped result tile into its resident accumulator, returning the next free bundle index.
 
     Args:
@@ -1620,13 +1849,14 @@ def _emit_accumulate(put: Callable[..., None], slot: int, group: int, *, close_l
         close_loop: Determines whether the final add carries the loop's closing bundle.
         accumulators: First VREG of each token group's accumulator, which a product reading another's tiles
             places away from the registers that tile occupies.
+        scratch: First VREG the popped tile occupies.
 
     Returns:
         The next free bundle index.
     """
     base = accumulators[group]
     for vreg in range(_TILE_VREGS):
-        put(slot=slot, e=minitpu.vadd(base + vreg, base + vreg, _SCRATCH_TILE + vreg))
+        put(slot=slot, e=minitpu.vadd(base + vreg, base + vreg, scratch + vreg))
         if close_loop and vreg == _TILE_VREGS - 1:
             put(slot=slot, f=minitpu.loop_end())
         slot += 1

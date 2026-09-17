@@ -116,29 +116,21 @@ _ROW_SOFTMAX_OUT: int = 1024
 _VREG_ELEMENTS: int = _NUM_LANES * _NUM_SUBLANES
 """The number of values one vector register holds."""
 
-def _max_attention_rows() -> int:
-    """Returns the rows one attention launch covers, bounded by the VMEM the scores are staged in.
+_ATTENTION_ROWS_PER_TOKEN: int = (_ROW_SOFTMAX_OUT - _ROW_SCORES) // _BLOCK_TOKENS
+"""VMEM rows the score staging affords each token of a block."""
 
-    Returns:
-        The rows, a whole number of VREG spans.
+if _ATTENTION_ROWS_PER_TOKEN < 1:
+    _STAGING_MESSAGE = (
+        f"Unable to stage {_BLOCK_TOKENS} tokens of scores in {_ROW_SOFTMAX_OUT - _ROW_SCORES} rows. Move "
+        f"`_ROW_SOFTMAX_OUT`."
+    )
+    raise ValueError(_STAGING_MESSAGE)
 
-    Raises:
-        ValueError: If the gap cannot hold one row per token of a block.
-    """
-    per_token = (_ROW_SOFTMAX_OUT - _ROW_SCORES) // _BLOCK_TOKENS
-    if per_token < 1:
-        message = (
-            f"Unable to stage {_BLOCK_TOKENS} tokens of scores in {_ROW_SOFTMAX_OUT - _ROW_SCORES} rows. Move "
-            f"`_ROW_SOFTMAX_OUT`."
-        )
-        raise ValueError(message)
-    rows_per_token = 1 << (per_token.bit_length() - 1)
-    return rows_per_token * _TILE // _VREG_ELEMENTS * _VREG_ELEMENTS
+_ATTENTION_TOKEN_ROWS: int = 1 << (_ATTENTION_ROWS_PER_TOKEN.bit_length() - 1)
+"""VMEM rows one token's scores own, rounded down to the power of two the AGU reaches by shifting."""
 
-
-MAX_ATTENTION_ROWS: int = _max_attention_rows()
+MAX_ATTENTION_ROWS: int = _ATTENTION_TOKEN_ROWS * _TILE // _VREG_ELEMENTS * _VREG_ELEMENTS
 """Rows one attention launch covers, which the score staging bounds rather than the VREG a reduction spans."""
-
 
 _MAX_DESCRIPTOR_ROWS: int = 128
 """The largest number of rows one DMA descriptor moves, which is the chunk every staged region is sized in."""
@@ -161,20 +153,29 @@ _ROW_TX_OUT: int = _ROW_TX_IN + _TILE
 _ROW_ADD_BIAS: int = _ROW_TX_OUT + _TILE
 """First VMEM row of the replicated bias, which the broadcasting add reads at stride one."""
 
+_ROW_STAT_IN: int = _ROW_ADD_BIAS + _MAX_DESCRIPTOR_ROWS
+"""First VMEM row of the score tile a row statistic reduces, one query per row."""
+
+_ROW_STAT_SCRATCH: int = _ROW_STAT_IN + _TILE
+"""First VMEM row the cross-sublane reduction shifts its partials through."""
+
+_ROW_STAT_OUT: int = _ROW_STAT_SCRATCH + _TILE * 2
+"""First VMEM row of the maxima, probabilities and sums a row statistic leaves, a tile each."""
+
+_STAT_OUT_ROWS: int = _TILE * 3
+"""Rows one row statistic drains."""
+
+_ROW_FLASH_BASE: int = _ROW_STAT_OUT + _STAT_OUT_ROWS
+"""First VMEM row an attention block stages into, the regions past it sized by the head it covers."""
+
 _MODEL_WIDTH: int = 768
 """The GPT-2 model width in features."""
-
-_WIDTH_VREGS: int = _MODEL_WIDTH // _VREG_ELEMENTS
-"""The number of vector registers one model-width row spans."""
 
 _WIDTH_ROWS: int = _MODEL_WIDTH // _NUM_LANES
 """The number of VMEM rows one model-width row spans."""
 
 _LN_ROW_X: int = 0
 """The first VMEM row of the LayerNorm input."""
-
-_LN_ROW_CONST: int = _WIDTH_ROWS
-"""The first VMEM row of the LayerNorm constants, which sit directly above the input."""
 
 _LN_ROW_OUT: int = 512
 """The first VMEM row of the LayerNorm result."""
@@ -205,31 +206,6 @@ def layernorm_constants(gamma: NDArray[np.float32], beta: NDArray[np.float32], *
     inverse = np.full(_VREG_ELEMENTS, 1.0 / width, dtype=np.float32)
     epsilon = np.full(_VREG_ELEMENTS, _LN_EPSILON, dtype=np.float32)
     return as_bf16_words(values=np.concatenate([gamma, beta, zero, inverse, epsilon]))
-
-
-def _require_norm_operands(*, width: int, **operands: NDArray[np.float32]) -> None:
-    """Rejects a normalisation operand that is not exactly one row of `width` features.
-
-    Args:
-        width: Features one normalised row covers.
-        operands: The per-feature vectors to check, named for the message.
-
-    Raises:
-        ValueError: If the width is not a whole number of VREGs, or an operand disagrees with it.
-    """
-    if width <= 0 or width % _VREG_ELEMENTS:
-        message = (
-            f"Unable to normalise a row of {width} features. The reductions are per VREG, so a row is a whole "
-            f"number of {_VREG_ELEMENTS}."
-        )
-        raise ValueError(message)
-    for name, values in operands.items():
-        if values.ndim != 1 or values.size != width:
-            message = (
-                f"Unable to use {name} of shape {values.shape} at width {width}. It must be exactly one row of "
-                f"{width} features."
-            )
-            raise ValueError(message)
 
 
 def as_bf16_words(values: NDArray[np.float32]) -> NDArray[np.uint16]:
@@ -506,30 +482,46 @@ def fused_ffn_bf16_reference(activations: NDArray[np.float32], up_weight: NDArra
     return out
 
 
-def _erf(values: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Returns the error function of each value, which the exact GELU is written in."""
-    return np.vectorize(math.erf, otypes=[np.float64])(values)
-
-
-def _reordered(rng: np.random.Generator, count: int) -> NDArray[np.intp] | None:
-    """Returns a permutation of the given positions that moves at least one of them.
-
-    An identity draw would leave the operand unchanged, so the check it feeds would read its own no-op as evidence.
+def attention_bf16_reference(query: NDArray[np.float32], key: NDArray[np.float32],
+                             value: NDArray[np.float32], *, initial_maximum: float) -> NDArray[np.float32]:
+    """Returns one attention block computed as the image computes it, rounded at every point it writes a VREG.
 
     Args:
-        rng: The generator the permutation is drawn from.
-        count: Positions to permute.
+        query: The block's queries, whose rows are tokens and columns the head.
+        key: Every key the block attends over.
+        value: Every value the block attends over.
+        initial_maximum: Value the running maximum enters below, which the image reads from its operands.
 
     Returns:
-        The permutation, or None when one position cannot be reordered at all.
+        The attended output, one BF16 container per value throughout.
     """
-    if count < 2:
-        return None
-    identity = np.arange(count)
-    order = rng.permutation(count)
-    while np.array_equal(order, identity):
-        order = rng.permutation(count)
-    return order
+    def held(values: NDArray[np.float32]) -> NDArray[np.float32]:
+        """Returns the values as one BF16 container each, which is what a VREG holds."""
+        return from_bf16_words(words=as_bf16_words(values=np.asarray(values, dtype=np.float32)))
+
+    rows, head = query.shape
+    running_maximum = np.full((rows, 1), initial_maximum, dtype=np.float32)
+    running_sum = np.zeros((rows, 1), dtype=np.float32)
+    attended = np.zeros((rows, head), dtype=np.float32)
+
+    for block in range(0, key.shape[0], _TILE):
+        keys, values = key[block:block + _TILE], value[block:block + _TILE]
+        scores = np.zeros((rows, _TILE), dtype=np.float32)
+        for step in range(0, head, _TILE):
+            piece = held(query[:, step:step + _TILE] @ keys[:, step:step + _TILE].T)
+            scores = piece if step == 0 else held(scores + piece)
+
+        maximum = held(np.maximum(running_maximum, scores.max(axis=1, keepdims=True)))
+        alpha = held(np.exp(held(running_maximum - maximum)))
+        running_maximum = maximum
+        probabilities = held(np.exp(held(scores - maximum)))
+
+        running_sum = held(held(running_sum * alpha) + held(probabilities.sum(axis=1, keepdims=True)))
+        attended = held(attended * alpha)
+        for tile in range(0, head, _TILE):
+            piece = held(probabilities @ values[:, tile:tile + _TILE])
+            attended[:, tile:tile + _TILE] = held(attended[:, tile:tile + _TILE] + piece)
+    return held(attended * held(1.0 / running_sum))
 
 
 def assert_operands_discriminating(activations: NDArray[np.float32], weights: NDArray[np.float32]) -> None:
@@ -600,6 +592,57 @@ def build_operands(
     # Fails rather than handing back operands that would report a vacuous pass.
     assert_operands_discriminating(activations=left, weights=right)
     return left, right
+
+
+def _require_norm_operands(*, width: int, **operands: NDArray[np.float32]) -> None:
+    """Rejects a normalisation operand that is not exactly one row of `width` features.
+
+    Args:
+        width: Features one normalised row covers.
+        operands: The per-feature vectors to check, named for the message.
+
+    Raises:
+        ValueError: If the width is not a whole number of VREGs, or an operand disagrees with it.
+    """
+    if width <= 0 or width % _VREG_ELEMENTS:
+        message = (
+            f"Unable to normalise a row of {width} features. The reductions are per VREG, so a row is a whole "
+            f"number of {_VREG_ELEMENTS}."
+        )
+        raise ValueError(message)
+    for name, values in operands.items():
+        if values.ndim != 1 or values.size != width:
+            message = (
+                f"Unable to use {name} of shape {values.shape} at width {width}. It must be exactly one row of "
+                f"{width} features."
+            )
+            raise ValueError(message)
+
+
+def _erf(values: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Returns the error function of each value, which the exact GELU is written in."""
+    return np.vectorize(math.erf, otypes=[np.float64])(values)
+
+
+def _reordered(rng: np.random.Generator, count: int) -> NDArray[np.intp] | None:
+    """Returns a permutation of the given positions that moves at least one of them.
+
+    An identity draw would leave the operand unchanged, so the check it feeds would read its own no-op as evidence.
+
+    Args:
+        rng: The generator the permutation is drawn from.
+        count: Positions to permute.
+
+    Returns:
+        The permutation, or None when one position cannot be reordered at all.
+    """
+    if count < 2:
+        return None
+    identity = np.arange(count)
+    order = rng.permutation(count)
+    while np.array_equal(order, identity):
+        order = rng.permutation(count)
+    return order
 
 
 def _single_launch_operands() -> (

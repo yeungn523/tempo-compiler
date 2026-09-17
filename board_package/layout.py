@@ -340,6 +340,12 @@ class FlashRegisterMap:
         return self.pushed + self.per_tile
 
     @property
+    def partial(self) -> int:
+        """Returns the first register the contraction steps of one score tile accumulate into.
+        """
+        return self.result + self.per_tile
+
+    @property
     def scores(self) -> int:
         """Returns the first register of the score tile, which reuses the matrix phase's registers."""
         return self.transient
@@ -357,7 +363,7 @@ class FlashRegisterMap:
     @property
     def transient_span(self) -> int:
         """Returns the registers the shared region spans, being the widest phase's demand."""
-        return max(_TILE_VREGS + 2 * self.per_tile, 2 * self.per_tile + self.token_groups)
+        return max(_TILE_VREGS + 3 * self.per_tile, 2 * self.per_tile + self.token_groups)
 
     @property
     def used(self) -> int:
@@ -478,8 +484,6 @@ class VmemAllocator:
 
     def check_disjoint(self) -> None:
         """Raises if any two regions overlap.
-
-        Bump allocation cannot produce an overlap, so this catches a hand-placed region mixed in with allocated ones.
         """
         ordered = sorted(self._regions, key=lambda r: r.base)
         for earlier, later in zip(ordered, ordered[1:]):
@@ -624,7 +628,7 @@ def flash_register_map(*, queries: int, head: int) -> FlashRegisterMap:
     entries = PROFILE["vreg_entry_count"]
 
     # The phases take turns, so the shared region is the widest of them rather than their sum.
-    transient_span = max(_TILE_VREGS + 2 * per_tile, 2 * per_tile + token_groups)
+    transient_span = max(_TILE_VREGS + 3 * per_tile, 2 * per_tile + token_groups)
     row_max = transient_span
     row_sum = row_max + per_tile
     accumulator = row_sum + per_tile

@@ -113,7 +113,7 @@ class FlashRegisterMapTest(unittest.TestCase):
     def test_every_phase_fits_the_shared_region(self) -> None:
         """Verifies that neither phase reaches past the registers the shared region spans."""
         mapped = flash_register_map(queries=16, head=64)
-        matrix = mapped.result + mapped.per_tile - mapped.transient
+        matrix = mapped.partial + mapped.per_tile - mapped.transient
         reduction = mapped.running + mapped.token_groups - mapped.transient
         self.assertLessEqual(matrix, mapped.transient_span)
         self.assertLessEqual(reduction, mapped.transient_span)
@@ -130,7 +130,7 @@ class FlashRegisterMapTest(unittest.TestCase):
     def test_sharing_is_what_makes_the_block_fit(self) -> None:
         """Verifies that the phases summed rather than shared leave no room for the scratch tile."""
         mapped = flash_register_map(queries=16, head=64)
-        matrix = mapped.result + mapped.per_tile - mapped.transient
+        matrix = mapped.partial + mapped.per_tile - mapped.transient
         reduction = mapped.running + mapped.token_groups - mapped.transient
         summed = matrix + reduction + 2 * mapped.per_tile
         self.assertGreater(summed + _TILE_VREGS, PROFILE["vreg_entry_count"])

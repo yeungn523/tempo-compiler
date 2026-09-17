@@ -295,9 +295,8 @@ class FusedRegisterMap:
 class FlashRegisterMap:
     """Holds where one attention block's tiles live in the vector register file.
 
-    The running statistics and the accumulator are rewritten by every key block, so they hold their registers
-    throughout. Everything else dies with the phase that wrote it, so the phases share one transient region rather than
-    each reserving its own.
+    The running statistics and the accumulator are rewritten by every key block, so they hold dedicated registers
+    throughout. Everything else outlasts only the phase that wrote it, so the phases share one transient region.
 
     Attributes:
         transient: First register of the region the phases share.

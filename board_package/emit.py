@@ -237,8 +237,8 @@ class RowReduce:
 class Accumulate:
     """Applies one elementwise operation to an output tile, wherever the register map placed it.
 
-    A tile the registers hold is updated in place, and one that spilled is read through the scratch tile, so a
-    step list states the update alone and the map decides what it costs.
+    A step list states the update, and the register map decides whether it runs in registers or through the
+    scratch tile.
 
     Attributes:
         kind: The operation applied, being vmul for a rescale and vadd for a product.
@@ -254,8 +254,8 @@ class Accumulate:
 
 
 Step = Load | Store | Product | Combine | Transform | RowReduce | Accumulate
-"""One operation of the vocabulary an image's body is written in, aliased rather than declared with the `type`
-statement because the board's interpreter is Python 3.11."""
+"""One operation of the vocabulary an image's body is written in. Aliased rather than declared with the `type`
+statement, which the board's Python 3.11 interpreter does not carry."""
 
 
 @dataclass(frozen=True)
@@ -863,7 +863,7 @@ def fused_ffn_stream(*, chunks: int, steps: int,
 
 
 def flash_steps(*, steps: int, tiles: int) -> tuple[Step, ...]:
-    """Returns the body one key block of an attention block runs, as the vocabulary states it.
+    """Returns one key block's steps, being the score product, the online softmax and the output accumulate.
 
     Notes:
         The rescale precedes the row sum because both want the registers the transpose stages through, which is
@@ -901,6 +901,63 @@ def flash_steps(*, steps: int, tiles: int) -> tuple[Step, ...]:
                  Accumulate(kind="vadd", tile=tile, operand="result")]
     return tuple(body)
 
+def step_footprint(step: Step) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+    """Returns the register regions one step reads, the ones it leaves a value in, and the ones it spends.
+
+    Args:
+        step: The step to describe.
+
+    Returns:
+        The regions read, the regions left holding a value, and the regions spent as working space.
+
+    Raises:
+        ValueError: If the step is not one the vocabulary carries.
+    """
+    empty: frozenset[str] = frozenset()
+    if isinstance(step, Load):
+        return empty, frozenset({step.into}), empty
+    if isinstance(step, Store):
+        return frozenset({step.source}), empty, empty
+    if isinstance(step, Product):
+        return frozenset({step.pushed, step.weight}), frozenset({"result"}), empty
+    if isinstance(step, Combine):
+        return frozenset({step.left, step.right}), frozenset({step.into}), empty
+    if isinstance(step, Transform):
+        return frozenset({step.source}), frozenset({step.into}), empty
+    if isinstance(step, RowReduce):
+        return frozenset({step.source}), frozenset({step.into}), frozenset({"staged", "running"})
+    if isinstance(step, Accumulate):
+        return frozenset({step.operand, "accumulator"}), frozenset({"accumulator"}), frozenset({"scratch"})
+    message = f"Unable to describe {step}, which is not a step the vocabulary carries."
+    raise ValueError(message)
+
+
+def check_steps(body: tuple[Step, ...]) -> None:
+    """Refuses a body that reads a region after another step spent it as working space.
+
+    Args:
+        body: The steps to check, in the order they run.
+
+    Raises:
+        ValueError: If a step reads a region another spent, with nothing writing it in between.
+    """
+    spent_at: dict[str, int] = {}
+    for index, step in enumerate(body):
+        reads, writes, spent = step_footprint(step)
+        for region in reads:
+            if region in spent_at:
+                message = (
+                    f"Unable to run step {index}, {step}, which reads {region} after step {spent_at[region]} "
+                    f"spent it as working space and nothing wrote it since. Read the value before the step "
+                    f"spending that region runs."
+                )
+                raise ValueError(message)
+        for region in writes:
+            spent_at.pop(region, None)
+        for region in spent:
+            spent_at[region] = index
+
+
 def emit_steps(put: Callable[..., None], builder: asm_module.AsmBuilder, slot: int, *, body: tuple[Step, ...],
                registers: FlashRegisterMap, rows: dict[str, int], turnaround: int) -> int:
     """Places every step of one body, resolving its regions through the register map.
@@ -920,6 +977,8 @@ def emit_steps(put: Callable[..., None], builder: asm_module.AsmBuilder, slot: i
     Raises:
         ValueError: If a step names an operation the vocabulary does not carry.
     """
+    check_steps(body)
+
     def region(name: str) -> int:
         """Returns the first VREG of a named register region."""
         return getattr(registers, name)

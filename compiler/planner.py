@@ -7,8 +7,9 @@ import math
 from bf16 import _BLOCK_DEPTH, _BLOCK_TOKENS, _TILE, _ZERO_TILE_WORDS
 from layout import LayoutError, register_map
 
-from .ir import (_EMITTED_NEST, _REDUCTION_AXIS, Drain, FusedLaunch, Launch, MatMul, Padding, Plan,
-                 ProgramError, Repack)
+from .ir import (_EMITTED_NEST, _REDUCTION_AXIS, Drain, FlashLaunch, FusedLaunch, Launch, MatMul, Padding,
+                 Plan, ProgramError, Repack)
+from .lowering import attention_block, attention_extents, unnameable
 
 _MINIMUM_LOOP_BLOCKS: int = 2
 """Smallest number of accumulation blocks a group carries, set by the two way unroll of the block loop."""
@@ -71,6 +72,9 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
     # kernel stating one matmul leaves this empty, so its plan is the loop below and nothing else.
     pairs = _fusable_pairs(matmuls) if fuse else {}
     absorbed = _epilogues_absorbed(matmuls)
+    # Reads the attention pairs before planning, an online softmax being a chain no plain launch describes.
+    attention = {matmuls[index].left_source: index for index in range(len(matmuls))
+                 if fuse and attention_block(matmuls, index=index)}
 
     launches: list[Launch | FusedLaunch] = []
     drains: list[Drain] = []
@@ -80,8 +84,15 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
     covered_by_index: dict[int, dict[str, int]] = {}
     planned_at: dict[int, int] = {}
     ratio = 1.0
-    consumed = set(pairs.values())
+    consumed = set(pairs.values()) | set(attention.values())
     for index, (matmul, extent) in enumerate(zip(matmuls, dims, strict=True)):
+        if index in attention:
+            launch = _attention_launch(matmuls, produces=index, consumes=attention[index])
+            planned_at[index] = len(launches)
+            launches.append(launch)
+            shape = (1, 1, launch.output_tiles, launch.queries, _TILE)
+            drains.append(Drain(zero_tile_words=0, words=math.prod(shape), shape=shape))
+            continue
         if index in consumed:
             # Planned with the matmul it is fused onto, whose image already covers this one's contraction.
             continue
@@ -194,6 +205,33 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
 
     return Plan(launches=tuple(launches), drains=tuple(drains), padding=tuple(padding), repack=tuple(repack),
                 masks_covered=tuple(masks_covered), issued_over_useful=ratio)
+
+
+def _attention_launch(matmuls: tuple[MatMul, ...], *, produces: int, consumes: int) -> FlashLaunch:
+    """Returns the launch one attention block runs, refusing a chain the machine has no vector operation for.
+
+    Args:
+        matmuls: The matmuls a kernel computes, in program order.
+        produces: Position of the matmul leaving the scores.
+        consumes: Position of the matmul contracting the probabilities.
+
+    Returns:
+        The launch.
+
+    Raises:
+        ProgramError: If the online softmax runs an operation the machine cannot name as a step.
+    """
+    for position, chain in ((consumes, matmuls[consumes].prologue_chain),
+                            (consumes, matmuls[consumes].epilogue_chain)):
+        refused = unnameable(chain)
+        if refused:
+            message = (
+                f"Unable to run matmul {position}'s chain, which names {', '.join(refused)}. Every operation "
+                f"standing around an attention block's products has to be one the vector unit runs in a single "
+                f"pass, so write those in terms of the operations it carries."
+            )
+            raise ProgramError(message)
+    return FlashLaunch(**attention_extents(matmuls, produces=produces, consumes=consumes))
 
 
 def _check_dimensions_match(*, index: int, matmul: MatMul, covered: dict[str, int],

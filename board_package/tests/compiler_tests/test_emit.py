@@ -392,5 +392,31 @@ class FusedFeedForwardEmitterTest(unittest.TestCase):
         self.assertEqual(staging.drain_rows, bf16._BLOCK_TOKENS * 4)
 
 
+
+class StepBodyTest(unittest.TestCase):
+    """Tests the checks a body of steps is placed under."""
+
+    def test_the_attention_body_is_accepted(self) -> None:
+        """Verifies that the body an attention block runs states an order its regions survive."""
+        emit.check_steps(emit.flash_steps(steps=4, tiles=4))
+
+    def test_a_reduction_spending_a_live_region_is_refused(self) -> None:
+        """Verifies that moving the row sum ahead of the rescale is refused rather than emitted."""
+        body = list(emit.flash_steps(steps=4, tiles=4))
+        reduction = next(index for index, step in enumerate(body)
+                         if isinstance(step, emit.RowReduce) and step.kind == "vadd")
+        rescale = next(index for index, step in enumerate(body)
+                       if isinstance(step, emit.Combine) and step.into == "row_sum" and step.kind == "vmul")
+        moved = (*body[:rescale], body[reduction], *body[rescale:reduction], *body[reduction + 1:])
+        with self.assertRaises(ValueError):
+            emit.check_steps(moved)
+
+    def test_every_step_states_a_footprint(self) -> None:
+        """Verifies that every step the attention body runs reports the regions it touches."""
+        for step in emit.flash_steps(steps=4, tiles=4):
+            reads, writes, spent = emit.step_footprint(step)
+            self.assertIsInstance(reads | writes | spent, frozenset)
+
+
 if __name__ == "__main__":
     unittest.main()

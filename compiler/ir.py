@@ -86,8 +86,7 @@ class TileLoop:
 class Operation:
     """One operation standing between a matmul and the value its consumer reads.
 
-    A set of names states which operations a chain runs and nothing else, so lowering it needs the order they run
-    in and the values each one reads.
+    Lowering a chain needs the order its operations run in and the values each one reads.
 
     Attributes:
         name: The operation's name, a reduce carrying the combiner it folds under.
@@ -106,8 +105,8 @@ class Operation:
 class Carried:
     """One value a loop hands from each trip to the next.
 
-    A carried value is what the block accumulates across its whole loop, so it holds a register region for the
-    length of it while everything else dies with the trip that wrote it.
+    A carried value outlasts every trip, so it holds a dedicated register region, while a value one trip
+    computes shares the transient one.
 
     Attributes:
         position: Which of the loop's carried values this is.
@@ -115,6 +114,7 @@ class Carried:
         inside: Identifier the body reads it under.
         leaving: Identifier of the value each trip hands on.
         shape: Extent of the value, which tells a running statistic from an accumulator.
+        chain: The operations updating it each trip, in program order.
     """
 
     position: int
@@ -122,6 +122,7 @@ class Carried:
     inside: int
     leaving: int
     shape: tuple[int, ...]
+    chain: tuple[Operation, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +139,8 @@ class MatMul:
         carried: Values the reduction loop hands from each trip to the next, empty where it walks none.
         epilogue_chain: The epilogue's operations in program order, each carrying what it reads.
         prologue_chain: The prologue's operations in program order, each carrying what it reads.
+        accumulator_chain: The operations producing what the matmul accumulates into, which is where a
+            rescale of the running product lands once Triton folds it onto the dot.
         left_source: Index of the matmul producing the left operand, or None when it comes from memory.
         reduction: Whole reduction the loop walks, or None when its bound is a runtime argument.
         tile_loops: Every loop walking the output rather than the contraction, outermost first, holding the ones
@@ -169,6 +172,7 @@ class MatMul:
     carried: tuple[Carried, ...] = ()
     epilogue_chain: tuple[Operation, ...] = ()
     prologue_chain: tuple[Operation, ...] = ()
+    accumulator_chain: tuple[Operation, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

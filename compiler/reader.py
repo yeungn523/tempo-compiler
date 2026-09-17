@@ -324,11 +324,12 @@ class _Graph:
             pending.extend(operation.get_operand(index) for index in range(operation.get_num_operands()))
         return source, frozenset(found), tuple(sorted(chain.values(), key=lambda step: step.position))
 
-    def carried_values(self, loop) -> tuple[Carried, ...]:
+    def carried_values(self, loop, *, among: list) -> tuple[Carried, ...]:
         """Returns the values one loop hands from each trip to the next.
 
         Args:
             loop: The scf.for operation to read.
+            among: The operations a chain terminates at, being the kernel's matmuls.
 
         Returns:
             One record per carried value, in the order the loop declares them.
@@ -347,7 +348,8 @@ class _Graph:
                 shape = ()
             found.append(Carried(position=index - 1, entering=loop.get_operand(2 + index).id(),
                                  inside=argument.id(), leaving=yielded.get_operand(index - 1).id(),
-                                 shape=shape))
+                                 shape=shape,
+                                 chain=self.trace(yielded.get_operand(index - 1), among=among)[2]))
         return tuple(found)
 
     def reduce_kind(self, operation) -> str | None:
@@ -791,8 +793,9 @@ def read_program(kernel: JITFunction, *, signature: dict[str, str],
             stores_inside_reduction=(at is not None and index < len(stores)
                                      and len(graph.enclosing_loops(stores[index])) > at),
             grid_axes=_grid_axes(graph=graph, pointers=pointers),
-            carried=graph.carried_values(loops[at]) if at is not None else (),
+            carried=graph.carried_values(loops[at], among=dots) if at is not None else (),
             epilogue_chain=epilogue_chain, prologue_chain=prologue_chain,
+            accumulator_chain=graph.trace(dot.get_operand(2), among=dots)[2],
         ))
     return tuple(matmuls)
 

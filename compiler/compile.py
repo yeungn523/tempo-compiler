@@ -7,9 +7,9 @@ from numpy.typing import NDArray
 
 from asm import IRAM_DEPTH, AsmKernel
 from bf16 import _BLOCK_DEPTH, _TILE
-from emit import Staging, fused_ffn_stream, looped_gemm_stream
+from emit import Staging, flash_attention_stream, fused_ffn_stream, looped_gemm_stream
 
-from .ir import FusedLaunch, Launch, MatMul, ProgramError
+from .ir import FlashLaunch, FusedLaunch, Launch, MatMul, ProgramError
 
 
 def stage(left: NDArray[np.float32], right: NDArray[np.float32], *, matmul: MatMul,
@@ -38,7 +38,7 @@ def stage(left: NDArray[np.float32], right: NDArray[np.float32], *, matmul: MatM
     return staged[0], staged[1]
 
 
-def compile_launch(launch: Launch | FusedLaunch) -> tuple[bytes, Staging]:
+def compile_launch(launch: Launch | FusedLaunch | FlashLaunch) -> tuple[bytes, Staging]:
     """Returns the image one launch compiles to and what a host stages for it.
 
     Args:
@@ -49,8 +49,16 @@ def compile_launch(launch: Launch | FusedLaunch) -> tuple[bytes, Staging]:
 
     Raises:
         NotImplementedError: If a plain launch activates its staged tiles, which the emitter does not place.
-        ProgramError: If the compiled bundles exceed the IRAM depth limit under either placement.
+        ProgramError: If the compiled bundles exceed the IRAM depth limit under every placement tried.
     """
+    if isinstance(launch, FlashLaunch):
+        bundles, staging = flash_attention_stream(key_blocks=launch.key_blocks, queries=launch.queries,
+                                                  head=launch.head)
+        # Pins the hand placement, whose gaps carry the VMEM and staging array dependencies the hazard model
+        # cannot see, so a packed image would move a load ahead of the store it reads.
+        return _assemble(name="flash_attention", bundles=bundles, placements=("",),
+                         remedy="narrow the head the block accumulates"), staging
+
     if isinstance(launch, FusedLaunch):
         bundles, staging = fused_ffn_stream(chunks=launch.chunks, steps=launch.steps,
                                             output_tiles=launch.output_tiles)
@@ -74,22 +82,25 @@ def compile_launch(launch: Launch | FusedLaunch) -> tuple[bytes, Staging]:
     return _assemble(name="looped_gemm", bundles=bundles, remedy=remedy), staging
 
 
-def _assemble(*, name: str, bundles: tuple[int, ...], remedy: str) -> bytes:
+def _assemble(*, name: str, bundles: tuple[int, ...], remedy: str,
+              placements: tuple[str | None, ...] = (None, "pack")) -> bytes:
     """Returns one kernel's image, packing its bundles where the hand placement overflows IRAM.
 
     Args:
         name: The name the kernel's error messages carry.
         bundles: The bundle words the emitter placed, in program order.
         remedy: What a refusal asks the caller to narrow, the tile that fits being the kernel's own choice.
+        placements: Re-placement passes tried in turn, an image whose schedule carries its own dependencies
+            naming the one pass that leaves it as it was written.
 
     Returns:
         The image bytes padded to the loader's boundary.
 
     Raises:
-        ProgramError: If neither placement fits the image in IRAM.
+        ProgramError: If no placement fits the image in IRAM.
     """
     overflow: ValueError | None = None
-    for placement in (None, "pack"):
+    for placement in placements:
         try:
             return AsmKernel(name=name, bundles=bundles, placement=placement).to_bytes(pad_to=4)
         except ValueError as error:

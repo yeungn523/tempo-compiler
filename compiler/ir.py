@@ -271,12 +271,42 @@ class FusedLaunch:
 
 
 @dataclass(frozen=True, slots=True)
+class FlashLaunch:
+    """Describes one image running an attention block's whole key loop.
+
+    The running statistics and the output accumulator hold vector registers for the loop, so the score tile
+    never reaches memory and the block costs one launch however many keys it attends over.
+
+    Attributes:
+        row_blocks: Query blocks the problem covers, being launches the host issues rather than a trip count.
+        key_blocks: Blocks the key loop walks, each covering a tile of keys.
+        queries: Queries one block covers.
+        head: Width of the head the block accumulates.
+    """
+
+    row_blocks: int
+    key_blocks: int
+    queries: int
+    head: int
+
+    @property
+    def output_tiles(self) -> int:
+        """Returns the tiles the head covers, being its width over the tile."""
+        return self.head // _TILE
+
+    @property
+    def launches(self) -> int:
+        """Returns the launches a host issues, being one per query block."""
+        return self.row_blocks
+
+
+@dataclass(frozen=True, slots=True)
 class Plan:
     """Holds the launches a kernel becomes and what the host must stage for them.
 
     Attributes:
         launches: One launch per matmul, in the order the host issues them, a fused one standing
-            for the pair it runs in one image.
+            for the pair it runs in one image and a flash one for the attention block it runs.
         drains: What each launch writes back, in the order the host issues them.
         padding: Every axis grown to reach whole launches, which the host zero fills and slices back.
         repack: Every operand the host must rewrite in memory, because the lanes read one contiguous run.
@@ -285,7 +315,7 @@ class Plan:
         issued_over_useful: Multiplies the padded shapes issue over the multiplies the problems hold.
     """
 
-    launches: tuple[Launch | FusedLaunch, ...]
+    launches: tuple[Launch | FusedLaunch | FlashLaunch, ...]
     drains: tuple[Drain, ...]
     padding: tuple[Padding, ...]
     repack: tuple[Repack, ...]

@@ -30,6 +30,9 @@ from compiler_tests.test_layout import renaming_onto  # noqa: E402
 from layout import register_map  # noqa: E402
 
 _OPERANDS: dict[str, str] = {"ap": "*bf16", "wp": "*bf16", "op": "*fp32"}
+
+_ATTENTION_OPERANDS: dict[str, str] = {"qp": "*bf16", "kp": "*bf16", "vp": "*bf16", "op": "*fp32"}
+"""Triton type of each buffer an attention kernel is compiled against."""
 """Triton type of each parameter a buffer is passed for, which every kernel below shares."""
 
 _STRIDE_NAMES: tuple[str, ...] = ("stride_am", "stride_ak", "stride_bk", "stride_bn", "stride_cm", "stride_cn")
@@ -98,10 +101,39 @@ class ProgramReaderTest(unittest.TestCase):
         launch = planned.launches[0]
         self.assertEqual((launch.row_blocks, launch.column_tiles, launch.groups), (2, 8, 3))
 
-    def test_a_folded_reduction_is_refused(self) -> None:
-        """Asserts a kernel whose reduction ran once, leaving tile loops alone, is refused rather than misread."""
-        with self.assertRaises(ProgramError):
-            compile_one(gemm_folded_reduction)
+    def test_a_folded_reduction_is_read_from_its_operands(self) -> None:
+        """Asserts a kernel whose reduction ran once contracts the extent its operands meet at."""
+        matmuls, planned = compile_one(gemm_folded_reduction)
+        matmul = matmuls[0]
+        self.assertEqual((matmul.rows, matmul.columns, matmul.depth), (32, 16, 64))
+        self.assertEqual(matmul.reduction, 64)
+        self.assertEqual(tuple(loop.axis for loop in matmul.tile_loops), ("m", "n"))
+        launch = planned.launches[0]
+        self.assertEqual((launch.row_blocks, launch.column_tiles, launch.groups), (2, 3, 1))
+
+    def test_an_attention_block_is_read_as_its_two_products(self) -> None:
+        """Asserts a flash attention kernel reads as the score product and the product consuming it."""
+        matmuls = read_attention()
+        scores, attended = matmuls
+        self.assertEqual((scores.rows, scores.columns, scores.depth), (16, 16, 64))
+        self.assertIsNone(scores.left_source)
+        self.assertEqual(scores.nest, ("m", "n", "k"))
+        self.assertEqual((attended.rows, attended.columns, attended.depth), (16, 64, 16))
+        self.assertEqual(attended.left_source, 0)
+        self.assertEqual(attended.nest, ("k",))
+
+    def test_a_reduce_is_read_as_the_operation_it_folds_under(self) -> None:
+        """Asserts a row maximum and a row sum are told apart by the combiner each reduce carries."""
+        matmuls = read_attention()
+        self.assertIn("tt.reduce.arith.maxnumf", matmuls[1].prologue)
+        self.assertIn("tt.reduce.arith.addf", matmuls[1].epilogue)
+        self.assertNotIn("tt.reduce.arith.addf", matmuls[1].prologue)
+
+    def test_the_key_loop_carries_the_statistics_and_the_accumulator(self) -> None:
+        """Asserts the values the key loop hands on are read, the accumulator told apart by its rank."""
+        scores, attended = read_attention()
+        self.assertEqual(scores.carried, ())
+        self.assertEqual([value.shape for value in attended.carried], [(16,), (16,), (16, 64)])
 
     def test_the_transform_ahead_of_the_matmul_is_recovered(self) -> None:
         """Asserts the operations standing between the left operand's load and the matmul are read as its prologue."""
@@ -418,6 +450,33 @@ def gemm_tall_rows(ap, wp, op, stride_am, stride_ak, stride_bk, stride_bn, strid
 
 
 @triton.jit
+def flash_attention_kernel(qp, kp, vp, op, stride_qm, stride_qd, stride_kn, stride_kd, stride_vn, stride_vd,
+                           stride_om, stride_od, M: tl.constexpr = 32, N: tl.constexpr = 64,
+                           D: tl.constexpr = 64, BLOCK_M: tl.constexpr = 16, BLOCK_N: tl.constexpr = 16):
+    """Attends with the online softmax a flash attention kernel carries, one key block at a time."""
+    offs_d = tl.arange(0, D)
+    for block in range(0, M, BLOCK_M):
+        offs_m = block + tl.arange(0, BLOCK_M)
+        query = tl.load(qp + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
+        running_max = tl.zeros((BLOCK_M,), dtype=tl.float32) - float("inf")
+        running_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        accumulator = tl.zeros((BLOCK_M, D), dtype=tl.float32)
+        for start in range(0, N, BLOCK_N):
+            offs_n = start + tl.arange(0, BLOCK_N)
+            key = tl.load(kp + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd)
+            value = tl.load(vp + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd)
+            scores = tl.dot(query, tl.trans(key))
+            block_max = tl.maximum(running_max, tl.max(scores, 1))
+            probabilities = tl.exp(scores - block_max[:, None])
+            alpha = tl.exp(running_max - block_max)
+            running_sum = running_sum * alpha + tl.sum(probabilities, 1)
+            accumulator = accumulator * alpha[:, None] + tl.dot(probabilities.to(tl.bfloat16), value)
+            running_max = block_max
+        tl.store(op + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od,
+                 accumulator / running_sum[:, None])
+
+
+@triton.jit
 def gemm_folded_reduction(ap, wp, op, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
                           M: tl.constexpr = 64, N: tl.constexpr = 48, K: tl.constexpr = 64,
                           BLOCK_M: tl.constexpr = 32, BLOCK_N: tl.constexpr = 16, BLOCK_K: tl.constexpr = 64):
@@ -615,6 +674,19 @@ def compile_ffn():
     strides = dict(stride_am=192, stride_ak=1, stride_uk=192, stride_un=1, stride_dk=16, stride_dn=1,
                    stride_cm=16, stride_cn=1)
     return matmuls, plan(matmuls, strides=strides, dims=({"m": 32}, {"m": 32, "n": 16}))
+
+
+def read_attention():
+    """Returns the matmuls the attention kernel states.
+
+    Returns:
+        The score product and the product consuming it.
+    """
+    constexprs = {parameter.name: parameter.default for parameter in flash_attention_kernel.params
+                  if parameter.is_constexpr}
+    return read_program(flash_attention_kernel,
+                        signature=signature_of(flash_attention_kernel, operands=_ATTENTION_OPERANDS),
+                        constexprs=constexprs)
 
 
 def compile_one(kernel, *, dims: tuple[dict[str, int], ...] = ()):

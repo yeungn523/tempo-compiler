@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from triton.runtime import JITFunction
 
 from .frontend import compile_to_ttir
-from .ir import _REDUCTION_AXIS, Access, Guard, MatMul, ProgramError, TileLoop
+from .ir import _REDUCTION_AXIS, Access, Carried, Guard, MatMul, Operation, ProgramError, TileLoop
 
 _ASSUMED_ACCUMULATOR_ELEMENT: str = "f32"
 """Element type a dot accumulates in when its printed result type states none."""
@@ -25,10 +25,15 @@ _PENDING_AXIS: int = -1
 """Axis a rank one iota occupies until an expand_dims operation places it in a ranked tensor."""
 
 _ADDRESS_OPERATIONS: frozenset[str] = frozenset(
-    {"arith.constant", "tt.splat", "tt.broadcast", "tt.make_range", "tt.expand_dims", "tt.addptr", "arith.muli",
-     "arith.addi", "tt.get_program_id", "arith.extsi", "arith.trunci"}
+    {"arith.constant", "tt.splat", "tt.make_range", "tt.addptr", "arith.muli", "arith.addi",
+     "tt.get_program_id", "arith.extsi", "arith.trunci"}
 )
 """Operations forming an address or supplying a literal rather than a step of an epilogue."""
+
+_RESHAPES: frozenset[str] = frozenset({"tt.broadcast", "tt.expand_dims"})
+"""Operations carrying a value into another shape. A walk passes through these recording nothing, because the
+same pair spreads a reduced row back over a tile and places an iota in an address, and only what lies behind
+them tells the two apart."""
 
 _PREDICATE_RESHAPES: frozenset[str] = frozenset(
     {"tt.broadcast", "tt.expand_dims", "arith.extsi", "arith.trunci"}
@@ -109,15 +114,19 @@ class _Graph:
         module.walk(operations.append)
 
         self._definitions: dict[int, object] = {}
+        self._blocks: dict[int, object] = {}
+        self._positions: dict[int, int] = {}
         self._named: dict[str, list] = {}
         blocks: dict[int, object] = {}
-        for operation in operations:
+        for position, operation in enumerate(operations):
+            self._positions[id(operation)] = position
             self._named.setdefault(operation.get_name(), []).append(operation)
             for index in range(operation.get_num_results()):
                 self._definitions[operation.get_result(index).id()] = operation
             block = operation.get_block()
             if block is not None:
                 blocks.setdefault(block.get_parent().id(), block)
+        self._blocks = blocks
 
         self._loop_of_block: dict[int, object] = {}
         self._body_of_loop: dict[int, object] = {}
@@ -269,10 +278,11 @@ class _Graph:
             among: The operations that terminate the trace, being the kernel's matmuls.
 
         Returns:
-            The producing operation, or None when the value comes from memory, and the arithmetic operation names
-            passed through on the way.
+            The producing operation, or None when the value comes from memory, the arithmetic operation names
+            passed through on the way, and those operations in program order.
         """
         found: set[str] = set()
+        chain: dict[int, Operation] = {}
         seen: set[int] = set()
         pending = [value]
         source = None
@@ -298,13 +308,71 @@ class _Graph:
                                  if operation.get_result(position).id() == key)
                     pending.append(terminator.get_operand(index))
                 continue
+            if name in _RESHAPES:
+                pending.extend(operation.get_operand(index) for index in range(operation.get_num_operands()))
+                continue
             if name == "tt.load" or name in _ADDRESS_OPERATIONS or operation.get_num_operands() == 0:
                 continue
 
             if name not in _WIDTH_CASTS:
-                found.add(name)
+                named = f"{name}.{self.reduce_kind(operation)}" if name == "tt.reduce" else name
+                found.add(named)
+                chain[id(operation)] = Operation(
+                    name=named, position=self._positions[id(operation)], result=operation.get_result(0).id(),
+                    operands=tuple(operation.get_operand(index).id()
+                                   for index in range(operation.get_num_operands())))
             pending.extend(operation.get_operand(index) for index in range(operation.get_num_operands()))
-        return source, frozenset(found)
+        return source, frozenset(found), tuple(sorted(chain.values(), key=lambda step: step.position))
+
+    def carried_values(self, loop) -> tuple[Carried, ...]:
+        """Returns the values one loop hands from each trip to the next.
+
+        Args:
+            loop: The scf.for operation to read.
+
+        Returns:
+            One record per carried value, in the order the loop declares them.
+        """
+        body = self._body_of_loop.get(id(loop))
+        yielded = self._yield_of_loop.get(id(loop))
+        if body is None or yielded is None:
+            return ()
+
+        found: list[Carried] = []
+        for index in range(1, body.get_num_arguments()):
+            argument = body.get_argument(index)
+            try:
+                shape = tuple(argument.get_shape())
+            except (RuntimeError, ValueError, TypeError):
+                shape = ()
+            found.append(Carried(position=index - 1, entering=loop.get_operand(2 + index).id(),
+                                 inside=argument.id(), leaving=yielded.get_operand(index - 1).id(),
+                                 shape=shape))
+        return tuple(found)
+
+    def reduce_kind(self, operation) -> str | None:
+        """Returns the operation one reduce folds its axis under, read from the region it carries.
+
+        Every reduce prints as the same operation whatever it computes, so the combiner in its region is what
+        tells a row maximum from a row sum.
+
+        Args:
+            operation: The tt.reduce operation to read.
+
+        Returns:
+            The combining operation's name, or None where the region does not resolve to one.
+        """
+        if not operation.get_num_regions():
+            return None
+        block = self._blocks.get(operation.get_region(0).id())
+        if block is None:
+            return None
+        terminator = next((found for found in self.by_name("tt.reduce.return")
+                           if found.get_block() is not None and found.get_block().id() == block.id()), None)
+        if terminator is None:
+            return None
+        combiner = self._definitions.get(terminator.get_operand(0).id())
+        return None if combiner is None else combiner.get_name()
 
     def accesses_of(self, *, dot, store) -> dict[str, Access]:
         """Reads how each operand of one matmul is addressed.
@@ -693,37 +761,61 @@ def read_program(kernel: JITFunction, *, signature: dict[str, str],
         pointers = {role: (None if operation is None else operation.get_operand(0))
                     for role, (operation, _) in (("activation", graph._load_behind(dot.get_operand(0))),
                                                  ("weight", graph._load_behind(dot.get_operand(1))))}
-        source, prologue = graph.trace(dot.get_operand(0), among=dots)
+        source, prologue, prologue_chain = graph.trace(dot.get_operand(0), among=dots)
         at = _reduction_position(index=index, graph=graph, loops=loops, steps=steps, pointers=pointers,
                                  rows=rows, columns=columns, source=source)
         consumer = consumers[index] if index < len(consumers) else None
-        epilogue = frozenset() if consumer is None else graph.trace(
-            consumer.get_operand(1 if consumer.get_name() == "tt.store" else 0), among=dots)[1]
+        epilogue, epilogue_chain = (frozenset(), ()) if consumer is None else graph.trace(
+            consumer.get_operand(1 if consumer.get_name() == "tt.store" else 0), among=dots)[1:]
 
         def walked(among) -> tuple[TileLoop, ...]:
             """Reads each of the given loops as a tile loop, dropping any whose bounds are runtime values."""
             read = (graph.tile_loop(other, axis=graph.axis_of_loop(other, pointers=pointers)) for other in among)
             return tuple(loop for loop in read if loop is not None)
 
+        # A dot contracting its whole depth in one operation has no reduction loop, so the contraction is the
+        # extent its operands meet at and every enclosing loop walks an output axis.
+        contraction = dot.get_operand(0).get_shape()[1]
         matmuls.append(MatMul(
-            rows=rows, columns=columns, depth=steps[at],
+            rows=rows, columns=columns, depth=steps[at] if at is not None else contraction,
             accumulator=accumulators[index] if index < len(accumulators) else _ASSUMED_ACCUMULATOR_ELEMENT,
             epilogue=epilogue,
             prologue=prologue,
             left_source=dots.index(source) if source is not None else None,
-            reduction=graph.constant(loops[at].get_operand(1)),
-            tile_loops=walked([*loops[:at], *loops[at + 1:]]),
-            nest=tuple(_REDUCTION_AXIS if position == at else graph.axis_of_loop(loop, pointers=pointers)
-                       for position, loop in enumerate(loops)
-                       if position == at or graph.axis_of_loop(loop, pointers=pointers) is not None),
+            reduction=graph.constant(loops[at].get_operand(1)) if at is not None else contraction,
+            tile_loops=walked(loops if at is None else [*loops[:at], *loops[at + 1:]]),
+            nest=_nest_of(graph=graph, loops=loops, at=at, pointers=pointers),
             accesses=graph.accesses_of(dot=dot, store=stores[index] if index < len(stores) else None),
             # A store the reduction encloses sits deeper than the reduction itself, which is the
             # accumulator the kernel keeps in memory rather than in registers.
-            stores_inside_reduction=(index < len(stores)
+            stores_inside_reduction=(at is not None and index < len(stores)
                                      and len(graph.enclosing_loops(stores[index])) > at),
             grid_axes=_grid_axes(graph=graph, pointers=pointers),
+            carried=graph.carried_values(loops[at]) if at is not None else (),
+            epilogue_chain=epilogue_chain, prologue_chain=prologue_chain,
         ))
     return tuple(matmuls)
+
+
+def _nest_of(*, graph: _Graph, loops: list, at: int | None, pointers: dict[str, object]) -> tuple[str, ...]:
+    """Returns the axis each enclosing loop walks, outermost first, with the contraction among them.
+
+    A dot whose contraction is unlooped runs it inside every loop it sits in, so the reduction names the
+    innermost position rather than one of them.
+
+    Args:
+        graph: The module being read.
+        loops: The loops enclosing the matmul, outermost first.
+        at: Position of the reduction loop, or None where the contraction is unlooped.
+        pointers: The activation's and the weight's pointer values, keyed by role.
+
+    Returns:
+        The axes, holding the reduction axis once.
+    """
+    walked = tuple(_REDUCTION_AXIS if position == at else graph.axis_of_loop(loop, pointers=pointers)
+                   for position, loop in enumerate(loops)
+                   if position == at or graph.axis_of_loop(loop, pointers=pointers) is not None)
+    return walked if at is not None else (*walked, _REDUCTION_AXIS)
 
 
 def _grid_axes(*, graph: _Graph, pointers: dict[str, object]) -> frozenset[str]:
@@ -748,7 +840,7 @@ def _grid_axes(*, graph: _Graph, pointers: dict[str, object]) -> frozenset[str]:
 
 
 def _reduction_position(*, index: int, graph: _Graph, loops: list, steps: list[int],
-                        pointers: dict[str, object], rows: int, columns: int, source=None) -> int:
+                        pointers: dict[str, object], rows: int, columns: int, source=None) -> int | None:
     """Returns the position of the loop walking one matmul's contraction.
 
     Notes:
@@ -769,11 +861,11 @@ def _reduction_position(*, index: int, graph: _Graph, loops: list, steps: list[i
         source: The matmul producing this one's left operand, or None when it comes from memory.
 
     Returns:
-        The position of the reduction loop.
+        The position of the reduction loop, or None where the contraction runs in one dot and no loop walks it.
 
     Raises:
-        ProgramError: If every loop walks an output axis, if two of them walk neither, or if a matmul reading
-            another's product shares no loop with it.
+        ProgramError: If two loops walk neither operand, or if a matmul reading another's product shares no loop
+            with it.
     """
     if source is not None:
         producing = graph.enclosing_loops(source)
@@ -798,12 +890,9 @@ def _reduction_position(*, index: int, graph: _Graph, loops: list, steps: list[i
         return walking[0]
 
     if not walking:
-        message = (
-            f"Unable to read matmul {index}'s reduction, whose {len(loops)} enclosing loops each address one "
-            f"operand alone and so walk an output axis. A reduction loop that runs once is folded before this "
-            f"reader sees it, so give it more than one trip, or state its depth as a runtime argument."
-        )
-        raise ProgramError(message)
+        # Every enclosing loop walks an output axis, so the dot contracts its whole depth in one operation and
+        # the reduction is its operands' own extent rather than a loop this reader can name.
+        return None
     message = (
         f"Unable to tell which of matmul {index}'s loops walks the reduction: {len(walking)} of them address "
         f"neither operand alone and step by neither the tile's {rows} rows nor its {columns} columns "

@@ -143,6 +143,121 @@ class LoopLevel:
     trips: int
 
 
+@dataclass(frozen=True, slots=True)
+class Load:
+    """Reads one tile of a VMEM region into a register region.
+
+    Attributes:
+        into: Register region the tile lands in.
+        region: VMEM region the tile is read from.
+        tile: Which tile of that region.
+    """
+
+    into: str
+    region: str
+    tile: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class Store:
+    """Writes a register region back to one tile of a VMEM region.
+
+    Attributes:
+        source: Register region written out.
+        region: VMEM region the tile belongs to.
+        tile: Which tile of that region.
+    """
+
+    source: str
+    region: str
+    tile: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class Product:
+    """Streams one stationary tile through the array, leaving the product in the result region.
+
+    Attributes:
+        pushed: Register region streamed against the stationary tile.
+        weight: Register region holding the stationary tile.
+    """
+
+    pushed: str
+    weight: str
+
+
+@dataclass(frozen=True, slots=True)
+class Combine:
+    """Applies one elementwise operation to whole register regions.
+
+    Attributes:
+        kind: The operation, being one of the vector ALU's mnemonics.
+        into: Register region the result lands in.
+        left: Register region of the left operand.
+        right: Register region of the right operand.
+    """
+
+    kind: str
+    into: str
+    left: str
+    right: str
+
+
+@dataclass(frozen=True, slots=True)
+class Transform:
+    """Applies one single operand operation to a whole register region.
+
+    Attributes:
+        kind: The operation, being a move or one of the SFU's mnemonics.
+        into: Register region the result lands in.
+        source: Register region read.
+    """
+
+    kind: str
+    into: str
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
+class RowReduce:
+    """Reduces each row of a register region across its lanes, broadcast back along them.
+
+    Attributes:
+        kind: The operation the rows fold under, being vmax or vadd.
+        source: Register region holding the tile.
+        into: Register region the broadcast result lands in.
+    """
+
+    kind: str
+    source: str
+    into: str
+
+
+@dataclass(frozen=True, slots=True)
+class Accumulate:
+    """Applies one elementwise operation to an output tile, wherever the register map placed it.
+
+    A tile the registers hold is updated in place, and one that spilled is read through the scratch tile, so a
+    step list states the update alone and the map decides what it costs.
+
+    Attributes:
+        kind: The operation applied, being vmul for a rescale and vadd for a product.
+        tile: Which output tile is updated.
+        operand: Register region of the right operand.
+        store: Determines whether a resident tile is written back to VMEM, which the drain needs.
+    """
+
+    kind: str
+    tile: int
+    operand: str
+    store: bool = False
+
+
+Step = Load | Store | Product | Combine | Transform | RowReduce | Accumulate
+"""One operation of the vocabulary an image's body is written in, aliased rather than declared with the `type`
+statement because the board's interpreter is Python 3.11."""
+
+
 @dataclass(frozen=True)
 class Staging:
     """Describes what a host stages for one emitted image and what it reads back.
@@ -744,6 +859,241 @@ def fused_ffn_stream(*, chunks: int, steps: int,
         The bundle words in placement order, and the staging a host reads them back with.
     """
     bundles, staging = fused_ffn(chunks=chunks, steps=steps, output_tiles=output_tiles)
+    return _flatten(bundles), staging
+
+
+def flash_steps(*, steps: int, tiles: int) -> tuple[Step, ...]:
+    """Returns the body one key block of an attention block runs, as the vocabulary states it.
+
+    Notes:
+        The rescale precedes the row sum because both want the registers the transpose stages through, which is
+        register pressure rather than a data dependence, so the order is stated here rather than derived.
+
+    Args:
+        steps: Tiles the contraction covers, being the head over the tile.
+        tiles: Tiles the head covers, which is what the accumulator spans.
+
+    Returns:
+        The steps, in the order they run.
+    """
+    body: list[Step] = [Load(into="partial", region="zero")]
+    for step in range(steps):
+        body += [Load(into="weight", region="key", tile=step),
+                 Load(into="pushed", region="query", tile=step),
+                 Product(pushed="pushed", weight="weight"),
+                 Combine(kind="vadd", into="partial", left="partial", right="result")]
+
+    body += [Transform(kind="vmov", into="scores", source="partial"),
+             RowReduce(kind="vmax", source="scores", into="partial"),
+             Combine(kind="vmax", into="partial", left="partial", right="row_max"),
+             Combine(kind="vsub", into="staged", left="row_max", right="partial"),
+             Transform(kind="vexp", into="staged", source="staged"),
+             Transform(kind="vmov", into="row_max", source="partial"),
+             Combine(kind="vsub", into="scores", left="scores", right="row_max"),
+             Transform(kind="vexp", into="scores", source="scores"),
+             Combine(kind="vmul", into="row_sum", left="row_sum", right="staged")]
+    body += [Accumulate(kind="vmul", tile=tile, operand="staged") for tile in range(tiles)]
+    body += [RowReduce(kind="vadd", source="scores", into="partial"),
+             Combine(kind="vadd", into="row_sum", left="row_sum", right="partial")]
+    for tile in range(tiles):
+        body += [Load(into="partial", region="value", tile=tile),
+                 Product(pushed="scores", weight="partial"),
+                 Accumulate(kind="vadd", tile=tile, operand="result")]
+    return tuple(body)
+
+def emit_steps(put: Callable[..., None], builder: asm_module.AsmBuilder, slot: int, *, body: tuple[Step, ...],
+               registers: FlashRegisterMap, rows: dict[str, int], turnaround: int) -> int:
+    """Places every step of one body, resolving its regions through the register map.
+
+    Args:
+        put: Merges slot words into the bundle at one offset.
+        builder: Encodes each slot word.
+        slot: The bundle index the body starts at.
+        body: The steps to place, in the order they run.
+        registers: Where the block's tiles live.
+        rows: First VMEM row of each staged region, keyed by what it stages.
+        turnaround: Bundles an access waits after the one whose VMEM rows it reads.
+
+    Returns:
+        The next free bundle index.
+
+    Raises:
+        ValueError: If a step names an operation the vocabulary does not carry.
+    """
+    def region(name: str) -> int:
+        """Returns the first VREG of a named register region."""
+        return getattr(registers, name)
+
+    for step in body:
+        if isinstance(step, Load):
+            for vreg in range(_TILE_VREGS):
+                put(offset=slot, x=builder.vld(region(step.into) + vreg,
+                                               _tile_row(rows[step.region], step.tile, vreg)))
+                slot += 1
+        elif isinstance(step, Store):
+            for vreg in range(_TILE_VREGS):
+                put(offset=slot, x=builder.vst(region(step.source) + vreg,
+                                               _tile_row(rows[step.region], step.tile, vreg)))
+                slot += 1
+        elif isinstance(step, Product):
+            slot = _emit_flash_product(put, builder, slot, weight=region(step.weight),
+                                       pushed=region(step.pushed), result=registers.result)
+        elif isinstance(step, Combine):
+            for vreg in range(_TILE_VREGS):
+                put(offset=slot, e=getattr(builder, step.kind)(region(step.into) + vreg,
+                                                               region(step.left) + vreg,
+                                                               region(step.right) + vreg))
+                slot += 1
+        elif isinstance(step, Transform):
+            for vreg in range(_TILE_VREGS):
+                put(offset=slot, e=getattr(builder, step.kind)(region(step.into) + vreg,
+                                                               region(step.source) + vreg))
+                slot += 1
+        elif isinstance(step, RowReduce):
+            slot = _emit_row_reduce(put, builder, slot, source=_tile_registers(region(step.source)),
+                                    transposed=_tile_registers(registers.staged),
+                                    work=(registers.running, registers.running + 1),
+                                    combine=getattr(builder, step.kind),
+                                    destination=_tile_registers(region(step.into)),
+                                    scratch_row=rows["scratch"], turnaround=turnaround)
+        elif isinstance(step, Accumulate):
+            slot = _emit_tile_update(put, builder, slot, tile=step.tile,
+                                     registers=registers, operation=getattr(builder, step.kind),
+                                     operand=region(step.operand), row=rows["output"],
+                                     turnaround=turnaround, store=step.store)
+        else:
+            message = f"Unable to place {step}, which is not a step the vocabulary carries."
+            raise ValueError(message)
+    return slot
+
+def flash_attention(*, key_blocks: int, queries: int = _TILE, head: int = _VREG_ELEMENTS,
+                    turnaround: int = _VMEM_TURNAROUND) -> tuple[dict[int, dict[str, int]], Staging]:
+    """Returns one attention block's bundles and what a host stages for them, the scores never reaching DMEM.
+
+    Notes:
+        The rescale precedes the row sum because both want the registers the transpose stages through.
+
+    Args:
+        key_blocks: Blocks the loop walks, `_TILE` keys each.
+        queries: Queries one block covers, a whole number of tiles.
+        head: Width of the head, a whole number of tiles.
+        turnaround: Bundles an access waits after the one whose VMEM rows it reads.
+
+    Returns:
+        The image's bundles, keyed by offset, and the staging a host reads them back with.
+
+    Raises:
+        ValueError: If the loop runs no blocks, if a block's operands overrun a descriptor, or if the queries
+            cover more than one token group.
+    """
+    if key_blocks < 1:
+        message = f"Unable to attend over {key_blocks} key blocks. At least one is needed."
+        raise ValueError(message)
+    if 2 * head > _MAX_DESCRIPTOR_ROWS:
+        message = (
+            f"Unable to stage a head of {head} in one descriptor. A block reads its keys and values together, "
+            f"which is {2 * head} rows against the {_MAX_DESCRIPTOR_ROWS} one descriptor moves."
+        )
+        raise ValueError(message)
+
+    registers = flash_register_map(queries=queries, head=head)
+    if registers.token_groups != 1:
+        message = (
+            f"Unable to attend over {queries} queries, which is {registers.token_groups} token groups. The row "
+            f"reduction transposes one tile at a time, so a block covers {_TILE} queries."
+        )
+        raise ValueError(message)
+
+    rows = _flash_vmem_map(head=head)
+    steps, tiles = head // _TILE, registers.output_tiles
+    staged, maximum = _tile_registers(registers.staged), _tile_registers(registers.row_max)
+    total = _tile_registers(registers.row_sum)
+    builder = asm_module.AsmBuilder()
+    bundles: dict[int, dict[str, int]] = {}
+
+    def put(*, offset: int, **slots: int) -> None:
+        """Merges slot words into one bundle, so co-issue reads at the call site."""
+        _merge(bundles=bundles, offset=offset, slots=slots)
+
+    slot = 0
+    put(offset=slot, s=builder.smovi(rd=_STRIDE_REGISTER, value=_ROW_BYTES))
+    slot += 1
+    for register, argument in ((_FLASH_QUERY_POINTER, 0), (_FLASH_OPERAND_POINTER, 1),
+                               (_FLASH_OUTPUT_POINTER, 2)):
+        put(offset=slot, s=builder.smov_arg(rd=register, arg=argument))
+        slot += 1
+    slot += 1
+    put(offset=slot, d=builder.dma_load(0, rows["query"], head + 2 * _TILE, _FLASH_QUERY_POINTER,
+                                        _STRIDE_REGISTER))
+    slot += 1
+    put(offset=slot, f=builder.flush_slot(mask=1))
+    slot += 1
+
+    # Enters the maximum below every score, so the first rescale multiplies by zero.
+    for vreg in range(_TILE_VREGS):
+        put(offset=slot, x=builder.vld(maximum[vreg], rows["initial"] + _NUM_SUBLANES * vreg))
+        slot += 1
+        put(offset=slot, x=builder.vld(total[vreg], rows["zero"] + _NUM_SUBLANES * vreg))
+        slot += 1
+        if registers.spilled:
+            put(offset=slot, x=builder.vld(registers.scratch + vreg, rows["zero"] + _NUM_SUBLANES * vreg))
+            slot += 1
+    for tile in range(tiles):
+        for vreg in range(_TILE_VREGS):
+            cleared = (builder.vld(registers.accumulator + tile * _TILE_VREGS + vreg,
+                                   rows["zero"] + _NUM_SUBLANES * vreg) if tile < registers.resident
+                       else builder.vst(registers.scratch + vreg, _tile_row(rows["output"], tile, vreg)))
+            put(offset=slot, x=cleared)
+            slot += 1
+
+    put(offset=slot, f=builder.lbegin(key_blocks))
+    slot += 1
+    put(offset=slot, d=builder.dma_load(0, rows["key"], 2 * head, _FLASH_OPERAND_POINTER, _STRIDE_REGISTER))
+    slot += 1
+    put(offset=slot, f=builder.flush_slot(mask=1))
+    slot += 1
+
+    slot = emit_steps(put, builder, slot, body=flash_steps(steps=steps, tiles=tiles), registers=registers,
+                      rows=rows, turnaround=turnaround)
+
+    put(offset=slot, s=builder.saddi(rd=_FLASH_OPERAND_POINTER, rs=_FLASH_OPERAND_POINTER,
+                                     value=2 * head * _ROW_BYTES))
+    slot += 1
+    slot += 2
+    put(offset=slot, f=builder.loop_end())
+    slot += 1
+
+    for vreg in range(_TILE_VREGS):
+        put(offset=slot, e=builder.vrecip(staged[vreg], total[vreg]))
+        slot += 1
+    slot = emit_steps(put, builder, slot, registers=registers, rows=rows, turnaround=turnaround,
+                      body=tuple(Accumulate(kind="vmul", tile=tile, operand="staged", store=True)
+                                 for tile in range(tiles)))
+    slot += turnaround
+    put(offset=slot, d=builder.dma_store(0, rows["output"], head, _FLASH_OUTPUT_POINTER, _STRIDE_REGISTER))
+    slot += 1
+    put(offset=slot, f=builder.flush_slot(mask=1))
+    slot += 1
+    put(offset=slot, f=builder.halt())
+
+    staging = Staging(rows=queries, columns=head, output_tiles=tiles, blocks=1, partials=1,
+                      drain_rows=head, zero_tile_words=0)
+    return bundles, staging
+
+def flash_attention_stream(*, key_blocks: int, queries: int = _TILE, head: int = _VREG_ELEMENTS,
+                           turnaround: int = _VMEM_TURNAROUND) -> tuple[tuple[int, ...], Staging]:
+    """Returns one attention block as the contiguous bundle words it places.
+
+    Args:
+        key_blocks: Blocks the loop walks, `_TILE` keys each.
+        queries: Queries one block covers.
+        head: Width of the head.
+        turnaround: Bundles an access waits after the one whose VMEM rows it reads.
+
+    Returns:
+        The bundle words in placement order, and the staging a host reads them back with.
+    """
+    bundles, staging = flash_attention(key_blocks=key_blocks, queries=queries, head=head, turnaround=turnaround)
     return _flatten(bundles), staging
 
 
@@ -1506,22 +1856,15 @@ def _emit_transpose(put: Callable[..., None], builder: asm_module.AsmBuilder, sl
     return slot
 
 
-def _emit_tile_update(put: Callable[..., None], builder: asm_module.AsmBuilder, slot: int,
-                      group: int, *, close_loop: bool, tile: int,
+def _emit_tile_update(put: Callable[..., None], builder: asm_module.AsmBuilder, slot: int, *, tile: int,
                       registers: FlashRegisterMap, operation: Callable[[int, int, int], int], operand: int,
                       row: int, turnaround: int, store: bool = False) -> int:
     """Applies one elementwise operation to an output tile, reading a spilled tile through the scratch tile.
-
-    Notes:
-        Absorbs the group and the closing flag `_emit_pipelined_matrix` hands its fold, an attention block
-        walking one token group and closing its loop elsewhere.
 
     Args:
         put: Merges slot words into the bundle at one offset.
         builder: Encodes each slot word.
         slot: The bundle index the update starts at.
-        group: Token group the fold drained.
-        close_loop: Whether the fold carries a loop's closing bundle.
         tile: Which output tile is being updated.
         registers: The register map the block is placed under.
         operation: The operation applied, being vmul for a rescale and vadd for a product.
@@ -1602,203 +1945,3 @@ def _emit_flash_product(put: Callable[..., None], builder: asm_module.AsmBuilder
         put(offset=slot, m=builder.vmatpop(result + vreg))
         slot += _POP_II
     return slot
-
-
-def flash_attention(*, key_blocks: int, queries: int = _TILE, head: int = _VREG_ELEMENTS,
-                    turnaround: int = _VMEM_TURNAROUND) -> tuple[dict[int, dict[str, int]], Staging]:
-    """Returns one attention block's bundles and what a host stages for them, the scores never reaching DMEM.
-
-    Notes:
-        The rescale precedes the row sum because both want the registers the transpose stages through.
-
-    Args:
-        key_blocks: Blocks the loop walks, `_TILE` keys each.
-        queries: Queries one block covers, a whole number of tiles.
-        head: Width of the head, a whole number of tiles.
-        turnaround: Bundles an access waits after the one whose VMEM rows it reads.
-
-    Returns:
-        The image's bundles, keyed by offset, and the staging a host reads them back with.
-
-    Raises:
-        ValueError: If the loop runs no blocks, if a block's operands overrun a descriptor, or if the queries
-            cover more than one token group.
-    """
-    if key_blocks < 1:
-        message = f"Unable to attend over {key_blocks} key blocks. At least one is needed."
-        raise ValueError(message)
-    if 2 * head > _MAX_DESCRIPTOR_ROWS:
-        message = (
-            f"Unable to stage a head of {head} in one descriptor. A block reads its keys and values together, "
-            f"which is {2 * head} rows against the {_MAX_DESCRIPTOR_ROWS} one descriptor moves."
-        )
-        raise ValueError(message)
-
-    registers = flash_register_map(queries=queries, head=head)
-    if registers.token_groups != 1:
-        message = (
-            f"Unable to attend over {queries} queries, which is {registers.token_groups} token groups. The row "
-            f"reduction transposes one tile at a time, so a block covers {_TILE} queries."
-        )
-        raise ValueError(message)
-
-    rows = _flash_vmem_map(head=head)
-    steps, tiles = head // _TILE, registers.output_tiles
-    work = (registers.running, registers.running + 1)
-    scores, staged = _tile_registers(registers.scores), _tile_registers(registers.staged)
-    partial, maximum = _tile_registers(registers.partial), _tile_registers(registers.row_max)
-    total = _tile_registers(registers.row_sum)
-    builder = asm_module.AsmBuilder()
-    bundles: dict[int, dict[str, int]] = {}
-
-    def put(*, offset: int, **slots: int) -> None:
-        """Merges slot words into one bundle, so co-issue reads at the call site."""
-        _merge(bundles=bundles, offset=offset, slots=slots)
-
-    slot = 0
-    put(offset=slot, s=builder.smovi(rd=_STRIDE_REGISTER, value=_ROW_BYTES))
-    slot += 1
-    for register, argument in ((_FLASH_QUERY_POINTER, 0), (_FLASH_OPERAND_POINTER, 1),
-                               (_FLASH_OUTPUT_POINTER, 2)):
-        put(offset=slot, s=builder.smov_arg(rd=register, arg=argument))
-        slot += 1
-    slot += 1
-    put(offset=slot, d=builder.dma_load(0, rows["query"], head + 2 * _TILE, _FLASH_QUERY_POINTER,
-                                        _STRIDE_REGISTER))
-    slot += 1
-    put(offset=slot, f=builder.flush_slot(mask=1))
-    slot += 1
-
-    # Enters the maximum below every score, so the first rescale multiplies by zero.
-    for vreg in range(_TILE_VREGS):
-        put(offset=slot, x=builder.vld(maximum[vreg], rows["initial"] + _NUM_SUBLANES * vreg))
-        slot += 1
-        put(offset=slot, x=builder.vld(total[vreg], rows["zero"] + _NUM_SUBLANES * vreg))
-        slot += 1
-        if registers.spilled:
-            put(offset=slot, x=builder.vld(registers.scratch + vreg, rows["zero"] + _NUM_SUBLANES * vreg))
-            slot += 1
-    for tile in range(tiles):
-        for vreg in range(_TILE_VREGS):
-            cleared = (builder.vld(registers.accumulator + tile * _TILE_VREGS + vreg,
-                                   rows["zero"] + _NUM_SUBLANES * vreg) if tile < registers.resident
-                       else builder.vst(registers.scratch + vreg, _tile_row(rows["output"], tile, vreg)))
-            put(offset=slot, x=cleared)
-            slot += 1
-
-    put(offset=slot, f=builder.lbegin(key_blocks))
-    slot += 1
-    put(offset=slot, d=builder.dma_load(0, rows["key"], 2 * head, _FLASH_OPERAND_POINTER, _STRIDE_REGISTER))
-    slot += 1
-    put(offset=slot, f=builder.flush_slot(mask=1))
-    slot += 1
-
-    # Sums the steps' partials into the cleared tile, the head being deeper than the array is wide.
-    for vreg in range(_TILE_VREGS):
-        put(offset=slot, x=builder.vld(partial[vreg], rows["zero"] + _NUM_SUBLANES * vreg))
-        slot += 1
-    for step in range(steps):
-        for vreg in range(_TILE_VREGS):
-            put(offset=slot, x=builder.vld(registers.weight + vreg, _tile_row(rows["key"], step, vreg)))
-            slot += 1
-            put(offset=slot, x=builder.vld(registers.pushed + vreg, _tile_row(rows["query"], step, vreg)))
-            slot += 1
-        slot = _emit_flash_product(put, builder, slot, weight=registers.weight, pushed=registers.pushed,
-                                   result=registers.result)
-        for vreg in range(_TILE_VREGS):
-            put(offset=slot, e=builder.vadd(partial[vreg], partial[vreg], registers.result + vreg))
-            slot += 1
-
-    for vreg in range(_TILE_VREGS):
-        put(offset=slot, e=builder.vmov(scores[vreg], partial[vreg]))
-        slot += 1
-    slot = _emit_row_reduce(put, builder, slot, source=scores, transposed=staged, work=work,
-                            combine=builder.vmax, destination=partial, scratch_row=rows["scratch"],
-                            turnaround=turnaround)
-
-    for vreg in range(_TILE_VREGS):
-        put(offset=slot, e=builder.vmax(partial[vreg], partial[vreg], maximum[vreg]))
-        slot += 1
-    for vreg in range(_TILE_VREGS):
-        put(offset=slot, e=builder.vsub(staged[vreg], maximum[vreg], partial[vreg]))
-        slot += 1
-    for vreg in range(_TILE_VREGS):
-        put(offset=slot, e=builder.vexp(staged[vreg], staged[vreg]))
-        slot += 1
-    for vreg in range(_TILE_VREGS):
-        put(offset=slot, e=builder.vmov(maximum[vreg], partial[vreg]))
-        slot += 1
-    for vreg in range(_TILE_VREGS):
-        put(offset=slot, e=builder.vsub(scores[vreg], scores[vreg], maximum[vreg]))
-        slot += 1
-    for vreg in range(_TILE_VREGS):
-        put(offset=slot, e=builder.vexp(scores[vreg], scores[vreg]))
-        slot += 1
-
-    # Corrects ahead of the row sum, which reuses the registers the correction is held in.
-    for vreg in range(_TILE_VREGS):
-        put(offset=slot, e=builder.vmul(total[vreg], total[vreg], staged[vreg]))
-        slot += 1
-    for tile in range(tiles):
-        slot = _emit_tile_update(put, builder, slot, 0, close_loop=False, tile=tile, registers=registers,
-                                 operation=builder.vmul, operand=registers.staged, row=rows["output"],
-                                 turnaround=turnaround)
-
-    slot = _emit_row_reduce(put, builder, slot, source=scores, transposed=staged, work=work,
-                            combine=builder.vadd, destination=partial, scratch_row=rows["scratch"],
-                            turnaround=turnaround)
-    for vreg in range(_TILE_VREGS):
-        put(offset=slot, e=builder.vadd(total[vreg], total[vreg], partial[vreg]))
-        slot += 1
-
-    for tile in range(tiles):
-        for vreg in range(_TILE_VREGS):
-            put(offset=slot, x=builder.vld(registers.partial + vreg, _tile_row(rows["value"], tile, vreg)))
-            slot += 1
-        slot = _emit_flash_product(put, builder, slot, weight=registers.partial, pushed=registers.scores,
-                                   result=registers.result)
-        slot = _emit_tile_update(put, builder, slot, 0, close_loop=False, tile=tile, registers=registers,
-                                 operation=builder.vadd, operand=registers.result, row=rows["output"],
-                                 turnaround=turnaround)
-
-    put(offset=slot, s=builder.saddi(rd=_FLASH_OPERAND_POINTER, rs=_FLASH_OPERAND_POINTER,
-                                     value=2 * head * _ROW_BYTES))
-    slot += 1
-    slot += 2
-    put(offset=slot, f=builder.loop_end())
-    slot += 1
-
-    for vreg in range(_TILE_VREGS):
-        put(offset=slot, e=builder.vrecip(staged[vreg], total[vreg]))
-        slot += 1
-    for tile in range(tiles):
-        slot = _emit_tile_update(put, builder, slot, 0, close_loop=False, tile=tile, registers=registers,
-                                 operation=builder.vmul, operand=registers.staged, row=rows["output"],
-                                 turnaround=turnaround, store=True)
-    slot += turnaround
-    put(offset=slot, d=builder.dma_store(0, rows["output"], head, _FLASH_OUTPUT_POINTER, _STRIDE_REGISTER))
-    slot += 1
-    put(offset=slot, f=builder.flush_slot(mask=1))
-    slot += 1
-    put(offset=slot, f=builder.halt())
-
-    staging = Staging(rows=queries, columns=head, output_tiles=tiles, blocks=1, partials=1,
-                      drain_rows=head, zero_tile_words=0)
-    return bundles, staging
-
-
-def flash_attention_stream(*, key_blocks: int, queries: int = _TILE, head: int = _VREG_ELEMENTS,
-                           turnaround: int = _VMEM_TURNAROUND) -> tuple[tuple[int, ...], Staging]:
-    """Returns one attention block as the contiguous bundle words it places.
-
-    Args:
-        key_blocks: Blocks the loop walks, `_TILE` keys each.
-        queries: Queries one block covers.
-        head: Width of the head.
-        turnaround: Bundles an access waits after the one whose VMEM rows it reads.
-
-    Returns:
-        The bundle words in placement order, and the staging a host reads them back with.
-    """
-    bundles, staging = flash_attention(key_blocks=key_blocks, queries=queries, head=head, turnaround=turnaround)
-    return _flatten(bundles), staging

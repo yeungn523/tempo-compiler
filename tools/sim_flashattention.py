@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Provides the RTL check that one attention block computes the attention a host computes."'
+"""Provides the RTL check that one attention block computes the attention a host computes.
+
+The image is the one the compiler emits for a flash launch, so this checks the path a kernel reaches the board
+through rather than a builder standing beside it."'
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ sys.path.insert(0, str(_HERE.parent / "board_package" / "minitpu_runtime"))
 
 from bf16 import (_NUM_LANES, _TILE, _VREG_ELEMENTS, as_bf16_words,  # noqa: E402
                   attention_bf16_reference, from_bf16_words)
-from kernels import build_flash_attention  # noqa: E402
+from compiler import FlashLaunch, compile_launch  # noqa: E402
 from sim_gemm import _run_image  # noqa: E402
 
 _TOLERANCE: float = 0.02
@@ -87,7 +90,7 @@ def simulate(*, key_blocks: int = 2, head: int = _VREG_ELEMENTS, seed: int = _SE
     Raises:
         RuntimeError: If the testbench does not report the round halted.
     """
-    kernel = build_flash_attention(key_blocks, head=head)
+    image, _ = compile_launch(FlashLaunch(row_blocks=1, key_blocks=key_blocks, queries=_TILE, head=head))
     query, key, value = _operands(key_blocks=key_blocks, head=head, seed=seed)
 
     initial = np.full((_TILE, _NUM_LANES), _INITIAL_MAXIMUM, dtype=np.float32)
@@ -100,7 +103,7 @@ def simulate(*, key_blocks: int = 2, head: int = _VREG_ELEMENTS, seed: int = _SE
                                      for tile in range(head // _TILE)], axis=0)
         blocks.extend([transposed, _tiled(value[rows])])
 
-    dump = _run_image(image=kernel.image.to_bytes(pad_to=4),
+    dump = _run_image(image=image,
                       activations=as_bf16_words(staged).tobytes(),
                       weights=as_bf16_words(np.concatenate(blocks, axis=0)).tobytes(),
                       drain_bytes=head * _NUM_LANES * 2, build_dir=build_dir, max_cycles=max_cycles,

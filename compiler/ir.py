@@ -83,6 +83,48 @@ class TileLoop:
 
 
 @dataclass(frozen=True, slots=True)
+class Operation:
+    """One operation standing between a matmul and the value its consumer reads.
+
+    A set of names states which operations a chain runs and nothing else, so lowering it needs the order they run
+    in and the values each one reads.
+
+    Attributes:
+        name: The operation's name, a reduce carrying the combiner it folds under.
+        position: Where the operation sits in program order.
+        result: Identifier of the value it produces.
+        operands: Identifier of each value it reads.
+    """
+
+    name: str
+    position: int
+    result: int
+    operands: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Carried:
+    """One value a loop hands from each trip to the next.
+
+    A carried value is what the block accumulates across its whole loop, so it holds a register region for the
+    length of it while everything else dies with the trip that wrote it.
+
+    Attributes:
+        position: Which of the loop's carried values this is.
+        entering: Identifier of the value it enters the loop holding.
+        inside: Identifier the body reads it under.
+        leaving: Identifier of the value each trip hands on.
+        shape: Extent of the value, which tells a running statistic from an accumulator.
+    """
+
+    position: int
+    entering: int
+    inside: int
+    leaving: int
+    shape: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class MatMul:
     """Describes one matmul and what a launch needs from it.
 
@@ -93,6 +135,9 @@ class MatMul:
         accumulator: Element type the matmul accumulates in.
         epilogue: Operations standing between this matmul and its consumer.
         prologue: Operations standing between this matmul's left operand and the matmul itself.
+        carried: Values the reduction loop hands from each trip to the next, empty where it walks none.
+        epilogue_chain: The epilogue's operations in program order, each carrying what it reads.
+        prologue_chain: The prologue's operations in program order, each carrying what it reads.
         left_source: Index of the matmul producing the left operand, or None when it comes from memory.
         reduction: Whole reduction the loop walks, or None when its bound is a runtime argument.
         tile_loops: Every loop walking the output rather than the contraction, outermost first, holding the ones
@@ -121,6 +166,9 @@ class MatMul:
     accesses: dict[str, Access]
     stores_inside_reduction: bool
     grid_axes: frozenset[str] = frozenset()
+    carried: tuple[Carried, ...] = ()
+    epilogue_chain: tuple[Operation, ...] = ()
+    prologue_chain: tuple[Operation, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

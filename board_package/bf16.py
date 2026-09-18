@@ -116,29 +116,21 @@ _ROW_SOFTMAX_OUT: int = 1024
 _VREG_ELEMENTS: int = _NUM_LANES * _NUM_SUBLANES
 """The number of values one vector register holds."""
 
-def _max_attention_rows() -> int:
-    """Returns the rows one attention launch covers, bounded by the VMEM the scores are staged in.
+_ATTENTION_ROWS_PER_TOKEN: int = (_ROW_SOFTMAX_OUT - _ROW_SCORES) // _BLOCK_TOKENS
+"""VMEM rows the score staging affords each token of a block."""
 
-    Returns:
-        The rows, a whole number of VREG spans.
+if _ATTENTION_ROWS_PER_TOKEN < 1:
+    _STAGING_MESSAGE = (
+        f"Unable to stage {_BLOCK_TOKENS} tokens of scores in {_ROW_SOFTMAX_OUT - _ROW_SCORES} rows. Move "
+        f"`_ROW_SOFTMAX_OUT`."
+    )
+    raise ValueError(_STAGING_MESSAGE)
 
-    Raises:
-        ValueError: If the gap cannot hold one row per token of a block.
-    """
-    per_token = (_ROW_SOFTMAX_OUT - _ROW_SCORES) // _BLOCK_TOKENS
-    if per_token < 1:
-        message = (
-            f"Unable to stage {_BLOCK_TOKENS} tokens of scores in {_ROW_SOFTMAX_OUT - _ROW_SCORES} rows. Move "
-            f"`_ROW_SOFTMAX_OUT`."
-        )
-        raise ValueError(message)
-    rows_per_token = 1 << (per_token.bit_length() - 1)
-    return rows_per_token * _TILE // _VREG_ELEMENTS * _VREG_ELEMENTS
+_ATTENTION_TOKEN_ROWS: int = 1 << (_ATTENTION_ROWS_PER_TOKEN.bit_length() - 1)
+"""VMEM rows one token's scores own, rounded down to the power of two the AGU reaches by shifting."""
 
-
-MAX_ATTENTION_ROWS: int = _max_attention_rows()
+MAX_ATTENTION_ROWS: int = _ATTENTION_TOKEN_ROWS * _TILE // _VREG_ELEMENTS * _VREG_ELEMENTS
 """Rows one attention launch covers, which the score staging bounds rather than the VREG a reduction spans."""
-
 
 _MAX_DESCRIPTOR_ROWS: int = 128
 """The largest number of rows one DMA descriptor moves, which is the chunk every staged region is sized in."""
@@ -161,20 +153,32 @@ _ROW_TX_OUT: int = _ROW_TX_IN + _TILE
 _ROW_ADD_BIAS: int = _ROW_TX_OUT + _TILE
 """First VMEM row of the replicated bias, which the broadcasting add reads at stride one."""
 
+_ROW_STAT_IN: int = _ROW_ADD_BIAS + _MAX_DESCRIPTOR_ROWS
+"""First VMEM row of the score tile a row statistic reduces, one query per row."""
+
+_ROW_STAT_SCRATCH: int = _ROW_STAT_IN + _TILE
+"""First VMEM row the cross-sublane reduction shifts its partials through."""
+
+_ROW_STAT_OUT: int = _ROW_STAT_SCRATCH + _TILE * 2
+"""First VMEM row of the maxima, probabilities and sums a row statistic leaves, a tile each."""
+
+_STAT_OUT_ROWS: int = _TILE * 3
+"""Rows one row statistic drains."""
+
+_ENTERING_MAXIMUM: float = -1e4
+"""Value a running maximum entering at no finite one is staged at, which every score the table covers clears."""
+
+_ROW_FLASH_BASE: int = _ROW_STAT_OUT + _STAT_OUT_ROWS
+"""First VMEM row an attention block stages into, the regions past it sized by the head it covers."""
+
 _MODEL_WIDTH: int = 768
 """The GPT-2 model width in features."""
-
-_WIDTH_VREGS: int = _MODEL_WIDTH // _VREG_ELEMENTS
-"""The number of vector registers one model-width row spans."""
 
 _WIDTH_ROWS: int = _MODEL_WIDTH // _NUM_LANES
 """The number of VMEM rows one model-width row spans."""
 
 _LN_ROW_X: int = 0
 """The first VMEM row of the LayerNorm input."""
-
-_LN_ROW_CONST: int = _WIDTH_ROWS
-"""The first VMEM row of the LayerNorm constants, which sit directly above the input."""
 
 _LN_ROW_OUT: int = 512
 """The first VMEM row of the LayerNorm result."""
@@ -205,31 +209,6 @@ def layernorm_constants(gamma: NDArray[np.float32], beta: NDArray[np.float32], *
     inverse = np.full(_VREG_ELEMENTS, 1.0 / width, dtype=np.float32)
     epsilon = np.full(_VREG_ELEMENTS, _LN_EPSILON, dtype=np.float32)
     return as_bf16_words(values=np.concatenate([gamma, beta, zero, inverse, epsilon]))
-
-
-def _require_norm_operands(*, width: int, **operands: NDArray[np.float32]) -> None:
-    """Rejects a normalisation operand that is not exactly one row of `width` features.
-
-    Args:
-        width: Features one normalised row covers.
-        operands: The per-feature vectors to check, named for the message.
-
-    Raises:
-        ValueError: If the width is not a whole number of VREGs, or an operand disagrees with it.
-    """
-    if width <= 0 or width % _VREG_ELEMENTS:
-        message = (
-            f"Unable to normalise a row of {width} features. The reductions are per VREG, so a row is a whole "
-            f"number of {_VREG_ELEMENTS}."
-        )
-        raise ValueError(message)
-    for name, values in operands.items():
-        if values.ndim != 1 or values.size != width:
-            message = (
-                f"Unable to use {name} of shape {values.shape} at width {width}. It must be exactly one row of "
-                f"{width} features."
-            )
-            raise ValueError(message)
 
 
 def as_bf16_words(values: NDArray[np.float32]) -> NDArray[np.uint16]:
@@ -456,6 +435,81 @@ def pack_fused_ffn(activations: NDArray[np.float32], up_weight: NDArray[np.float
     return staged, np.concatenate(chunks)
 
 
+def staged_maximum(stated: float) -> float:
+    """Returns the value a running maximum enters below, bounded where the kernel states no finite one.
+
+    The exponential table covers a finite range, so a maximum entering at negative infinity leaves a difference
+    the table cannot be indexed by. Any value every score clears rescales the first block by zero just as well.
+
+    Args:
+        stated: The value the kernel enters its running maximum at.
+
+    Returns:
+        The value a host stages.
+    """
+    return stated if math.isfinite(stated) else _ENTERING_MAXIMUM
+
+
+def pack_attention(query: NDArray[np.float32], key: NDArray[np.float32], value: NDArray[np.float32], *,
+                   initial_maximum: float,
+                   constants: tuple[float, ...] = ()) -> tuple[NDArray[np.uint16], NDArray[np.uint16]]:
+    """Lays one attention block's operands out in the order its image visits them.
+
+    Args:
+        query: The block's queries, whose rows are tokens and columns the head.
+        key: Every key the block attends over, laid out as the queries are.
+        value: Every value the block attends over, laid out as the queries are.
+        initial_maximum: Value the running maximum enters below, which every score clears.
+        constants: Numbers the kernel states, a tile of each riding the queries' own descriptor.
+
+    Returns:
+        The query words of each block followed by the initial maximum, the zeros that block clears from and a
+        tile of every stated number, and the key and value words, each key block's transposed keys ahead of
+        its values.
+
+    Raises:
+        ValueError: If a dimension is not a whole number of tiles, or if the three operands disagree on the head
+            or the keys on their count.
+    """
+    queries, head = query.shape
+    if queries % _TILE or head % _TILE:
+        message = (
+            f"Unable to pack a query block of shape [{queries},{head}]. Both dimensions must be a whole number "
+            f"of the {_TILE} wide tiles the array computes."
+        )
+        raise ValueError(message)
+    if key.shape != value.shape or key.shape[1] != head:
+        message = (
+            f"Unable to pack keys of shape {key.shape} against values of shape {value.shape} and a head of "
+            f"{head}. The keys and the values cover the same positions of the same head."
+        )
+        raise ValueError(message)
+    if key.shape[0] % _TILE:
+        message = (
+            f"Unable to pack {key.shape[0]} keys. The loop walks them a tile at a time, so they are a whole "
+            f"number of {_TILE}."
+        )
+        raise ValueError(message)
+
+    # One launch stages the queries of its own block, so each block carries the two tiles it enters the loop
+    # from and a host reaches the next by advancing one block's worth of rows.
+    initial = np.full((_TILE, _NUM_LANES), initial_maximum, dtype=np.float32)
+    cleared = np.zeros((_TILE, _NUM_LANES), dtype=np.float32)
+    stated = [np.full((_TILE, _NUM_LANES), number, dtype=np.float32) for number in constants]
+    staged = np.concatenate([piece for block in range(queries // _TILE)
+                             for piece in (_by_tile(query[block * _TILE: (block + 1) * _TILE]),
+                                           initial, cleared, *stated)], axis=0)
+
+    blocks: list[NDArray[np.float32]] = []
+    for block in range(key.shape[0] // _TILE):
+        rows = slice(block * _TILE, (block + 1) * _TILE)
+        # The array wants the keys transposed, its stationary operand being the contraction by the keys.
+        blocks.append(np.concatenate([key[rows, tile * _TILE: (tile + 1) * _TILE].T
+                                      for tile in range(head // _TILE)], axis=0))
+        blocks.append(_by_tile(value[rows]))
+    return as_bf16_words(values=staged), as_bf16_words(values=np.concatenate(blocks, axis=0))
+
+
 def fused_ffn_reference(activations: NDArray[np.float32], up_weight: NDArray[np.float32],
                         down_weight: NDArray[np.float32]) -> NDArray[np.float64]:
     """Returns the layer the fused kernel computes, in float64, for a drained image to be held against.
@@ -506,30 +560,63 @@ def fused_ffn_bf16_reference(activations: NDArray[np.float32], up_weight: NDArra
     return out
 
 
-def _erf(values: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Returns the error function of each value, which the exact GELU is written in."""
-    return np.vectorize(math.erf, otypes=[np.float64])(values)
-
-
-def _reordered(rng: np.random.Generator, count: int) -> NDArray[np.intp] | None:
-    """Returns a permutation of the given positions that moves at least one of them.
-
-    An identity draw would leave the operand unchanged, so the check it feeds would read its own no-op as evidence.
+def attention_reference(query: NDArray[np.float32], key: NDArray[np.float32],
+                        value: NDArray[np.float32]) -> NDArray[np.float64]:
+    """Returns the attention the block computes, in float64, for a drained image to be held against.
 
     Args:
-        rng: The generator the permutation is drawn from.
-        count: Positions to permute.
+        query: The block's queries, whose rows are tokens and columns the head.
+        key: Every key the block attends over.
+        value: Every value the block attends over.
 
     Returns:
-        The permutation, or None when one position cannot be reordered at all.
+        The attended output, with one row per query token.
     """
-    if count < 2:
-        return None
-    identity = np.arange(count)
-    order = rng.permutation(count)
-    while np.array_equal(order, identity):
-        order = rng.permutation(count)
-    return order
+    scores = np.asarray(query, dtype=np.float64) @ np.asarray(key, dtype=np.float64).T
+    weights = np.exp(scores - scores.max(axis=1, keepdims=True))
+    return (weights / weights.sum(axis=1, keepdims=True)) @ np.asarray(value, dtype=np.float64)
+
+
+def attention_bf16_reference(query: NDArray[np.float32], key: NDArray[np.float32],
+                             value: NDArray[np.float32], *, initial_maximum: float) -> NDArray[np.float32]:
+    """Returns one attention block computed as the image computes it, rounded at every point it writes a VREG.
+
+    Args:
+        query: The block's queries, whose rows are tokens and columns the head.
+        key: Every key the block attends over.
+        value: Every value the block attends over.
+        initial_maximum: Value the running maximum enters below, which the image reads from its operands.
+
+    Returns:
+        The attended output, one BF16 container per value throughout.
+    """
+    def held(values: NDArray[np.float32]) -> NDArray[np.float32]:
+        """Returns the values as one BF16 container each, which is what a VREG holds."""
+        return from_bf16_words(words=as_bf16_words(values=np.asarray(values, dtype=np.float32)))
+
+    rows, head = query.shape
+    running_maximum = np.full((rows, 1), initial_maximum, dtype=np.float32)
+    running_sum = np.zeros((rows, 1), dtype=np.float32)
+    attended = np.zeros((rows, head), dtype=np.float32)
+
+    for block in range(0, key.shape[0], _TILE):
+        keys, values = key[block:block + _TILE], value[block:block + _TILE]
+        scores = np.zeros((rows, _TILE), dtype=np.float32)
+        for step in range(0, head, _TILE):
+            piece = held(query[:, step:step + _TILE] @ keys[:, step:step + _TILE].T)
+            scores = piece if step == 0 else held(scores + piece)
+
+        maximum = held(np.maximum(running_maximum, scores.max(axis=1, keepdims=True)))
+        alpha = held(np.exp(held(running_maximum - maximum)))
+        running_maximum = maximum
+        probabilities = held(np.exp(held(scores - maximum)))
+
+        running_sum = held(held(running_sum * alpha) + held(probabilities.sum(axis=1, keepdims=True)))
+        attended = held(attended * alpha)
+        for tile in range(0, head, _TILE):
+            piece = held(probabilities @ values[:, tile:tile + _TILE])
+            attended[:, tile:tile + _TILE] = held(attended[:, tile:tile + _TILE] + piece)
+    return held(attended * held(1.0 / running_sum))
 
 
 def assert_operands_discriminating(activations: NDArray[np.float32], weights: NDArray[np.float32]) -> None:
@@ -602,6 +689,71 @@ def build_operands(
     return left, right
 
 
+def _require_norm_operands(*, width: int, **operands: NDArray[np.float32]) -> None:
+    """Rejects a normalisation operand that is not exactly one row of `width` features.
+
+    Args:
+        width: Features one normalised row covers.
+        operands: The per-feature vectors to check, named for the message.
+
+    Raises:
+        ValueError: If the width is not a whole number of VREGs, or an operand disagrees with it.
+    """
+    if width <= 0 or width % _VREG_ELEMENTS:
+        message = (
+            f"Unable to normalise a row of {width} features. The reductions are per VREG, so a row is a whole "
+            f"number of {_VREG_ELEMENTS}."
+        )
+        raise ValueError(message)
+    for name, values in operands.items():
+        if values.ndim != 1 or values.size != width:
+            message = (
+                f"Unable to use {name} of shape {values.shape} at width {width}. It must be exactly one row of "
+                f"{width} features."
+            )
+            raise ValueError(message)
+
+
+def _by_tile(matrix: NDArray[np.float32]) -> NDArray[np.float32]:
+    """Returns one operand as the tiles an image stages, each tile a run of `_TILE` rows.
+
+    Args:
+        matrix: The operand, whose columns are a whole number of tiles.
+
+    Returns:
+        The stacked tiles.
+    """
+    width = matrix.shape[1]
+    return np.concatenate([matrix[:, tile * _TILE: (tile + 1) * _TILE]
+                           for tile in range(width // _TILE)], axis=0)
+
+
+def _erf(values: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Returns the error function of each value, which the exact GELU is written in."""
+    return np.vectorize(math.erf, otypes=[np.float64])(values)
+
+
+def _reordered(rng: np.random.Generator, count: int) -> NDArray[np.intp] | None:
+    """Returns a permutation of the given positions that moves at least one of them.
+
+    An identity draw would leave the operand unchanged, so the check it feeds would read its own no-op as evidence.
+
+    Args:
+        rng: The generator the permutation is drawn from.
+        count: Positions to permute.
+
+    Returns:
+        The permutation, or None when one position cannot be reordered at all.
+    """
+    if count < 2:
+        return None
+    identity = np.arange(count)
+    order = rng.permutation(count)
+    while np.array_equal(order, identity):
+        order = rng.permutation(count)
+    return order
+
+
 def _single_launch_operands() -> (
     tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32], NDArray[np.uint16]]
 ):
@@ -651,12 +803,17 @@ def _fp32_abs_q7(bits: NDArray[np.uint32]) -> NDArray[np.int64]:
 
     Returns:
         The magnitudes scaled by 128 and truncated, saturated to the 13-bit field the SFU carries.
+
+    Notes:
+        The field holds magnitudes below 8192/128, which is 64.0. A 24-bit mantissa reaches 8192 exactly when
+        the shift is ten or less and can never reach it when the shift is eleven or more, so the saturation sits
+        at that boundary.
     """
     exponent = ((bits >> 23) & 0xFF).astype(np.int64)
     mantissa = (bits & 0x7F_FFFF) | (1 << 23)
     right_shift = 16 - (exponent - 127)
     shifted = mantissa >> np.clip(right_shift, 0, 63)
-    return np.where((exponent == 0) | (right_shift >= 24), 0, np.where(right_shift <= 0, 0x1FFF, shifted))
+    return np.where((exponent == 0) | (right_shift >= 24), 0, np.where(right_shift <= 10, 0x1FFF, shifted))
 
 
 def _bf16_round(value: float) -> int:

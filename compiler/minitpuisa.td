@@ -432,15 +432,7 @@ def DmaSlots : Resource<"dma_slots">
     let note = "Descriptor slots a flush mask selects between. flush_slot blocks until dma_slot_done covers every bit of its mask and only a descriptor asserts that bit, so flushing a slot the kernel never issued on wedges the device until the PL is reprogrammed.";
 }
 
-/**
- * @brief Stores the order every generated artifact lists the records above in.
- *
- * @details The order is part of the contract, being the order of the published table's rows, of the conformance
- * package's localparams and of the assembler model's operation tuple. TableGen sorts its own record listing by name,
- * so the order is named here rather than left to a rename to reshuffle three artifacts. tools/gen_isa_doc.py refuses
- * a record these lists omit, because a mnemonic missing from the generated model is a hazard the scheduler cannot
- * then see.
- */
+/// @brief Stores the order every generated artifact lists the records above in.
 class EmissionOrder
 {
     /// Stores the operation groups, in publication order.

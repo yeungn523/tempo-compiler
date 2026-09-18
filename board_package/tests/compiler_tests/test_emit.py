@@ -392,5 +392,34 @@ class FusedFeedForwardEmitterTest(unittest.TestCase):
         self.assertEqual(staging.drain_rows, bf16._BLOCK_TOKENS * 4)
 
 
+
+class StepBodyTest(unittest.TestCase):
+    """Tests the checks a body of steps is placed under."""
+
+    def test_a_body_leaving_the_spent_regions_alone_is_accepted(self) -> None:
+        """Verifies that a body reading nothing a reduction folded through states a surviving order."""
+        emit.check_steps((emit.Load(into="scores", region="query"),
+                          emit.RowReduce(kind="vmax", source="scores", into="partial"),
+                          emit.Combine(kind="vadd", into="row_sum", left="row_sum", right="partial")))
+
+    def test_a_read_of_a_region_a_reduction_spent_is_refused(self) -> None:
+        """Verifies that reading the staging a reduction transposed through is refused rather than emitted."""
+        with self.assertRaises(ValueError):
+            emit.check_steps((emit.Load(into="staged", region="query"),
+                              emit.RowReduce(kind="vmax", source="scores", into="partial"),
+                              emit.Combine(kind="vmul", into="row_sum", left="row_sum", right="staged")))
+
+    def test_every_step_states_the_registers_it_uses(self) -> None:
+        """Verifies that every step the vocabulary carries reports the register regions it touches."""
+        for step in (emit.Load(into="scores", region="query"), emit.Store(source="scores", region="output"),
+                     emit.Product(pushed="scores", weight="staged"),
+                     emit.Combine(kind="vadd", into="partial", left="partial", right="result"),
+                     emit.Transform(kind="vexp", into="scores", source="scores"),
+                     emit.RowReduce(kind="vmax", source="scores", into="partial"),
+                     emit.Accumulate(kind="vmul", tile=0, operand="staged")):
+            reads, writes, spent = emit.classify_register_use(step)
+            self.assertIsInstance(reads | writes | spent, frozenset)
+
+
 if __name__ == "__main__":
     unittest.main()

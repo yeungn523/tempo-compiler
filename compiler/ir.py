@@ -83,6 +83,51 @@ class TileLoop:
 
 
 @dataclass(frozen=True, slots=True)
+class Operation:
+    """One operation standing between a matmul and the value its consumer reads.
+
+    Lowering a chain needs the order its operations run in and the values each one reads.
+
+    Attributes:
+        name: The operation's name, a reduce carrying the combiner it folds under.
+        position: Where the operation sits in program order.
+        result: Identifier of the value it produces.
+        operands: Identifier of each value it reads.
+    """
+
+    name: str
+    position: int
+    result: int
+    operands: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Carried:
+    """One value a loop hands from each trip to the next.
+
+    A carried value outlasts every trip, so it holds a dedicated register region, while a value one trip
+    computes shares the transient one.
+
+    Attributes:
+        position: Which of the loop's carried values this is.
+        entering: Identifier of the value it enters the loop holding.
+        inside: Identifier the body reads it under.
+        leaving: Identifier of the value each trip hands on.
+        result: Identifier the value carries outside the loop, which is what a later operation reads it under.
+        shape: Extent of the value, which tells a running statistic from an accumulator.
+        chain: The operations updating it each trip, in program order.
+    """
+
+    position: int
+    entering: int
+    inside: int
+    leaving: int
+    result: int
+    shape: tuple[int, ...]
+    chain: tuple[Operation, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class MatMul:
     """Describes one matmul and what a launch needs from it.
 
@@ -93,6 +138,15 @@ class MatMul:
         accumulator: Element type the matmul accumulates in.
         epilogue: Operations standing between this matmul and its consumer.
         prologue: Operations standing between this matmul's left operand and the matmul itself.
+        carried: Values the reduction loop hands from each trip to the next, empty where it walks none.
+        epilogue_chain: The epilogue's operations in program order, each carrying what it reads.
+        prologue_chain: The prologue's operations in program order, each carrying what it reads.
+        accumulator_chain: The operations producing what the matmul accumulates into, which is where a
+            rescale of the running product lands once Triton folds it onto the dot.
+        product: The dot itself, which carries the value it leaves and the values it reads. The chains around a
+            matmul terminate at it rather than naming it, so this is what joins them into one graph.
+        constants: The number each constant the kernel states carries, paired with the value it defines. A
+            constant reaches the vector unit as a staged tile, so the number is what a host writes.
         left_source: Index of the matmul producing the left operand, or None when it comes from memory.
         reduction: Whole reduction the loop walks, or None when its bound is a runtime argument.
         tile_loops: Every loop walking the output rather than the contraction, outermost first, holding the ones
@@ -121,6 +175,12 @@ class MatMul:
     accesses: dict[str, Access]
     stores_inside_reduction: bool
     grid_axes: frozenset[str] = frozenset()
+    carried: tuple[Carried, ...] = ()
+    epilogue_chain: tuple[Operation, ...] = ()
+    prologue_chain: tuple[Operation, ...] = ()
+    accumulator_chain: tuple[Operation, ...] = ()
+    product: Operation | None = None
+    constants: tuple[tuple[int, float], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,12 +331,50 @@ class FusedLaunch:
 
 
 @dataclass(frozen=True, slots=True)
+class FlashLaunch:
+    """Describes one image running an attention block's whole key loop.
+
+    The running statistics and the output accumulator hold vector registers for the key loop, so the score
+    tile never reaches memory and the whole problem costs one launch however many keys or queries it covers.
+
+    Attributes:
+        row_blocks: Query blocks the problem covers, which the image walks itself in one launch.
+        key_blocks: Blocks the key loop walks, each covering a tile of keys.
+        queries: Queries one block covers.
+        head: Width of the head the block accumulates.
+        body: The steps one trip of the key loop runs, empty where the caller states the extents alone.
+        epilogue: The steps the block runs once the key loop has ended.
+        constants: Number of every tile the kernel states, which a host stages ahead of the keys.
+        entering: Value the running maximum is staged at, being what the kernel enters its loop holding.
+    """
+
+    row_blocks: int
+    key_blocks: int
+    queries: int
+    head: int
+    body: tuple = ()
+    epilogue: tuple = ()
+    constants: tuple[float, ...] = ()
+    entering: float = 0.0
+
+    @property
+    def output_tiles(self) -> int:
+        """Returns the tiles the head covers, being its width over the tile."""
+        return self.head // _TILE
+
+    @property
+    def launches(self) -> int:
+        """Returns the launches a host issues, the image walking every query block itself."""
+        return 1
+
+
+@dataclass(frozen=True, slots=True)
 class Plan:
     """Holds the launches a kernel becomes and what the host must stage for them.
 
     Attributes:
         launches: One launch per matmul, in the order the host issues them, a fused one standing
-            for the pair it runs in one image.
+            for the pair it runs in one image and a flash one for the attention block it runs.
         drains: What each launch writes back, in the order the host issues them.
         padding: Every axis grown to reach whole launches, which the host zero fills and slices back.
         repack: Every operand the host must rewrite in memory, because the lanes read one contiguous run.
@@ -285,7 +383,7 @@ class Plan:
         issued_over_useful: Multiplies the padded shapes issue over the multiplies the problems hold.
     """
 
-    launches: tuple[Launch | FusedLaunch, ...]
+    launches: tuple[Launch | FusedLaunch | FlashLaunch, ...]
     drains: tuple[Drain, ...]
     padding: tuple[Padding, ...]
     repack: tuple[Repack, ...]

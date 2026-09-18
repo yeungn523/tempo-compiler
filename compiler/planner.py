@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import math
 
-from bf16 import _BLOCK_DEPTH, _BLOCK_TOKENS, _TILE, _ZERO_TILE_WORDS
-from layout import LayoutError, register_map
+from bf16 import _BLOCK_DEPTH, _BLOCK_TOKENS, _TILE, _ZERO_TILE_WORDS, staged_maximum
+from layout import LayoutError, flash_register_map, register_map
 
 from .ir import (_EMITTED_NEST, _REDUCTION_AXIS, Drain, FlashLaunch, FusedLaunch, Launch, MatMul, Padding,
                  Plan, ProgramError, Repack)
-from .lowering import attention_block, attention_extents, unnameable
+from .allocation import allocate
+from .dataflow import attention_trip
+from .lowering import attention_block, attention_body, attention_epilogue, attention_extents, unnameable
 
 _MINIMUM_LOOP_BLOCKS: int = 2
 """Smallest number of accumulation blocks a group carries, set by the two way unroll of the block loop."""
@@ -90,7 +92,7 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
             launch = _attention_launch(matmuls, produces=index, consumes=attention[index])
             planned_at[index] = len(launches)
             launches.append(launch)
-            shape = (1, 1, launch.output_tiles, launch.queries, _TILE)
+            shape = (launch.row_blocks, 1, launch.output_tiles, launch.queries, _TILE)
             drains.append(Drain(zero_tile_words=0, words=math.prod(shape), shape=shape))
             continue
         if index in consumed:
@@ -216,10 +218,11 @@ def _attention_launch(matmuls: tuple[MatMul, ...], *, produces: int, consumes: i
         consumes: Position of the matmul contracting the probabilities.
 
     Returns:
-        The launch.
+        The launch, carrying the steps its trip was placed into.
 
     Raises:
-        ProgramError: If the online softmax runs an operation the machine cannot name as a step.
+        ProgramError: If the online softmax runs an operation the machine cannot name as a step, or if the trip
+            admits no order the register file holds its values under.
     """
     for position, chain in ((consumes, matmuls[consumes].prologue_chain),
                             (consumes, matmuls[consumes].epilogue_chain)):
@@ -231,7 +234,17 @@ def _attention_launch(matmuls: tuple[MatMul, ...], *, produces: int, consumes: i
                 f"pass, so write those in terms of the operations it carries."
             )
             raise ProgramError(message)
-    return FlashLaunch(**attention_extents(matmuls, produces=produces, consumes=consumes))
+
+    extents = attention_extents(matmuls, produces=produces, consumes=consumes)
+    trip = attention_trip(matmuls, produces=produces, consumes=consumes)
+    registers = flash_register_map(queries=extents["queries"], head=extents["head"])
+    placement = allocate(trip, registers=registers)
+    tiles = registers.output_tiles
+    entering = trip.values[trip.carried["row_max"][0]].number
+    return FlashLaunch(**extents,
+                       body=attention_body(placement, trip=trip, steps=extents["head"] // _TILE, tiles=tiles),
+                       epilogue=attention_epilogue(trip, tiles=tiles), constants=trip.constants,
+                       entering=staged_maximum(0.0 if entering is None else entering))
 
 
 def _check_dimensions_match(*, index: int, matmul: MatMul, covered: dict[str, int],

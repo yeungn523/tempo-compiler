@@ -165,6 +165,9 @@ _ROW_STAT_OUT: int = _ROW_STAT_SCRATCH + _TILE * 2
 _STAT_OUT_ROWS: int = _TILE * 3
 """Rows one row statistic drains."""
 
+_ENTERING_MAXIMUM: float = -1e4
+"""Value a running maximum entering at no finite one is staged at, which every score the table covers clears."""
+
 _ROW_FLASH_BASE: int = _ROW_STAT_OUT + _STAT_OUT_ROWS
 """First VMEM row an attention block stages into, the regions past it sized by the head it covers."""
 
@@ -432,8 +435,24 @@ def pack_fused_ffn(activations: NDArray[np.float32], up_weight: NDArray[np.float
     return staged, np.concatenate(chunks)
 
 
+def staged_maximum(stated: float) -> float:
+    """Returns the value a running maximum enters below, bounded where the kernel states no finite one.
+
+    The exponential table covers a finite range, so a maximum entering at negative infinity leaves a difference
+    the table cannot be indexed by. Any value every score clears rescales the first block by zero just as well.
+
+    Args:
+        stated: The value the kernel enters its running maximum at.
+
+    Returns:
+        The value a host stages.
+    """
+    return stated if math.isfinite(stated) else _ENTERING_MAXIMUM
+
+
 def pack_attention(query: NDArray[np.float32], key: NDArray[np.float32], value: NDArray[np.float32], *,
-                   initial_maximum: float) -> tuple[NDArray[np.uint16], NDArray[np.uint16]]:
+                   initial_maximum: float,
+                   constants: tuple[float, ...] = ()) -> tuple[NDArray[np.uint16], NDArray[np.uint16]]:
     """Lays one attention block's operands out in the order its image visits them.
 
     Args:
@@ -441,10 +460,12 @@ def pack_attention(query: NDArray[np.float32], key: NDArray[np.float32], value: 
         key: Every key the block attends over, laid out as the queries are.
         value: Every value the block attends over, laid out as the queries are.
         initial_maximum: Value the running maximum enters below, which every score clears.
+        constants: Numbers the kernel states, a tile of each riding the queries' own descriptor.
 
     Returns:
-        The query words of each block followed by the initial maximum and the zeros that block clears from, and
-        the key and value words, each key block's transposed keys ahead of its values.
+        The query words of each block followed by the initial maximum, the zeros that block clears from and a
+        tile of every stated number, and the key and value words, each key block's transposed keys ahead of
+        its values.
 
     Raises:
         ValueError: If a dimension is not a whole number of tiles, or if the three operands disagree on the head
@@ -474,9 +495,10 @@ def pack_attention(query: NDArray[np.float32], key: NDArray[np.float32], value: 
     # from and a host reaches the next by advancing one block's worth of rows.
     initial = np.full((_TILE, _NUM_LANES), initial_maximum, dtype=np.float32)
     cleared = np.zeros((_TILE, _NUM_LANES), dtype=np.float32)
+    stated = [np.full((_TILE, _NUM_LANES), number, dtype=np.float32) for number in constants]
     staged = np.concatenate([piece for block in range(queries // _TILE)
                              for piece in (_by_tile(query[block * _TILE: (block + 1) * _TILE]),
-                                           initial, cleared)], axis=0)
+                                           initial, cleared, *stated)], axis=0)
 
     blocks: list[NDArray[np.float32]] = []
     for block in range(key.shape[0] // _TILE):
@@ -764,12 +786,18 @@ def _fp32_abs_q7(bits: NDArray[np.uint32]) -> NDArray[np.int64]:
 
     Returns:
         The magnitudes scaled by 128 and truncated, saturated to the 13-bit field the SFU carries.
+
+    Notes:
+        The field holds magnitudes below 8192/128, which is 64.0. A 24-bit mantissa reaches 8192 exactly
+        when the shift is ten or less and can never reach it when the shift is eleven or more, so that is
+        where the saturation sits. Saturating at a shift of zero instead, which is 65536.0, is what let the
+        SFU wrap every magnitude from 64.0 up modulo 64.0 and address its table as if it were small.
     """
     exponent = ((bits >> 23) & 0xFF).astype(np.int64)
     mantissa = (bits & 0x7F_FFFF) | (1 << 23)
     right_shift = 16 - (exponent - 127)
     shifted = mantissa >> np.clip(right_shift, 0, 63)
-    return np.where((exponent == 0) | (right_shift >= 24), 0, np.where(right_shift <= 0, 0x1FFF, shifted))
+    return np.where((exponent == 0) | (right_shift >= 24), 0, np.where(right_shift <= 10, 0x1FFF, shifted))
 
 
 def _bf16_round(value: float) -> int:

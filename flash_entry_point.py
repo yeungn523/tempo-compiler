@@ -25,10 +25,6 @@ from bf16 import _ELEMENT_BYTES, attention_bf16_reference, pack_attention  # noq
 from compiler import FlashLaunch, ProgramError, compile_launch, plan, read_program, signature_of  # noqa: E402
 from kernel_entry_point import _bindings, _integer_bindings, read_kernel  # noqa: E402
 
-_INITIAL_MAXIMUM: float = -1e4
-"""Value the running maximum enters below, which every score clears and whose exponential is zero."""
-
-
 def main() -> int:
     """Compiles one attention kernel and writes the image and operands a board launches it from.
 
@@ -73,7 +69,8 @@ def main() -> int:
     drain = planned.drains[0]
     bundles = len(image) // BUNDLE_BYTES
     print(f"launch  row_blocks={launch.row_blocks} key_blocks={launch.key_blocks} "
-          f"queries={launch.queries} head={launch.head}")
+          f"queries={launch.queries} head={launch.head} entering={launch.entering:g} "
+          f"constants={len(launch.constants)}")
     print(f"image   {bundles} bundles over {staging.rows}x{staging.columns}, "
           f"{100 * bundles / IRAM_DEPTH:.0f}% of IRAM, draining {drain.words} words shaped {drain.shape}")
 
@@ -109,12 +106,14 @@ def _pack(*, path: pathlib.Path, launch: FlashLaunch, drain, query: np.ndarray, 
         key: Every key the block attends over.
         value: Every value the block attends over.
     """
-    staged, streamed = pack_attention(query, key, value, initial_maximum=_INITIAL_MAXIMUM)
+    staged, streamed = pack_attention(query, key, value, initial_maximum=launch.entering,
+                                      constants=launch.constants)
     np.savez(
         path,
         queries=staged,
         operands=streamed,
-        expected=attention_bf16_reference(query, key, value, initial_maximum=_INITIAL_MAXIMUM),
+        expected=attention_bf16_reference(query, key, value, initial_maximum=launch.entering),
+        constants=np.asarray(launch.constants, dtype=np.float32),
         row_blocks=launch.row_blocks,
         key_blocks=launch.key_blocks,
         head=launch.head,

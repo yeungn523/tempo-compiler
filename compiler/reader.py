@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import struct
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -96,6 +97,8 @@ class _Graph:
         module: The module this graph indexes.
         _resolved: Memoized expression per resolved value.
         _zero_filled: Cached zero fill flag per load, read from the printed module on first use.
+        _constants: Cached value of each constant, read from the printed module on first use.
+        _zero_names: Cached printed name of each constant standing at zero.
         _definitions: Defining operation per value.
         _named: Operations grouped by name, in walk order.
         _loop_of_block: Loop owning each body block.
@@ -110,6 +113,8 @@ class _Graph:
         self.module = module
         self._resolved: dict[int, _Expression] = {}
         self._zero_filled: list[bool] | None = None
+        self._constants: dict[int, float] | None = None
+        self._zero_names: set[str] = set()
         operations: list = []
         module.walk(operations.append)
 
@@ -315,20 +320,17 @@ class _Graph:
                 continue
 
             if name not in _WIDTH_CASTS:
-                named = f"{name}.{self.reduce_kind(operation)}" if name == "tt.reduce" else name
-                found.add(named)
-                chain[id(operation)] = Operation(
-                    name=named, position=self._positions[id(operation)], result=operation.get_result(0).id(),
-                    operands=tuple(self.resolve_reshape(operation.get_operand(index))
-                                   for index in range(operation.get_num_operands())))
+                recorded = self.record(operation)
+                found.add(recorded.name)
+                chain[id(operation)] = recorded
             pending.extend(operation.get_operand(index) for index in range(operation.get_num_operands()))
         return source, frozenset(found), tuple(sorted(chain.values(), key=lambda step: step.position))
 
-    def resolve_reshape(self, value) -> int:
-        """Returns the identifier of the value one reshaped view carries, which is the view's own where it is none.
+    def resolve_view(self, value) -> int:
+        """Returns the identifier of the value one view carries, which is the view's own where it is none.
 
-        A broadcast and an expand state a value in another shape, so a consumer naming one of those names the
-        value behind it rather than a second value of its own.
+        A broadcast and an expand state a value in another shape, and a width cast states it in another width,
+        so a consumer naming one of those names the value behind it rather than a second value of its own.
 
         Args:
             value: The value to resolve.
@@ -341,10 +343,27 @@ class _Graph:
         while current.id() not in seen:
             seen.add(current.id())
             operation = self._definitions.get(current.id())
-            if operation is None or operation.get_name() not in _RESHAPES:
+            if operation is None or operation.get_name() not in _RESHAPES | _WIDTH_CASTS:
                 return current.id()
             current = operation.get_operand(0)
         return current.id()
+
+    def record(self, operation) -> Operation:
+        """Returns one operation as the record a lowering reads.
+
+        Args:
+            operation: The operation to record.
+
+        Returns:
+            The record, naming a reduce after the combiner it folds under and naming the value behind any
+            reshaped view it reads.
+        """
+        name = operation.get_name()
+        named = f"{name}.{self.reduce_kind(operation)}" if name == "tt.reduce" else name
+        return Operation(name=named, position=self._positions[id(operation)],
+                         result=operation.get_result(0).id(),
+                         operands=tuple(self.resolve_view(operation.get_operand(index))
+                                        for index in range(operation.get_num_operands())))
 
     def carried_values(self, loop, *, among: list) -> tuple[Carried, ...]:
         """Returns the values one loop hands from each trip to the next.
@@ -370,7 +389,7 @@ class _Graph:
                 shape = ()
             found.append(Carried(position=index - 1, entering=loop.get_operand(2 + index).id(),
                                  inside=argument.id(), leaving=yielded.get_operand(index - 1).id(),
-                                 shape=shape,
+                                 result=loop.get_result(index - 1).id(), shape=shape,
                                  chain=self.trace(yielded.get_operand(index - 1), among=among)[2]))
         return tuple(found)
 
@@ -473,29 +492,58 @@ class _Graph:
         """Returns True when a masked load fills its excluded elements with zero.
 
         Notes:
-            The MLIR binding returns None for a dense float constant, so every load's fill is read from the
-            module's printed form and matched by position. A load with no fill selects every element and reports
-            True, and a fill this reader cannot resolve reports False rather than being assumed zero.
+            A load with no fill selects every element and reports True, and a fill this reader cannot resolve
+            reports False rather than being assumed zero.
         """
-        if self._zero_filled is None:
-            zeros: set[str] = set()
-            flags: list[bool] = []
-            for line in self.module.str_nodebug().splitlines():
-                constant = _CONSTANT_LINE.match(line)
-                if constant is not None:
-                    text = (constant.group("dense") or constant.group("scalar") or "").strip()
-                    try:
-                        if float(text) == 0.0:
-                            zeros.add(constant.group("name"))
-                    except ValueError:
-                        pass
-                found = _LOAD_LINE.search(line)
-                if found is not None:
-                    operands = [operand.strip() for operand in found.group("operands").split(",")]
-                    flags.append(len(operands) < 3 or operands[2] in zeros)
-            self._zero_filled = flags
+        self._read_constants()
         position = self.by_name("tt.load").index(load)
         return self._zero_filled[position] if position < len(self._zero_filled) else False
+
+    def constant_values(self) -> dict[int, float]:
+        """Returns the number every constant the module states carries, keyed by the value it defines.
+
+        A dense float constant is what a kernel writes a scale or a starting statistic as, and the value it
+        carries reaches a staged tile rather than an address.
+
+        Returns:
+            The number of each constant this reader can resolve, which leaves out one printed in a form it
+            cannot read.
+        """
+        self._read_constants()
+        return dict(self._constants)
+
+    def _read_constants(self) -> None:
+        """Reads every constant and every load's fill from the printed module, once per graph.
+
+        The MLIR binding returns None for a dense float constant, so the printed form is read and matched to
+        the walk by position, which is the order both carry.
+        """
+        if self._constants is not None:
+            return
+        parsed: list[tuple[str, float | None]] = []
+        flags: list[bool] = []
+        for line in self.module.str_nodebug().splitlines():
+            constant = _CONSTANT_LINE.match(line)
+            if constant is not None:
+                stated = (constant.group("dense") or constant.group("scalar") or "").strip()
+                number = _as_number(stated)
+                parsed.append((constant.group("name"), number))
+                if number == 0.0:
+                    self._zero_names.add(constant.group("name"))
+            found = _LOAD_LINE.search(line)
+            if found is not None:
+                operands = [operand.strip() for operand in found.group("operands").split(",")]
+                flags.append(len(operands) < 3 or operands[2] in self._zero_names)
+        self._zero_filled = flags
+
+        walked = self.by_name("arith.constant")
+        self._constants = {}
+        for position, operation in enumerate(walked):
+            identifier = operation.get_result(0).id()
+            bound = self.constant(operation.get_result(0))
+            number = bound if bound is not None else (parsed[position][1] if position < len(parsed) else None)
+            if number is not None:
+                self._constants[identifier] = float(number)
 
     def resolve(self, value) -> _Expression:
         """Reads a value as a base pointer plus a per axis affine offset, memoized."""
@@ -818,8 +866,36 @@ def read_program(kernel: JITFunction, *, signature: dict[str, str],
             carried=graph.carried_values(loops[at], among=dots) if at is not None else (),
             epilogue_chain=epilogue_chain, prologue_chain=prologue_chain,
             accumulator_chain=graph.trace(dot.get_operand(2), among=dots)[2],
+            product=graph.record(dot),
+            constants=tuple(graph.constant_values().items()),
         ))
     return tuple(matmuls)
+
+
+def _as_number(stated: str) -> float | None:
+    """Returns the number one printed literal carries, or None where it is printed in another form.
+
+    Args:
+        stated: The literal as the module prints it, being a decimal or a hexadecimal bit pattern.
+
+    Returns:
+        The number, or None.
+    """
+    try:
+        return float(stated)
+    except ValueError:
+        pass
+    if not stated.startswith("0x"):
+        return None
+    widths = {8: ">f", 16: ">d"}
+    packed = {8: ">I", 16: ">Q"}
+    digits = len(stated) - 2
+    if digits not in widths:
+        return None
+    try:
+        return struct.unpack(widths[digits], struct.pack(packed[digits], int(stated, 16)))[0]
+    except (ValueError, struct.error):
+        return None
 
 
 def _nest_of(*, graph: _Graph, loops: list, at: int | None, pointers: dict[str, object]) -> tuple[str, ...]:

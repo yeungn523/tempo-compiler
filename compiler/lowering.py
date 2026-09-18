@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from emit import Combine, RowReduce, Step, Transform
+from emit import Accumulate, Combine, Load, Product, RowReduce, Step, Transform
 
+from .allocation import COMMIT, Place, Placement
+from .dataflow import CONSTANT, Trip
 from .ir import Operation, ProgramError
 
 _COMBINERS: dict[str, str] = {
@@ -29,6 +31,21 @@ _REDUCTIONS: dict[str, str] = {
 
 _RECIPROCAL: str = "arith.divf"
 """Division, which the machine runs as a reciprocal and a multiply because it carries no divider."""
+
+_PRODUCT: str = "tt.dot"
+"""Name the module prints a matrix product under, which the array runs rather than the vector unit."""
+
+_ACCUMULATOR: str = "accumulator"
+"""Region the output tiles hold, whose tiles are updated one at a time because some of them lie in VMEM."""
+
+_RECIPROCAL_REGION: str = "staged"
+"""Slot the normalizing reciprocal is taken into, every slot standing free once the key loop has ended."""
+
+_ZERO_REGION: str = "zero"
+"""Region the tile of zeros lies in, which an attention block stages to clear its accumulators from."""
+
+_CONSTANT_REGION: str = "constant"
+"""Region the tile of every other stated number lies in, one tile each in the order the trip states them."""
 
 
 def lower_operation(operation: Operation, *, into: str, sources: tuple[str, ...]) -> tuple[Step, ...]:
@@ -66,6 +83,65 @@ def lower_operation(operation: Operation, *, into: str, sources: tuple[str, ...]
         f"{', '.join(sorted(_COMBINERS | _TRANSFORMS | _REDUCTIONS))} and a division through its reciprocal, so "
         f"an operation outside those is one this machine computes in no single pass. Write it in terms of those, "
         f"or compute it in a further launch."
+    )
+    raise ProgramError(message)
+
+
+def attention_body(placement: Placement, *, trip: Trip, steps: int, tiles: int) -> tuple[Step, ...]:
+    """Returns the steps one trip of an attention block's key loop runs.
+
+    Args:
+        placement: The order and the regions the trip's operations were placed under.
+        trip: The dataflow the placement was made of.
+        steps: Tiles the score product contracts over, being the head over the tile.
+        tiles: Tiles the head covers, which is what the accumulator spans.
+
+    Returns:
+        The steps, in the order they run.
+
+    Raises:
+        ProgramError: If a placed operation is one no step runs.
+    """
+    attended = _attended(placement)
+    body: list[Step] = []
+    for place in placement.places:
+        if place.operation.name == COMMIT:
+            body.append(Transform(kind="vmov", into=place.into, source=place.sources[0]))
+        elif place.operation.name != _PRODUCT:
+            body.extend(_stage_constants(place, trip=trip))
+            body.extend(_lower_placed(place, tiles=tiles))
+        elif place is attended:
+            body.extend(_attended_product(place, tiles=tiles))
+        else:
+            body.extend(_score_product(place, steps=steps))
+    return tuple(body)
+
+
+def attention_epilogue(trip: Trip, *, tiles: int) -> tuple[Step, ...]:
+    """Returns the steps an attention block runs once its key loop has ended.
+
+    Args:
+        trip: The dataflow one trip runs, whose operations after the loop are normalized here.
+        tiles: Tiles the head covers, which is what the accumulator spans.
+
+    Returns:
+        The steps, in the order they run.
+
+    Raises:
+        ProgramError: If the block ends on anything other than dividing its accumulator by its running sum.
+    """
+    divides = len(trip.after) == 1 and trip.after[0].name == _RECIPROCAL
+    regions = [trip.values[operand].region for operand in trip.after[0].operands] if divides else []
+    if regions == [_ACCUMULATOR, "row_sum"]:
+        return (Transform(kind="vrecip", into=_RECIPROCAL_REGION, source="row_sum"),
+                *(Accumulate(kind="vmul", tile=tile, operand=_RECIPROCAL_REGION, store=True)
+                  for tile in range(tiles)))
+
+    stated = ", ".join(one.name for one in trip.after) or "nothing"
+    message = (
+        f"Unable to drain an attention block ending on {stated}. The running sum is what the accumulated "
+        f"output is normalized by, and the machine divides through a reciprocal, so a block ending on anything "
+        f"else is one this drain does not spell."
     )
     raise ProgramError(message)
 
@@ -148,3 +224,115 @@ def _require(operation: Operation, *, sources: tuple[str, ...], wanted: int) -> 
         f"where each operand the operation reads lives, so one per operand is what names them."
     )
     raise ProgramError(message)
+
+
+def _attended(placement: Placement) -> Place:
+    """Returns the product accumulating onto the output, being the one leaving a value in its region.
+
+    Args:
+        placement: The order and the regions the trip's operations were placed under.
+
+    Returns:
+        The place the product holds.
+
+    Raises:
+        ProgramError: If no product accumulates onto the output, which is a trip holding no attention block.
+    """
+    found = [place for place in placement.places
+             if place.operation.name == _PRODUCT and place.into == _ACCUMULATOR]
+    if len(found) == 1:
+        return found[0]
+    message = (
+        f"Unable to name the product attending over the values, of which {len(found)} accumulate onto the "
+        f"output. An attention block runs one product leaving the scores and one accumulating what the online "
+        f"softmax leaves onto the output, so exactly one of the pair writes the accumulator."
+    )
+    raise ProgramError(message)
+
+
+def _lower_placed(place: Place, *, tiles: int) -> tuple[Step, ...]:
+    """Returns the steps one placed operation runs, spreading a write of the output over its tiles.
+
+    Args:
+        place: The operation, the region its result lands in and the region of each value it reads.
+        tiles: Tiles the head covers, which is what the accumulator spans.
+
+    Returns:
+        The steps.
+
+    Raises:
+        ProgramError: If the operation writes the output under something other than a combining operation.
+    """
+    if place.into != _ACCUMULATOR:
+        return lower_operation(place.operation, into=place.into, sources=place.sources)
+    kind = _COMBINERS.get(place.operation.name)
+    operand = next((source for source in place.sources if source != _ACCUMULATOR), None)
+    if kind is not None and operand is not None:
+        return tuple(Accumulate(kind=kind, tile=tile, operand=operand) for tile in range(tiles))
+
+    message = (
+        f"Unable to write the output under {place.operation.name}. Some of the output lies in VMEM rather than "
+        f"in registers, so it is updated one tile at a time under an operation combining it with one other "
+        f"value, and this operation is not one of those."
+    )
+    raise ProgramError(message)
+
+
+def _score_product(place: Place, *, steps: int) -> tuple[Step, ...]:
+    """Returns the steps the product leaving the scores runs, one group per tile of the contraction.
+
+    Args:
+        place: The product, the region its result lands in and the slot each operand is staged in.
+        steps: Tiles the product contracts over, being the head over the tile.
+
+    Returns:
+        The steps.
+    """
+    pushed, weight, cleared = place.sources
+    body: list[Step] = [Load(into=cleared, region="zero")]
+    for step in range(steps):
+        body += [Load(into=weight, region="key", tile=step),
+                 Load(into=pushed, region="query", tile=step),
+                 Product(pushed=pushed, weight=weight),
+                 Combine(kind="vadd", into=place.into, left=place.into, right="result")]
+    return tuple(body)
+
+
+def _attended_product(place: Place, *, tiles: int) -> tuple[Step, ...]:
+    """Returns the steps the product attending over the values runs, one group per tile of the head.
+
+    Args:
+        place: The product, the region its result lands in and the slot each operand is staged in.
+        tiles: Tiles the head covers, which is what the accumulator spans.
+
+    Returns:
+        The steps.
+    """
+    pushed, weight, _ = place.sources
+    body: list[Step] = []
+    for tile in range(tiles):
+        body += [Load(into=weight, region="value", tile=tile),
+                 Product(pushed=pushed, weight=weight),
+                 Accumulate(kind="vadd", tile=tile, operand="result")]
+    return tuple(body)
+
+
+def _stage_constants(place: Place, *, trip: Trip) -> tuple[Step, ...]:
+    """Returns the loads placing every number one operation reads into the slot it reads it from.
+
+    Args:
+        place: The operation, the region its result lands in and the region of each value it reads.
+        trip: The dataflow the placement was made of, which states what number each value carries.
+
+    Returns:
+        The loads, empty where the operation reads no stated number.
+    """
+    staged: list[Step] = []
+    for operand, source in zip(place.operation.operands, place.sources, strict=True):
+        value = trip.values.get(operand)
+        if value is None or value.role != CONSTANT or value.number is None:
+            continue
+        region, tile = ((_ZERO_REGION, 0) if value.number == 0.0
+                        else (_CONSTANT_REGION, trip.constants.index(value.number)))
+        staged.append(Load(into=source, region=region, tile=tile))
+    return tuple(staged)

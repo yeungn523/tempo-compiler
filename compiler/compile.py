@@ -52,8 +52,18 @@ def compile_launch(launch: Launch | FusedLaunch | FlashLaunch) -> tuple[bytes, S
         ProgramError: If the compiled bundles exceed the IRAM depth limit under every placement tried.
     """
     if isinstance(launch, FlashLaunch):
+        if not launch.body or not launch.epilogue:
+            message = (
+                "Unable to compile an attention launch carrying no steps. The steps one key block runs are "
+                "placed from the kernel's own operations, so a launch stating its extents alone is one no "
+                "plan made."
+            )
+            raise ProgramError(message)
         bundles, staging = flash_attention_stream(key_blocks=launch.key_blocks, queries=launch.queries,
-                                                  head=launch.head)
+                                                  head=launch.head, body=launch.body,
+                                                  epilogue=launch.epilogue,
+                                                  constants=len(launch.constants),
+                                                  row_blocks=launch.row_blocks)
         # Pins the hand placement, whose gaps carry the VMEM and staging array dependencies the hazard model
         # cannot see, so a packed image would move a load ahead of the store it reads.
         return _assemble(name="flash_attention", bundles=bundles, placements=("",),

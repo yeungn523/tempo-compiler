@@ -113,6 +113,7 @@ class Carried:
         entering: Identifier of the value it enters the loop holding.
         inside: Identifier the body reads it under.
         leaving: Identifier of the value each trip hands on.
+        result: Identifier the value carries outside the loop, which is what a later operation reads it under.
         shape: Extent of the value, which tells a running statistic from an accumulator.
         chain: The operations updating it each trip, in program order.
     """
@@ -121,6 +122,7 @@ class Carried:
     entering: int
     inside: int
     leaving: int
+    result: int
     shape: tuple[int, ...]
     chain: tuple[Operation, ...] = ()
 
@@ -141,6 +143,10 @@ class MatMul:
         prologue_chain: The prologue's operations in program order, each carrying what it reads.
         accumulator_chain: The operations producing what the matmul accumulates into, which is where a
             rescale of the running product lands once Triton folds it onto the dot.
+        product: The dot itself, which carries the value it leaves and the values it reads. The chains around a
+            matmul terminate at it rather than naming it, so this is what joins them into one graph.
+        constants: The number each constant the kernel states carries, paired with the value it defines. A
+            constant reaches the vector unit as a staged tile, so the number is what a host writes.
         left_source: Index of the matmul producing the left operand, or None when it comes from memory.
         reduction: Whole reduction the loop walks, or None when its bound is a runtime argument.
         tile_loops: Every loop walking the output rather than the contraction, outermost first, holding the ones
@@ -173,6 +179,8 @@ class MatMul:
     epilogue_chain: tuple[Operation, ...] = ()
     prologue_chain: tuple[Operation, ...] = ()
     accumulator_chain: tuple[Operation, ...] = ()
+    product: Operation | None = None
+    constants: tuple[tuple[int, float], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,20 +334,28 @@ class FusedLaunch:
 class FlashLaunch:
     """Describes one image running an attention block's whole key loop.
 
-    The running statistics and the output accumulator hold vector registers for the loop, so the score tile
-    never reaches memory and the block costs one launch however many keys it attends over.
+    The running statistics and the output accumulator hold vector registers for the key loop, so the score
+    tile never reaches memory and the whole problem costs one launch however many keys or queries it covers.
 
     Attributes:
-        row_blocks: Query blocks the problem covers, being launches the host issues rather than a trip count.
+        row_blocks: Query blocks the problem covers, which the image walks itself in one launch.
         key_blocks: Blocks the key loop walks, each covering a tile of keys.
         queries: Queries one block covers.
         head: Width of the head the block accumulates.
+        body: The steps one trip of the key loop runs, empty where the caller states the extents alone.
+        epilogue: The steps the block runs once the key loop has ended.
+        constants: Number of every tile the kernel states, which a host stages ahead of the keys.
+        entering: Value the running maximum is staged at, being what the kernel enters its loop holding.
     """
 
     row_blocks: int
     key_blocks: int
     queries: int
     head: int
+    body: tuple = ()
+    epilogue: tuple = ()
+    constants: tuple[float, ...] = ()
+    entering: float = 0.0
 
     @property
     def output_tiles(self) -> int:
@@ -348,8 +364,8 @@ class FlashLaunch:
 
     @property
     def launches(self) -> int:
-        """Returns the launches a host issues, being one per query block."""
-        return self.row_blocks
+        """Returns the launches a host issues, the image walking every query block itself."""
+        return 1
 
 
 @dataclass(frozen=True, slots=True)

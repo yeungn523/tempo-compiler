@@ -560,6 +560,23 @@ def fused_ffn_bf16_reference(activations: NDArray[np.float32], up_weight: NDArra
     return out
 
 
+def attention_reference(query: NDArray[np.float32], key: NDArray[np.float32],
+                        value: NDArray[np.float32]) -> NDArray[np.float64]:
+    """Returns the attention the block computes, in float64, for a drained image to be held against.
+
+    Args:
+        query: The block's queries, whose rows are tokens and columns the head.
+        key: Every key the block attends over.
+        value: Every value the block attends over.
+
+    Returns:
+        The attended output, with one row per query token.
+    """
+    scores = np.asarray(query, dtype=np.float64) @ np.asarray(key, dtype=np.float64).T
+    weights = np.exp(scores - scores.max(axis=1, keepdims=True))
+    return (weights / weights.sum(axis=1, keepdims=True)) @ np.asarray(value, dtype=np.float64)
+
+
 def attention_bf16_reference(query: NDArray[np.float32], key: NDArray[np.float32],
                              value: NDArray[np.float32], *, initial_maximum: float) -> NDArray[np.float32]:
     """Returns one attention block computed as the image computes it, rounded at every point it writes a VREG.
@@ -788,10 +805,9 @@ def _fp32_abs_q7(bits: NDArray[np.uint32]) -> NDArray[np.int64]:
         The magnitudes scaled by 128 and truncated, saturated to the 13-bit field the SFU carries.
 
     Notes:
-        The field holds magnitudes below 8192/128, which is 64.0. A 24-bit mantissa reaches 8192 exactly
-        when the shift is ten or less and can never reach it when the shift is eleven or more, so that is
-        where the saturation sits. Saturating at a shift of zero instead, which is 65536.0, is what let the
-        SFU wrap every magnitude from 64.0 up modulo 64.0 and address its table as if it were small.
+        The field holds magnitudes below 8192/128, which is 64.0. A 24-bit mantissa reaches 8192 exactly when
+        the shift is ten or less and can never reach it when the shift is eleven or more, so the saturation sits
+        at that boundary.
     """
     exponent = ((bits >> 23) & 0xFF).astype(np.int64)
     mantissa = (bits & 0x7F_FFFF) | (1 << 23)

@@ -27,8 +27,8 @@ _HEAD: int = 64
 _SEED: int = 0
 """Draw the operands are generated from, fixed so two runs compile the same numbers."""
 
-_SPREAD: float = 2.0
-"""Bound the operands are drawn inside, which keeps every score under the range the SFU's table covers."""
+_SPREAD: float = 1.25
+"""Bound the operands are drawn inside, which keeps the scores of one query row within 64 of one another."""
 
 
 @triton.jit

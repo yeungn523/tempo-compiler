@@ -19,7 +19,7 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent
 
 sys.path.insert(0, str(_HERE / "minitpu_runtime"))
 
-from bf16 import _ELEMENT_BYTES, from_bf16_words, reduce_drain  # noqa: E402
+from bf16 import _NUM_LANES, _TILE, from_bf16_words, reduce_drain  # noqa: E402
 from runtime import (  # noqa: E402
     MemcpyKind,
     minitpuFree,
@@ -229,7 +229,12 @@ def _run_fused_on_device(*, image: bytes,
 
 def _run_attention_on_device(*, image: bytes,
                              operands: np.lib.npyio.NpzFile) -> tuple[NDArray[np.float32], Measurement]:
-    """Copies an attention block's operands to the device, launches the image per query block, and reads back.
+    """Copies an attention block's operands to the device, launches the image once, and reads back.
+
+    Notes:
+        One image covers every query block, the emitter wrapping the body in a hardware loop over them and each
+        block staging its own queries and draining its own rows from inside it. The host therefore stages the
+        whole packed buffer and issues one launch.
 
     Args:
         image: The kernel image the host compiler produced, already padded to the loader's boundary.
@@ -238,21 +243,17 @@ def _run_attention_on_device(*, image: bytes,
     Returns:
         The float32 attended output and what the run cost.
     """
-    queries = operands["queries"]
-    streamed = operands["operands"]
+    # The pack carries one VMEM row per array row, which the device reads as the flat word stream it was laid
+    # out as.
+    queries = np.ravel(operands["queries"])
+    streamed = np.ravel(operands["operands"])
     drain_bytes = int(operands["drain_bytes"])
     drain_words = int(operands["drain_words"])
-    shape = tuple(int(extent) for extent in operands["drain_shape"])
     blocks, head = int(operands["row_blocks"]), int(operands["head"])
-    rows = shape[3]
-    # One launch stages its own block's queries and the two tiles it enters the key loop from.
-    span = queries.size // blocks
-    attended = np.empty((blocks * rows, head), dtype=np.float32)
 
     minitpuSetDevice("minitpu")
     minitpuHostReset()
     owned: list[int] = []
-    cycles = bundles = 0
     try:
         host_image = minitpuHostAlloc(len(image))
         host_image.view[: len(image) // 4] = np.frombuffer(image, dtype="<u4")
@@ -260,46 +261,41 @@ def _run_attention_on_device(*, image: bytes,
         owned.append(device_image)
         minitpuMemcpy(device_image, host_image, len(image), MemcpyKind.HostToDevice)
 
+        host_queries = minitpuHostAlloc(queries.nbytes)
+        host_queries.view.view("<u2")[: queries.size] = queries
+        device_queries = minitpuMalloc(queries.nbytes)
+        owned.append(device_queries)
+        minitpuMemcpy(device_queries, host_queries, queries.nbytes, MemcpyKind.HostToDevice)
+
+        # The image advances the key and value pointer a block at a time itself, so the host stages the whole
+        # stream once.
         host_streamed = minitpuHostAlloc(streamed.nbytes)
         host_streamed.view.view("<u2")[: streamed.size] = streamed
         device_streamed = minitpuMalloc(streamed.nbytes)
         owned.append(device_streamed)
         minitpuMemcpy(device_streamed, host_streamed, streamed.nbytes, MemcpyKind.HostToDevice)
 
-        host_queries = minitpuHostAlloc(span * _ELEMENT_BYTES)
-        device_queries = minitpuMalloc(span * _ELEMENT_BYTES)
-        owned.append(device_queries)
-
         host_drain = minitpuHostAlloc(drain_bytes)
         device_drain = minitpuMalloc(drain_bytes)
         owned.append(device_drain)
 
         opened = time.perf_counter()
-        for block in range(blocks):
-            staged = queries[block * span : (block + 1) * span]
-            host_queries.view.view("<u2")[: staged.size] = staged
-            minitpuMemcpy(device_queries, host_queries, staged.nbytes, MemcpyKind.HostToDevice)
-            # The image reads the keys and values from their own pointer, advancing it a block at a time itself.
-            minitpuMemcpy(device_streamed, host_streamed, streamed.nbytes, MemcpyKind.HostToDevice)
-
-            minitpuLaunchKernel(device_image, len(image),
-                                args=[device_queries, device_streamed, device_drain])
-            minitpuMemcpy(host_drain, device_drain, drain_bytes, MemcpyKind.DeviceToHost)
-
-            sample = read_perf()
-            cycles += sample.cycles
-            bundles += sample.instrs
-
-            drained = from_bf16_words(words=host_drain.view.view("<u2")[:drain_words])
-            attended[block * rows : (block + 1) * rows] = reduce_drain(drained, shape=shape)
+        minitpuLaunchKernel(device_image, len(image),
+                            args=[device_queries, device_streamed, device_drain])
+        minitpuMemcpy(host_drain, device_drain, drain_bytes, MemcpyKind.DeviceToHost)
         elapsed = time.perf_counter() - opened
+        sample = read_perf()
+
+        drained = from_bf16_words(words=host_drain.view.view("<u2")[:drain_words])
+
+        # One block drains its output a tile at a time, and the blocks follow one another.
+        attended = np.concatenate([np.concatenate(block, axis=1) for block in
+                                   drained.reshape(blocks, head // _TILE, _TILE, _NUM_LANES)], axis=0)
     finally:
         for address in owned:
             minitpuFree(address)
         minitpuHostReset()
-    return attended, Measurement(launches=blocks, cycles=cycles, bundles=bundles, seconds=elapsed)
-
-
+    return attended, Measurement(launches=1, cycles=sample.cycles, bundles=sample.instrs, seconds=elapsed)
 def main() -> int:
     """Launches the compiled image and reports its error against the reference the host computed.
 
@@ -342,8 +338,6 @@ def main() -> int:
     run = _run_attention_on_device if attention else (_run_fused_on_device if fused else _run_on_device)
     product, measured = run(image=image, operands=operands)
     error = float(np.abs(product - expected).max() / np.abs(expected).max())
-    # A layer contracts twice, so the format costs more over it than the tolerance one product is allowed. The
-    # host measures that cost and ships it, leaving the bar what the image adds on top.
     cost = float(operands["format_cost"]) if "format_cost" in operands.files else 0.0
     verdict = "PASS" if error <= cost + _TOLERANCE else "FAIL"
     print(f"device   {verdict}, relative error {error * 100:.4f}%"

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compiles one attention kernel into the image and packed operands a board launches it from.
 
-An attention block reads three operands, drains no clearing tile and is issued per query block, so it is packed
+An attention block reads three operands, drains no clearing tile and walks its query blocks itself, so it is packed
 here rather than through the entry point the products share.
 """
 
@@ -21,7 +21,8 @@ sys.path.insert(0, str(_HERE / "board_package"))
 sys.path.insert(0, str(_HERE / "board_package" / "minitpu_runtime"))
 
 from asm import BUNDLE_BYTES, IRAM_DEPTH  # noqa: E402
-from bf16 import _ELEMENT_BYTES, attention_bf16_reference, pack_attention  # noqa: E402
+from bf16 import (_ELEMENT_BYTES, attention_bf16_reference, attention_reference,  # noqa: E402
+                  pack_attention)
 from compiler import FlashLaunch, ProgramError, compile_launch, plan, read_program, signature_of  # noqa: E402
 from kernel_entry_point import _bindings, _integer_bindings, read_kernel  # noqa: E402
 
@@ -108,11 +109,17 @@ def _pack(*, path: pathlib.Path, launch: FlashLaunch, drain, query: np.ndarray, 
     """
     staged, streamed = pack_attention(query, key, value, initial_maximum=launch.entering,
                                       constants=launch.constants)
+    expected = attention_reference(query, key, value).astype(np.float32)
+    modelled = attention_bf16_reference(query, key, value, initial_maximum=launch.entering)
     np.savez(
         path,
         queries=staged,
         operands=streamed,
-        expected=attention_bf16_reference(query, key, value, initial_maximum=launch.entering),
+        expected=expected,
+        # The bar a launch is held to. BF16 over two contractions and the online softmax between them costs
+        # more than the tolerance a single product is allowed, and the board is too slow a core to derive that
+        # cost there.
+        format_cost=float(np.abs(modelled - expected).max() / max(float(np.abs(expected).max()), 1e-9)),
         constants=np.asarray(launch.constants, dtype=np.float32),
         row_blocks=launch.row_blocks,
         key_blocks=launch.key_blocks,

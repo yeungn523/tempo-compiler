@@ -77,11 +77,6 @@ class OperandDiscriminationTest(unittest.TestCase):
         activations, weights = _varying_operands(depth=2 * _BLOCK_DEPTH)
         assert_operands_discriminating(activations=activations, weights=weights)
 
-    def test_a_whole_number_of_blocks_is_assumed(self) -> None:
-        """Verifies that the test depth divides evenly into contraction blocks."""
-        self.assertEqual(_DEPTH % _BLOCK_DEPTH, 0)
-
-
 def _varying_operands(depth: int = _DEPTH) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
     """Returns an activation and weight pair that varies along every axis the guard inspects.
 

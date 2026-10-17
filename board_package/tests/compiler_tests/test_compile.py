@@ -21,6 +21,7 @@ sys.path.insert(0, str(_HERE / "board_package" / "minitpu_runtime"))
 import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
+import build_gpt2_images  # noqa: E402
 import kernels  # noqa: E402
 import sample_triton  # noqa: E402
 from bf16 import _BLOCK_DEPTH, _BLOCK_TOKENS, _TILE  # noqa: E402
@@ -369,7 +370,6 @@ class PlannerTest(unittest.TestCase):
         self.assertEqual(launch.groups, 3)
         self.assertEqual(launch.loop_blocks, 2)
         self.assertFalse(launch.activate)
-        self.assertTrue(launch.fuse_groups)
         self.assertEqual(planned.issued_over_useful, 1.0)
         self.assertEqual(planned.padding, ())
         self.assertEqual(planned.repack, ())
@@ -395,7 +395,6 @@ class PlannerTest(unittest.TestCase):
         matmuls, planned = compile_ffn()
         self.assertEqual(matmuls[1].left_source, 0)
         self.assertEqual([launch.activate for launch in planned.launches], [False, True])
-        self.assertTrue(all(launch.fuse_groups for launch in planned.launches))
 
     def test_the_feed_forward_launches_meet_at_the_hidden_width(self) -> None:
         """Asserts the up projection's columns and the down projection's reduction cover the same width."""
@@ -472,17 +471,6 @@ class PlannerTest(unittest.TestCase):
 class PipelineTest(unittest.TestCase):
     """Covers the whole path, holding the image a plan emits to the one the hand-written builder assembles."""
 
-    def test_the_planned_image_matches_the_hand_written_builder(self) -> None:
-        """Asserts a compiled kernel emits the bundle stream `build_looped_gemm` assembles for the same launch."""
-        _, planned = compile_one(gemm)
-        launch = planned.launches[0]
-        hand = kernels.build_looped_gemm(launch.column_tiles, launch.groups, activate=launch.activate,
-                                         fuse_groups=launch.fuse_groups,
-                                         loop_blocks=launch.loop_blocks).image.assemble(pad_to=4)
-        emitted, _ = compile_launch(launch)
-        derived = tuple(int.from_bytes(emitted[at:at + 16], "little") for at in range(0, len(emitted), 16))
-        self.assertIsNotNone(renaming_onto(derived, hand))
-
     def test_every_field_the_image_carries_reaches_it(self) -> None:
         """Asserts each launch field describing the image changes it, so none is dropped before the emitter.
 
@@ -494,7 +482,7 @@ class PipelineTest(unittest.TestCase):
         base = dataclasses.replace(compile_one(gemm)[1].launches[0], column_tiles=4)
         reference, _ = compile_launch(base)
         for field, value in (("column_tiles", 8), ("groups", 6), ("loop_blocks", 4),
-                             ("fuse_groups", False), ("block_m", 16), ("block_n", 32)):
+                             ("block_m", 16), ("block_n", 32)):
             with self.subTest(field=field):
                 altered, _ = compile_launch(dataclasses.replace(base, **{field: value}))
                 self.assertNotEqual(altered, reference)
@@ -536,12 +524,22 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual((launch.blocks, launch.partials, launch.output_tiles, launch.block_m, _TILE),
                          (staging.blocks, staging.partials, staging.output_tiles, staging.rows, _TILE))
 
-    def test_a_launch_that_activates_is_refused(self) -> None:
-        """Asserts a launch carrying an epilogue raises, since the emitter places the plain product only."""
+    def test_every_gpt2_image_matches_the_hand_written_builder(self) -> None:
+        """Asserts each GEMM a GPT-2 layer launches compiles to the stream `build_looped_gemm` assembles for it."""
+        for depth, columns, activate in build_gpt2_images._SHAPES:
+            with self.subTest(depth=depth, columns=columns, activate=activate):
+                image, entry = build_gpt2_images._compile_gemm(depth=depth, columns=columns, activate=activate)
+                hand = kernels.build_looped_gemm(entry["column_tiles"], entry["groups"], activate=activate,
+                                                 loop_blocks=entry["loop_blocks"]).image.assemble(pad_to=4)
+                derived = tuple(int.from_bytes(image[at:at + 16], "little") for at in range(0, len(image), 16))
+                self.assertIsNotNone(renaming_onto(derived, hand))
+                self.assertEqual(entry["column_tiles"], columns // _TILE)
 
-        base = compile_one(gemm)[1].launches[0]
-        with self.assertRaises(NotImplementedError):
-            compile_launch(dataclasses.replace(base, activate=True))
+    def test_an_activated_wide_block_is_refused(self) -> None:
+        """Asserts an activating launch over more than one output tile raises, its staged tiles being rewritten."""
+        base = dataclasses.replace(compile_one(gemm_activated)[1].launches[0], column_tiles=4)
+        with self.assertRaises(ValueError):
+            compile_launch(dataclasses.replace(base, block_n=2 * _TILE))
 
     def test_a_wide_block_reaches_the_emitter(self) -> None:
         """Asserts the block a kernel names changes the image, rather than being dropped on the way to the emitter.
@@ -556,8 +554,8 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(launch.block_n, 32)
         # Serialised the same way the tool does, so padding cannot make the two differ on its own.
         narrow = asm.AsmKernel(name="looped_gemm", bundles=emit.looped_gemm_stream(
-            column_tiles=launch.column_tiles, groups=launch.groups, loop_blocks=launch.loop_blocks,
-            fuse_groups=launch.fuse_groups)[0]).to_bytes(pad_to=4)
+            column_tiles=launch.column_tiles, groups=launch.groups,
+            loop_blocks=launch.loop_blocks)[0]).to_bytes(pad_to=4)
         self.assertNotEqual(compile_launch(launch)[0], narrow)
 
     def test_a_wide_block_keeps_an_accumulator_set_per_tile(self) -> None:
@@ -568,8 +566,7 @@ class PipelineTest(unittest.TestCase):
 
         launch = compile_one(gemm_wide_columns, dims=({"m": 32},))[1].launches[0]
         words, _ = emit.looped_gemm_stream(column_tiles=launch.column_tiles, groups=launch.groups,
-                                           loop_blocks=launch.loop_blocks, fuse_groups=launch.fuse_groups,
-                                           block_n=launch.block_n)
+                                           loop_blocks=launch.loop_blocks, block_n=launch.block_n)
         touched: set[int] = set()
         for word in words:
             decoded = asm._decode(word)

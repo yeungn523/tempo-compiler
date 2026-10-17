@@ -858,10 +858,6 @@ def read_program(kernel: JITFunction, *, signature: dict[str, str],
             tile_loops=walked(loops if at is None else [*loops[:at], *loops[at + 1:]]),
             nest=_nest_of(graph=graph, loops=loops, at=at, pointers=pointers),
             accesses=graph.accesses_of(dot=dot, store=stores[index] if index < len(stores) else None),
-            # A store the reduction encloses sits deeper than the reduction itself, which is the
-            # accumulator the kernel keeps in memory rather than in registers.
-            stores_inside_reduction=(at is not None and index < len(stores)
-                                     and len(graph.enclosing_loops(stores[index])) > at),
             grid_axes=_grid_axes(graph=graph, pointers=pointers),
             carried=graph.carried_values(loops[at], among=dots) if at is not None else (),
             epilogue_chain=epilogue_chain, prologue_chain=prologue_chain,

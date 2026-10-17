@@ -48,6 +48,10 @@ _PUSH_AT: int = _MATLOAD_AT + MATRIX_OCCUPANCY["vmatload"] + 1
 """Offset the first activation push issues at, being the first cycle the matrix controller is free again. A
 command holds the controller for its occupancy, so the next becomes legal one cycle later."""
 
+_GELU_AT: int = RTL_PARAMS["WB_W_VLD"] + 2
+"""Offset the first activation issues at in an activating step, each one reading its tile two bundles past that
+tile's load writeback."""
+
 _PUSH_II: int = MATRIX_OCCUPANCY["vmatpush"] + 1
 """Offsets between consecutive pushes, being the interval the controller's occupancy allows."""
 
@@ -94,14 +98,14 @@ _MATLOAD_HOLD: int = MATRIX_OCCUPANCY["vmatload"] + 1
 """Offsets a weight load holds the matrix controller, which is where a step's first push becomes legal."""
 
 _TXIN_II: int = 2
-"""Bundles between consecutive vtxin, carrying build_tile_transpose's verified spacing."""
+"""Bundles between consecutive vtxin, being the spacing the board verified for a tile transpose."""
 
 _TXIN_TO_TXOUT: int = 4
 """Bundles the first vtxout waits after the last vtxin. The hazard model covers vector and scalar registers, so
 the staging array's own dependency is held by the schedule."""
 
 _TXOUT_II: int = 6
-"""Bundles between consecutive vtxout, carrying build_tile_transpose's verified spacing."""
+"""Bundles between consecutive vtxout, being the spacing the board verified for a tile transpose."""
 
 _VMEM_TURNAROUND: int = 8
 """Bundles an access waits after the one whose VMEM rows it reads, the hazard model covering registers alone."""
@@ -273,7 +277,8 @@ class Staging:
         columns: Output columns the product covers.
         output_tiles: Output tiles one block covers, being how the drain groups what it holds.
         blocks: Blocks the column loop walks, being the output tiles over the tiles one block covers.
-        partials: Partial products each column tile leaves for the host to sum.
+        partials: Partial products each column tile leaves for the host to sum, being two for a block accumulating
+            in VMEM, whose consecutive blocks fold into opposite banks.
         drain_rows: VMEM rows one drain writes, being the resident tiles the accumulators hold.
         zero_tile_words: Words of clearing tile the drain opens with, which an image leaving none reports as zero.
     """
@@ -620,20 +625,22 @@ def gemm_step(*, activation_row: int, weight_row: int, close_loop: bool,
     return bundles
 
 
-def looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups: bool = False,
-                block_m: int = _BLOCK_TOKENS, block_n: int = _TILE) -> tuple[dict[int, dict[str, int]], Staging]:
+def looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, activate: bool = False,
+                block_m: int = _BLOCK_TOKENS,
+                block_n: int = _TILE) -> tuple[dict[int, dict[str, int]], Staging]:
     """Returns the tiled GEMM's bundles and what a host stages for them, both from one derivation.
 
     Notes:
         Staging is overlapped onto compute by double buffering. A block computes out of one VMEM slot while the
-        next block's operands land in the other, and `vmemswap` exchanges them once per block.
+        next block's operands land in the other, and `vmemswap` exchanges them once per block. The accumulators
+        carry every group, so the contraction sums on the device in BF16 and drains once per column tile.
 
     Args:
         column_tiles: Output column tiles the product covers, being the outer loop's trip count.
         groups: Reduction groups each column tile accumulates, being the middle loop's trip count.
         loop_blocks: Accumulation blocks one group carries, which the two way unroll halves into a trip count.
-        fuse_groups: Determines whether the accumulators drain once per column tile, summing the contraction on
-            the device in BF16, rather than once per group for the host to sum in float32.
+        activate: Determines whether each staged activation tile passes through the GELU before it enters the
+            array.
         block_m: Token rows one block covers, being the activation tiles it stages and pushes.
         block_n: Output columns one block covers, whose tiles accumulate together and share one staging of the
             activations.
@@ -643,8 +650,9 @@ def looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups
 
     Raises:
         ValueError: If a group carries an odd number of blocks, which the two way unroll cannot halve, if the block
-            does not divide the columns the product covers, if the register file does not hold its accumulators, or
-            if the nest stages an operand anywhere but the innermost loop.
+            does not divide the columns the product covers, if the register file does not hold its accumulators,
+            if the nest stages an operand anywhere but the innermost loop, or if an activating block covers more
+            than one resident output tile.
     """
     if loop_blocks % 2:
         message = (
@@ -661,6 +669,13 @@ def looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups
         )
         raise ValueError(message)
     registers = register_map(block_m=block_m, block_n=block_n)
+    if activate and (registers.output_tiles != 1 or registers.resident != 1):
+        message = (
+            f"Unable to activate a block {block_n} columns wide. An activating step rewrites its staged tiles in "
+            f"place, so a block may cover only one resident {_TILE} wide output tile, but got "
+            f"{registers.output_tiles}."
+        )
+        raise ValueError(message)
 
     # Walks blocks rather than tiles, since a block's tiles share the activations staged for it.
     nest = (LoopLevel(axis=_COLUMN_AXIS, trips=column_tiles // tiles),
@@ -686,10 +701,7 @@ def looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups
     at += 1
     at = _emit_rewind(put=put, builder=builder, at=at, loop=nest[0], operands=staged)
 
-    # Clears the accumulators once per column tile, so they carry every group and the contraction sums on
-    # the device in BF16.
-    if fuse_groups:
-        at = _emit_clear(put=put, builder=builder, at=at, rows=rows, registers=registers)
+    at = _emit_clear(put=put, builder=builder, at=at, rows=rows, registers=registers)
 
     put(offset=at, f=builder.lbegin(nest[1].trips))
     at += 1
@@ -704,26 +716,21 @@ def looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups
         if step + 1 < _STEPS:
             put(offset=at, f=builder.flush_slot(mask=3))
             at += 1
-    if not fuse_groups:
-        at = _emit_clear(put=put, builder=builder, at=at, rows=rows, registers=registers)
 
     put(offset=at, f=builder.lbegin(nest[2].trips))
     at += 1
     for compute_slot in range(2):
         at = _emit_block(put=put, builder=builder, at=at, compute_slot=compute_slot, operands=staged,
-                         rows=rows, registers=registers)
+                         rows=rows, registers=registers, activate=activate)
     put(offset=at, f=builder.loop_end())
     at += 1
 
     # Returns both descriptor slots, which the group's trailing prefetch still owns, for the drain to use.
     put(offset=at, f=builder.flush_slot(mask=3))
     at += 1
-    if not fuse_groups:
-        at = _emit_drain(put=put, builder=builder, at=at, rows=rows, registers=registers)
     put(offset=at, f=builder.loop_end())
     at += 1
-    if fuse_groups:
-        at = _emit_drain(put=put, builder=builder, at=at, rows=rows, registers=registers)
+    at = _emit_drain(put=put, builder=builder, at=at, rows=rows, registers=registers)
     # Steps over the tiles the block covered past the first, which one iteration's own advance does not reach.
     for operand in staged:
         at = _emit_split_advance(put=put, builder=builder, at=at, register=operand.pointer,
@@ -735,12 +742,12 @@ def looped_gemm(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups
     held = registers.resident or registers.spilled
     staging = Staging(rows=block_m, columns=column_tiles * _TILE, output_tiles=tiles,
                       blocks=nest[0].trips,
-                      partials=(1 if fuse_groups else groups) * (2 if registers.spilled else 1),
+                      partials=2 if registers.spilled else 1,
                       drain_rows=held * registers.token_groups * _TILE)
     return bundles, staging
 
 
-def looped_gemm_stream(*, column_tiles: int, groups: int, loop_blocks: int, fuse_groups: bool = False,
+def looped_gemm_stream(*, column_tiles: int, groups: int, loop_blocks: int, activate: bool = False,
                        block_m: int = _BLOCK_TOKENS,
                        block_n: int = _TILE) -> tuple[tuple[int, ...], Staging]:
     """Returns the tiled GEMM as the contiguous bundle words it places, zero filling the offsets it leaves.
@@ -749,7 +756,8 @@ def looped_gemm_stream(*, column_tiles: int, groups: int, loop_blocks: int, fuse
         column_tiles: Output column tiles the product covers.
         groups: Reduction groups each column tile accumulates.
         loop_blocks: Accumulation blocks one group carries.
-        fuse_groups: Determines whether the accumulators drain once per column tile rather than once per group.
+        activate: Determines whether each staged activation tile passes through the GELU before it enters the
+            array.
         block_m: Token rows one block covers.
         block_n: Output columns one block covers.
 
@@ -757,7 +765,7 @@ def looped_gemm_stream(*, column_tiles: int, groups: int, loop_blocks: int, fuse
         The bundle words in placement order, and the staging a host reads them back with.
     """
     bundles, staging = looped_gemm(column_tiles=column_tiles, groups=groups, loop_blocks=loop_blocks,
-                                   fuse_groups=fuse_groups, block_m=block_m, block_n=block_n)
+                                   activate=activate, block_m=block_m, block_n=block_n)
     return _flatten(bundles), staging
 
 
@@ -1396,9 +1404,56 @@ def _emit_drain_spill(*, put: Callable[..., None], builder: asm_module.AsmBuilde
     return at
 
 
+def _gelu_gemm_step(*, activation_row: int, weight_row: int, close_loop: bool,
+                    registers: RegisterMap) -> dict[int, dict[str, int]]:
+    """Returns one accumulation step's bundles with every staged activation tile passed through the GELU first.
+
+    Notes:
+        Every activation precedes the first push. VREG read port A is one physical port whose static-priority mux
+        the matrix controller wins (``vpu.sv`` ``effective_raddr_a``), so a vgelu issued while a vmatpush streams
+        reads the pushed register in place of its own operand. The hazard model does not see that port, so the
+        offsets here carry the ordering themselves.
+
+    Args:
+        activation_row: First VMEM row of this step's activation pair, spanning both token groups.
+        weight_row: First VMEM row of this step's weight tile.
+        close_loop: Determines whether the step's final accumulate carries the enclosing loop's closing bundle.
+        registers: Where the block's operands live, which must hold one resident output tile.
+
+    Returns:
+        The step's bundles, keyed by offset, each holding the slot words that bundle issues.
+    """
+    builder = asm_module.AsmBuilder()
+    bundles: dict[int, dict[str, int]] = {}
+
+    def put(*, offset: int, **slots: int) -> None:
+        """Merges slot words into one bundle, so a push and a load co-issue where both fit."""
+        _merge(bundles=bundles, offset=offset, slots=slots)
+
+    staged = registers.token_groups * _TILE_VREGS
+    for index in range(staged):
+        group, vreg = divmod(index, _TILE_VREGS)
+        put(offset=index, x=builder.vld(vreg=registers.activation + index,
+                                        row=activation_row + _TILE_ROWS * group + _NUM_SUBLANES * vreg))
+    for vreg in range(_TILE_VREGS):
+        put(offset=staged + vreg,
+            x=builder.vld(vreg=registers.weight + vreg, row=weight_row + _NUM_SUBLANES * vreg))
+    for index in range(staged):
+        put(offset=_GELU_AT + index,
+            e=builder.vgelu(vd=registers.activation + index, va=registers.activation + index))
+    # Trails the weight loads, which start after the activation loads, and stays past the last vgelu's port A read.
+    matload_at = max(staged + _MATLOAD_AT, _GELU_AT + staged)
+    put(offset=matload_at, m=builder.vmatload(vreg=registers.weight))
+
+    _place_matrix_commands(put=put, builder=builder, stage_next=lambda *, group, vreg: None,
+                           close_loop=close_loop, registers=registers, tile=0,
+                           origin=matload_at + _MATLOAD_HOLD)
+    return bundles
+
+
 def _emit_block(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at: int, compute_slot: int,
                 operands: tuple[StagedOperand, ...], rows: dict[str, tuple[int, ...]],
-                registers: RegisterMap) -> int:
+                registers: RegisterMap, activate: bool = False) -> int:
     """Emits one block, which accumulates out of `compute_slot` while the next block lands in the other.
 
     Each step's leading flush collects the descriptors issued one step earlier.
@@ -1413,10 +1468,15 @@ def _emit_block(*, put: Callable[..., None], builder: asm_module.AsmBuilder, at:
             spilled = tile - registers.resident
             spill_row = None if spilled < 0 else (
                 rows["spill"][0] + _TILE_ROWS * spilled * registers.token_groups)
-            step_bundles = gemm_step(activation_row=rows["activation"][step],
-                                          weight_row=rows["weight"][step] + _TILE * tile,
-                                          close_loop=False, registers=registers, tile=tile,
-                                          spill_row=spill_row)
+            if activate:
+                step_bundles = _gelu_gemm_step(activation_row=rows["activation"][step],
+                                               weight_row=rows["weight"][step], close_loop=False,
+                                               registers=registers)
+            else:
+                step_bundles = gemm_step(activation_row=rows["activation"][step],
+                                         weight_row=rows["weight"][step] + _TILE * tile,
+                                         close_loop=False, registers=registers, tile=tile,
+                                         spill_row=spill_row)
             for offset, slots in step_bundles.items():
                 put(offset=at + offset, **slots)
             at += max(step_bundles) + 1

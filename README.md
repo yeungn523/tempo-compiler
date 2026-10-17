@@ -93,14 +93,15 @@ ___
 Every tool extends `sys.path` to reach `compiler/`, `board_package/`, and `board_package/minitpu_runtime/` on its own,
 so each one runs from the repository root with no `PYTHONPATH` export.
 
-| Entry point             | Purpose                                                                          |
-|-------------------------|----------------------------------------------------------------------------------|
-| `kernel_entry_point.py` | Reads any Triton kernel into the compiler and emits its image                    |
-| `sample_triton.py`      | Holds a GEMM kernel per loop order and a whole feed-forward layer                |
-| `tools/sim_gemm.py`     | Runs an emitted GEMM image against the RTL and reports its error                 |
-| `tools/sim_ffn.py`      | Runs the fused feed-forward image against the RTL and reports its error          |
-| `tools/gen_isa_doc.py`  | Regenerates or checks every artifact derived from the ISA source                 |
-| `tools/run_on_board.py` | Compiles one kernel or several and runs them over a single SSH session           |
+| Entry point                  | Purpose                                                                 |
+|------------------------------|-------------------------------------------------------------------------|
+| `kernel_entry_point.py`      | Reads any Triton kernel into the compiler and emits its image           |
+| `sample_triton.py`           | Holds a GEMM kernel per loop order and a whole feed-forward layer       |
+| `tools/sim_gemm.py`          | Runs an emitted GEMM image against the RTL and reports its error        |
+| `tools/sim_ffn.py`           | Runs the fused feed-forward image against the RTL and reports its error |
+| `tools/gen_isa_doc.py`       | Regenerates or checks every artifact derived from the ISA source        |
+| `tools/run_on_board.py`      | Compiles one kernel or several and runs them over a single SSH session  |
+| `tools/build_gpt2_images.py` | Compiles every GEMM image a GPT-2 small layer launches                  |
 
 ### Compiling and Checking a Kernel
 
@@ -178,12 +179,16 @@ plus a tolerance.
 ### Deploying to the Board
 
 ```sh
+python3 tools/build_gpt2_images.py
 tools/deploy_board.sh <netid> 187
 ```
 
-The first argument is your own login on the board and the second is the last octet of the board's address. Every file
-is copied and then verified by md5, because a `tar | ssh` deploy once reported success while writing zero byte files
-and every board check passed against the stale copies already there.
+The first line compiles the GEMM images the layer drivers in `gpt2_kernels.py` launch, which the board cannot do itself
+because it carries neither Triton nor the compiler. Rerun it after any change to the emitter or to `gpt2_triton.py`.
+
+The deploy's first argument is your own login on the board and the second is the last octet of the board's address.
+Every file is copied and then verified by md5, because a `tar | ssh` deploy once reported success while writing zero
+byte files and every board check passed against the stale copies already there.
 
 ***Warning!*** Program the board with `sudo make minitpu` from the deployed package rather than with a script on its
 own. The Makefile sets the PL clock first, and a board that programs the PL without that step runs the fabric at

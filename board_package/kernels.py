@@ -42,10 +42,6 @@ from bf16 import (  # noqa: E402
     _ROW_OUTPUT,
     _ROW_SCORES,
     _ROW_SOFTMAX_OUT,
-    _ROW_STAT_IN,
-    _ROW_STAT_OUT,
-    _ROW_STAT_SCRATCH,
-    _STAT_OUT_ROWS,
     _ROW_WEIGHT,
     _ROW_ZERO,
     _STEPS,
@@ -77,93 +73,13 @@ _WEIGHT_TILE: int = 24
 _SCRATCH_TILE: int = 28
 """First VREG of the tile a vmatpop lands in, which the accumulate that follows reads and the next pop reuses."""
 
-_TXIN_II: int = 2
-"""Bundles between consecutive vtxin, carrying build_tile_transpose's verified spacing."""
-
-_TXIN_TO_TXOUT: int = 4
-"""Bundles the first vtxout waits after the last vtxin. The hazard model covers vector and scalar registers, so
-the staging array's own dependency is held by the schedule."""
-
-_TXOUT_II: int = 6
-"""Bundles between consecutive vtxout, carrying build_tile_transpose's verified spacing."""
-
-_PUSH_II: int = 6
-"""Bundles between consecutive vmatpush, being the command's initiation interval."""
-
-_POP_II: int = 5
-"""Bundles between consecutive vmatpop, being the command's initiation interval."""
-
-_VMEM_TURNAROUND: int = 8
-"""Bundles an access waits after the one whose VMEM rows it reads, carrying the distance build_tile_transpose
-holds between its stores and the descriptor reading them."""
-
-_SUBLANE_FOLDS: tuple[int, ...] = tuple(_NUM_SUBLANES >> (step + 1)
-                                        for step in range(_NUM_SUBLANES.bit_length() - 1))
-"""Sublanes each step of the cross-sublane fold reads over, halving until sublane zero holds the whole row."""
-
-_SUBLANE_ZERO: int = 1
-"""Sublane mask selecting the one sublane a folded row ends in."""
-
-_STRIDE_REGISTER: int = 3
-"""Scalar register holding the host row stride every descriptor reads."""
-
-_STAT_SCORES: tuple[int, ...] = (0, 1, 2, 3)
-"""VREGs holding the score tile, register v carrying queries 4v through 4v+3."""
-
-_STAT_TRANSPOSED: tuple[int, ...] = (4, 5, 6, 7)
-"""VREGs a score tile transposes into, every lane carrying a query and every sublane a key."""
-
-_STAT_WORK: tuple[int, int] = (8, 9)
-"""VREGs the fold rewrites in place, being the running partials and the register they are read back into."""
-
-_STAT_MAXIMA: tuple[int, ...] = (14, 15, 16, 17)
-"""VREGs holding each query's row maximum along a whole row, laid out as the scores are."""
-
-_STAT_PROBABILITIES: tuple[int, ...] = (18, 19, 20, 21)
-"""VREGs holding the exponentiated scores, laid out as the scores are."""
-
-_STAT_SUMS: tuple[int, ...] = (22, 23, 24, 25)
-"""VREGs holding each query's row sum along a whole row, laid out as the scores are."""
-
-
 @minitpu.asm
 def single_halt() -> None:
     """Assembles the shortest valid program, a single halt bundle."""
     minitpu.bundle(f=minitpu.halt())
 
 
-@minitpu.asm
-def single_mul_add() -> None:
-    """Assembles a 32x32 BF16 ``C = A * B + A`` program over four DMA-streamed tiles."""
-    bundles = {}
-    pc = 0
-    tile_bytes = 16 * _ROW_BYTES
-    for tile in range(4):
-        bundles[pc] = {"s": minitpu.smov_arg(0, 0) if tile == 0 else minitpu.saddi(0, 0, tile_bytes)}; pc += 1
-        # Carries the DMA row stride, which is one lane stripe. Naming it as a literal instead walks DRAM at whatever
-        # that literal says, so a descriptor reads every other row and the result is plausible.
-        bundles[pc] = {"s": minitpu.smovi(1, _ROW_BYTES)}; pc += 1
-        bundles[pc] = {"s": minitpu.smov_arg(2, 1) if tile == 0 else minitpu.saddi(2, 2, tile_bytes)}; pc += 1
-        bundles[pc] = {"s": minitpu.smov_arg(3, 2) if tile == 0 else minitpu.saddi(3, 3, tile_bytes)}; pc += 1
-        pc += 1  # Explicit NOP that preserves the verified DMA schedule.
-        bundles[pc] = {"d": minitpu.dma_load(0, 0, 16, 0, 1)}; pc += 1
-        bundles[pc] = {"d": minitpu.dma_load(1, 16, 16, 2, 1)}; pc += 1
-        bundles[pc] = {"f": minitpu.flush_slot(3)}; pc += 1
-        bundles[pc] = {"f": minitpu.lbegin(4)}; pc += 1
-        bundles[pc] = {"x": minitpu.vld(0, 0, agu=True, shift=2)}
-        bundles[pc + 1] = {"x": minitpu.vld(1, 16, agu=True, shift=2)}
-        bundles[pc + 7] = {"v": minitpu.vmul(2, 0, 1)}
-        bundles[pc + 13] = {"v": minitpu.vadd(3, 2, 0)}
-        bundles[pc + 19] = {"x": minitpu.vst(3, 32, agu=True, shift=2), "f": minitpu.loop_end()}; pc += 20
-        bundles[pc] = {"d": minitpu.dma_store(0, 32, 16, 3, 1)}; pc += 1
-        bundles[pc] = {"f": minitpu.flush_slot(1)}; pc += 1
-    bundles[pc] = {"f": minitpu.halt()}; pc += 1
-    for index in range(pc):
-        minitpu.bundle(**bundles.get(index, {}))
-
-
-def build_looped_gemm(column_tiles: int, groups: int, *, activate: bool,
-                      fuse_groups: bool = False, loop_blocks: int = _LOOP_BLOCKS,
+def build_looped_gemm(column_tiles: int, groups: int, *, activate: bool, loop_blocks: int = _LOOP_BLOCKS,
                       batch: int = 1, batch_activation_bytes: int = 0
                       ) -> MinitpuKernel:
     """Assembles the tiled GEMM with each block's staging hidden behind the previous block's compute.
@@ -172,12 +88,6 @@ def build_looped_gemm(column_tiles: int, groups: int, *, activate: bool,
         column_tiles: Output column tiles the product covers, being the outer loop's trip count.
         groups: Block groups each column tile drains, being the middle loop's trip count.
         activate: Determines whether each staged tile is activated before it enters the array.
-        fuse_groups: Accumulate every group into the resident output tiles and drain once per
-            column tile, instead of draining a partial per group for the host to sum in float32.
-            The accumulation is then BF16 rather than float32, which measures 1.16x the relative
-            error at GPT-2's contraction depth. What it buys is that the
-            product never has to reach the host at all: one drain per column tile instead of
-            `groups`, no host reduction, and an output the next launch can consume where it lies.
         loop_blocks: Blocks of `_BLOCK_DEPTH` one contraction group accumulates. The default makes
             a group 192 deep, which is why GPT-2's contractions must be multiples of 192; attention
             wants 64, which is this at 2.
@@ -301,10 +211,9 @@ def build_looped_gemm(column_tiles: int, groups: int, *, activate: bool,
             bundles[pc] = {"s": minitpu.saddi(1, 1, OUTPUT_ROWS * ROW_BYTES)}; pc += 1
             return pc
 
-        # Clears the accumulators once per column tile when fused, so they carry every group and the contraction sums on
-        # the device. Unfused: they clear and drain per group, and the host sums the partials in float32.
-        if fuse_groups:
-            pc = emit_clear(pc)
+        # Clears the accumulators once per column tile, so they carry every group and the contraction sums on the
+        # device.
+        pc = emit_clear(pc)
 
         bundles[pc] = {"f": minitpu.lbegin(groups)}; pc += 1
         # Steps back and re-primes this group's first block. flush.slot blocks until dma_slot_done covers flush_mask_q,
@@ -317,9 +226,6 @@ def build_looped_gemm(column_tiles: int, groups: int, *, activate: bool,
             if step + 1 < _STEPS:
                 bundles[pc] = {"f": minitpu.flush_slot(3)}; pc += 1
 
-        if not fuse_groups:
-            pc = emit_clear(pc)
-
         bundles[pc] = {"f": minitpu.lbegin(loop_blocks // 2)}; pc += 1
         pc = emit_block(pc, compute_slot=0)
         pc = emit_block(pc, compute_slot=1)
@@ -328,11 +234,8 @@ def build_looped_gemm(column_tiles: int, groups: int, *, activate: bool,
         # Returns both DMA slots, which the group's trailing prefetch still owns, for the drain to use.
         bundles[pc] = {"f": minitpu.flush_slot(3)}; pc += 1
 
-        if not fuse_groups:
-            pc = emit_drain(pc)
         bundles[pc] = {"f": minitpu.loop_end()}; pc += 1                  # closes the group loop
-        if fuse_groups:
-            pc = emit_drain(pc)
+        pc = emit_drain(pc)
         if batched:
             # Undoes this column tile's walk down the activation. Every term is a `saddi` emitted above: the leading
             # block, then per contraction group a rewind of one block and an advance of `loop_blocks` of them.
@@ -465,95 +368,6 @@ def build_elementwise_add(chunks: int, *, broadcast_right: bool = False) -> Mini
     # Packs, because the hand placement pads with empty bundles that carry no wait. Dropping them shrinks the image and
     # leaves the schedule as it was.
     return minitpu.asm(elementwise_add, placement="pack")
-
-
-def build_tile_transpose(tiles: int, *, load_stride: int, store_stride: int,
-                         store_advance: int) -> MinitpuKernel:
-    """Assembles a 16x16 tile transpose, one tile per loop iteration.
-
-    Notes:
-        This is the operation with no other route. `sublane_stride` permutes rows
-        uniformly across every lane and a DMA descriptor moves whole 16-lane rows,
-        so exchanging lanes with sublanes needed the staging array `vtxin` and
-        `vtxout` drive.
-
-        Four `vtxin` fill the tile with rows, four `vtxout` read it back as
-        columns. The tile persists between them the way the MXU's weights persist
-        between `vmatload` and `vmatpop`.
-
-    Args:
-        tiles: Tiles to transpose in one launch, walked along the row axis.
-        load_stride: Rows between consecutive rows OF ONE TILE in the source, in
-            VMEM rows. A tile of a row-major [R, C] array is 16 rows at stride
-            C / NUM_LANES, not 16 consecutive rows -- this is the first kernel here
-            that needed a descriptor stride other than one, and every other kernel
-            in this package still walks at stride one.
-        store_stride: The same for the destination.
-        store_advance: Rows the destination pointer moves per tile.
-
-    Note:
-        All three are required, with no defaults, because the two callers disagree
-        on every one of them and a default is right for only one. A stack of square
-        tiles is stride 1 and advance `_TILE`, and a tile column of a matrix is stride
-        `C / NUM_LANES` and advance 1, because tile (i, j) becomes tile (j, i) and
-        it is the destination tile's OWN rows that `store_stride` separates. Giving
-        this a default silently rewrote the stacked caller's descriptors from
-        stride 1 to stride 16, and every simulation still passed: the one shape
-        under test named its strides explicitly.
-
-    Returns:
-        The program, taking the input and output pointers as its arguments.
-
-    Raises:
-        ValueError: If the tile count is not positive.
-    """
-    if tiles < 1:
-        message = f"Unable to transpose {tiles} tiles. At least one is needed."
-        raise ValueError(message)
-
-    def tile_transpose() -> None:
-        """Transposes one tile per iteration, advancing both pointers."""
-        bundles = {}
-        pc = 0
-        # Spends all four scalar registers here: two pointers and two strides. The strides are immediates because a
-        # kernel is built per shape anyway.
-        bundles[pc] = {"s": minitpu.smovi(2, load_stride * _ROW_BYTES)}; pc += 1
-        bundles[pc] = {"s": minitpu.smovi(3, store_stride * _ROW_BYTES)}; pc += 1
-        bundles[pc] = {"s": minitpu.smov_arg(0, 0)}; pc += 1      # sreg0 = input
-        bundles[pc] = {"s": minitpu.smov_arg(1, 2)}; pc += 1      # sreg1 = output
-        pc += 1
-
-        bundles[pc] = {"f": minitpu.lbegin(tiles)}; pc += 1
-        bundles[pc] = {"d": minitpu.dma_load(0, _ROW_TX_IN, _TILE, 0, 2)}; pc += 1
-        bundles[pc] = {"f": minitpu.flush_slot(1)}; pc += 1
-        for quarter in range(_NUM_SUBLANES):
-            bundles[pc] = {"x": minitpu.vld(quarter, _ROW_TX_IN + _NUM_SUBLANES * quarter)}
-            pc += 1
-        pc += 8
-        for quarter in range(_NUM_SUBLANES):
-            bundles[pc] = {"e": minitpu.vtxin(quarter, quarter)}; pc += 2
-        pc += 4
-        for quarter in range(_NUM_SUBLANES):
-            bundles[pc] = {"e": minitpu.vtxout(8 + quarter, quarter)}; pc += 6
-        pc += 6
-        for quarter in range(_NUM_SUBLANES):
-            bundles[pc] = {"x": minitpu.vst(8 + quarter,
-                                            _ROW_TX_OUT + _NUM_SUBLANES * quarter)}
-            pc += 1
-        pc += 8
-        bundles[pc] = {"d": minitpu.dma_store(0, _ROW_TX_OUT, _TILE, 1, 3)}; pc += 1
-        bundles[pc] = {"f": minitpu.flush_slot(1)}; pc += 1
-        # Advances the source by a whole tile of rows at its stride, because this walks DOWN a source tile column. Where
-        # the destination moves is the caller's to say.
-        bundles[pc] = {"s": minitpu.saddi(0, 0, _TILE * load_stride * _ROW_BYTES)}; pc += 1
-        bundles[pc] = {"s": minitpu.saddi(1, 1, store_advance * _ROW_BYTES)}; pc += 1
-        pc += 2                    # scalar writeback, before the next descriptor reads it
-        bundles[pc] = {"f": minitpu.loop_end()}; pc += 1
-        bundles[pc] = {"f": minitpu.halt()}; pc += 1
-        for index in range(pc):
-            minitpu.bundle(**bundles.get(index, {}))
-
-    return minitpu.asm(tile_transpose)
 
 
 #: Names the widest addend an S-slot immediate carries. `sequencer_scalar_agu` sign-extends SADDI's 16-bit field, so a
@@ -1086,63 +900,6 @@ def build_softmax_packed(tokens: int, heads: int, *,
     return minitpu.asm(softmax_packed)
 
 
-def build_row_statistics(*, turnaround: int = _VMEM_TURNAROUND) -> MinitpuKernel:
-    """Assembles the row maxima and row sums one attention block's online softmax carries, over one score tile.
-
-    Args:
-        turnaround: Bundles an access waits after the one whose VMEM rows it reads.
-
-    Returns:
-        The program, taking the score tile's pointer and the output pointer, leaving the broadcast maxima, the
-        probabilities and the broadcast sums, a tile each.
-    """
-    def row_statistics() -> None:
-        """Reduces one score tile to its row maxima and row sums, exponentiating between the two."""
-        bundles: dict[int, dict[str, int]] = {}
-
-        def put(slot: int, **slots: int) -> None:
-            """Merges slots into one bundle so co-issue reads at the call site."""
-            bundles.setdefault(slot, {}).update(slots)
-
-        slot = 0
-        put(slot, s=minitpu.smovi(_STRIDE_REGISTER, _ROW_BYTES)); slot += 1
-        put(slot, s=minitpu.smov_arg(0, 0)); slot += 1             # sreg0 = scores
-        put(slot, s=minitpu.smov_arg(1, 2)); slot += 1             # sreg1 = output
-        slot += 1                                                  # scalar writeback latency
-        put(slot, d=minitpu.dma_load(0, _ROW_STAT_IN, _TILE, 0, _STRIDE_REGISTER)); slot += 1
-        put(slot, f=minitpu.flush_slot(1)); slot += 1
-        for quarter, register in enumerate(_STAT_SCORES):
-            put(slot, x=minitpu.vld(register, _ROW_STAT_IN + _NUM_SUBLANES * quarter)); slot += 1
-
-        slot = _emit_row_reduce(put, slot, source=_STAT_SCORES, transposed=_STAT_TRANSPOSED, work=_STAT_WORK,
-                                combine=minitpu.vmax, destination=_STAT_MAXIMA,
-                                scratch_row=_ROW_STAT_SCRATCH, turnaround=turnaround)
-
-        # Subtracts each query's own maximum, the maxima being laid out as the scores are.
-        for quarter, register in enumerate(_STAT_PROBABILITIES):
-            put(slot, e=minitpu.vsub(register, _STAT_SCORES[quarter], _STAT_MAXIMA[quarter])); slot += 1
-        for register in _STAT_PROBABILITIES:
-            put(slot, e=minitpu.vexp(register, register)); slot += 1
-
-        slot = _emit_row_reduce(put, slot, source=_STAT_PROBABILITIES, transposed=_STAT_TRANSPOSED,
-                                work=_STAT_WORK, combine=minitpu.vadd, destination=_STAT_SUMS,
-                                scratch_row=_ROW_STAT_SCRATCH, turnaround=turnaround)
-
-        for tile, group in enumerate((_STAT_MAXIMA, _STAT_PROBABILITIES, _STAT_SUMS)):
-            for quarter, register in enumerate(group):
-                put(slot, x=minitpu.vst(register, _tile_row(_ROW_STAT_OUT, tile, quarter))); slot += 1
-        slot += turnaround
-        put(slot, d=minitpu.dma_store(0, _ROW_STAT_OUT, _STAT_OUT_ROWS, 1, _STRIDE_REGISTER)); slot += 1
-        put(slot, f=minitpu.flush_slot(1)); slot += 1
-        put(slot, f=minitpu.halt()); slot += 1
-        for index in range(slot):
-            minitpu.bundle(**bundles.get(index, {}))
-
-    # Keeps the hand placement: this schedule's gaps carry VMEM and staging array dependencies the hazard model
-    # cannot see, so packing would move a load ahead of the store it reads.
-    return minitpu.asm(row_statistics, placement="")
-
-
 def build_layernorm_rows(rows: int, *, packed: bool = False) -> MinitpuKernel:
     """Assembles LayerNorm over several hidden rows, one per loop iteration.
 
@@ -1333,92 +1090,6 @@ def _require_norm_fits(*, name: str, width_rows: int, const_rows: int, out_row: 
             f"block, or stage the row in pieces."
         )
         raise ValueError(message)
-
-
-def _tile_row(first: int, tile: int, vreg: int) -> int:
-    """Returns the VMEM row one register of one tile occupies within a region."""
-    return first + _TILE * tile + _NUM_SUBLANES * vreg
-
-
-def _emit_row_reduce(put: Callable[..., None], slot: int, *, source: tuple[int, ...],
-                     transposed: tuple[int, ...], work: tuple[int, int],
-                     combine: Callable[[int, int, int], int], destination: tuple[int, ...],
-                     scratch_row: int, turnaround: int) -> int:
-    """Reduces each row of one tile across its 16 lanes, leaving the result broadcast back along them.
-
-    Args:
-        put: The bundle merger the calling builder assembles its schedule with.
-        slot: The bundle index the reduction starts at.
-        source: VREGs holding the tile, register v carrying rows 4v through 4v+3.
-        transposed: VREGs the tile transposes into.
-        work: The folded partials and the register they are read back into, rewritten in place.
-        combine: The operation the rows fold under, being vmax or vadd.
-        destination: VREGs the broadcast result lands in, laid out as the source is.
-        scratch_row: First VMEM row the fold turns its partials through.
-        turnaround: Bundles an access waits after the one whose VMEM rows it reads.
-
-    Returns:
-        The next free bundle index.
-    """
-    folded, shifted = work
-    slot = _emit_transpose(put, slot, source=source, destination=transposed)
-
-    # Combines the registers elementwise, every lane now carrying a row, to one partial per sublane.
-    put(slot=slot, e=combine(folded, transposed[0], transposed[1]))
-    slot += 1
-    for register in transposed[2:]:
-        put(slot=slot, e=combine(folded, folded, register))
-        slot += 1
-
-    # Halves the sublanes through VMEM, whose sublanes read consecutive rows, nothing reducing across them.
-    # Leaves stale rows past each shift, so only sublane zero is read on.
-    for step, distance in enumerate(_SUBLANE_FOLDS):
-        row = scratch_row + 2 * _NUM_SUBLANES * step
-        put(slot=slot, x=minitpu.vst(folded, row))
-        slot += 1 + turnaround
-        put(slot=slot, x=minitpu.vld(shifted, row + distance))
-        slot += 1
-        put(slot=slot, e=combine(folded, folded, shifted))
-        slot += 1
-
-    # Spreads sublane zero over consecutive rows, which one load reads back as agreeing sublanes.
-    broadcast = scratch_row + 2 * _NUM_SUBLANES * len(_SUBLANE_FOLDS)
-    for offset in range(_NUM_SUBLANES):
-        put(slot=slot, x=minitpu.vst(folded, broadcast + offset, mask=_SUBLANE_ZERO))
-        slot += 1
-    slot += turnaround
-    put(slot=slot, x=minitpu.vld(shifted, broadcast))
-    slot += 1
-    return _emit_transpose(put, slot, source=(shifted,) * _NUM_SUBLANES, destination=destination)
-
-
-def _emit_transpose(put: Callable[..., None], slot: int, *, source: tuple[int, ...],
-                    destination: tuple[int, ...]) -> int:
-    """Stages one tile into the transpose array and drains its columns back out.
-
-    The staging array is neither a VREG nor an SREG, so the schedule holds the distance between the two halves
-    rather than the hazard model.
-
-    Args:
-        put: The bundle merger the calling builder assembles its schedule with.
-        slot: The bundle index the first vtxin occupies.
-        source: VREGs staged in, one per quarter, repeating where one register fills the tile.
-        destination: VREGs the columns drain into.
-
-    Returns:
-        The next free bundle index.
-    """
-    for quarter, register in enumerate(source):
-        put(slot=slot, e=minitpu.vtxin(register, quarter))
-        slot += _TXIN_II
-    slot += _TXIN_TO_TXOUT
-    for quarter, register in enumerate(destination):
-        put(slot=slot, e=minitpu.vtxout(register, quarter))
-        slot += _TXOUT_II
-    return slot
-
-
-
 
 
 def _emit_gemm_step(

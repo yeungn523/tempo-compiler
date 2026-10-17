@@ -355,8 +355,7 @@ def main() -> int:
             print(f"nest   {index}  kernel walks {', '.join(launch.nest)}, issued as written over "
                   f"{issued} of {launch.block_m} by {launch.block_n}")
             print(f"launch {index}  row_blocks={launch.row_blocks} column_tiles={launch.column_tiles} "
-                  f"groups={launch.groups} loop_blocks={launch.loop_blocks} activate={launch.activate} "
-                  f"fuse_groups={launch.fuse_groups}")
+                  f"groups={launch.groups} loop_blocks={launch.loop_blocks} activate={launch.activate}")
         try:
             image, staging = compile_launch(launch)
         except NotImplementedError as error:

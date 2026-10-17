@@ -61,7 +61,7 @@ def simulate(*, launch: Launch, reduction: int, build_dir: str | None = None,
         RuntimeError: If the testbench does not report every round halted.
     """
     counts = dict(column_tiles=launch.column_tiles, groups=launch.groups, loop_blocks=launch.loop_blocks,
-                  fuse_groups=launch.fuse_groups, block_m=launch.block_m, block_n=launch.block_n)
+                  block_m=launch.block_m, block_n=launch.block_n)
     # Takes every shape from the emitter, which settled them placing the bundles, so this states none of its own.
     bundles, staging = emit.looped_gemm_stream(**counts)
     image = asm.AsmKernel(name="looped_gemm", bundles=bundles).to_bytes(pad_to=4)
@@ -221,7 +221,6 @@ def main() -> int:
     parser.add_argument("--rows", type=int, default=_BLOCK_TOKENS, help="token rows, being one block")
     parser.add_argument("--depth", type=int, default=192, help="the contraction, a multiple of the group depth")
     parser.add_argument("--columns", type=int, default=48, help="output columns, a multiple of the tile")
-    parser.add_argument("--fuse-groups", action="store_true", help="accumulate the groups on the device")
     parser.add_argument("--loop-blocks", type=int, default=2, help="blocks one group carries")
     parser.add_argument("--block-m", type=int, default=_BLOCK_TOKENS, help="token rows one block covers")
     parser.add_argument("--block-n", type=int, default=_TILE, help="output columns one block covers")
@@ -247,12 +246,11 @@ def main() -> int:
         # States the launch, since these dimensions came from a person rather than from a plan.
         launch = Launch(row_blocks=arguments.rows // arguments.block_m, column_tiles=arguments.columns // _TILE,
                         groups=arguments.depth // (arguments.loop_blocks * _BLOCK_DEPTH),
-                        loop_blocks=arguments.loop_blocks, activate=False, fuse_groups=arguments.fuse_groups,
+                        loop_blocks=arguments.loop_blocks, activate=False,
                         block_m=arguments.block_m, block_n=arguments.block_n)
         error = simulate(launch=launch, reduction=arguments.depth, build_dir=arguments.build_dir,
                          max_cycles=arguments.max_cycles)
-        what = (f"{arguments.rows}x{arguments.depth} @ {arguments.depth}x{arguments.columns} "
-                f"fuse_groups={arguments.fuse_groups}")
+        what = f"{arguments.rows}x{arguments.depth} @ {arguments.depth}x{arguments.columns}"
 
     verdict = "PASS" if error <= _TOLERANCE else "FAIL"
     print(f"{what}  {verdict}  relative error {error * 100:.4f}%")

@@ -84,8 +84,8 @@ def check_kernels_assemble() -> bool:
     probe = (
         "import sys; sys.path[:0] = [%r, %r]; "
         "import kernels; "
-        "n = len(bytes(kernels.single_mul_add.image.to_bytes(pad_to=4))); "
-        "assert n > 0; print('  kernels assemble (%%d bytes for the mul-add image)' %% n)"
+        "n = len(bytes(kernels.single_halt.image.to_bytes(pad_to=4))); "
+        "assert n > 0; print('  kernels assemble (%%d bytes for the halt image)' %% n)"
     ) % (str(HERE), str(HERE / "minitpu_runtime"))
     result = subprocess.run(
         [sys.executable, "-c", probe], capture_output=True, text=True

@@ -48,7 +48,7 @@ def compile_launch(launch: Launch | FusedLaunch | FlashLaunch) -> tuple[bytes, S
         The image bytes padded to the loader's boundary, and the staging the emitter placed them from.
 
     Raises:
-        NotImplementedError: If a plain launch activates its staged tiles, which the emitter does not place.
+        ValueError: If an activating launch covers a block wider than one resident output tile.
         ProgramError: If the compiled bundles exceed the IRAM depth limit under every placement tried.
     """
     if isinstance(launch, FlashLaunch):
@@ -75,16 +75,9 @@ def compile_launch(launch: Launch | FusedLaunch | FlashLaunch) -> tuple[bytes, S
         return _assemble(name="fused_ffn", bundles=bundles,
                          remedy="narrow the output the layer covers"), staging
 
-    if launch.activate:
-        message = (
-            "Unable to compile a launch activating its staged tiles outside a fused pair. The activation rides "
-            "the staging of the matmul consuming the product, which is the fused stream rather than this one."
-        )
-        raise NotImplementedError(message)
-
     counts = dict(column_tiles=launch.column_tiles, groups=launch.groups,
-                  loop_blocks=launch.loop_blocks,
-                  fuse_groups=launch.fuse_groups, block_m=launch.block_m, block_n=launch.block_n)
+                  loop_blocks=launch.loop_blocks, activate=launch.activate,
+                  block_m=launch.block_m, block_n=launch.block_n)
     bundles, staging = looped_gemm_stream(**counts)
     remedy = (
         f"narrow the tile width, where a BLOCK_N of {launch.block_n} unrolls {launch.output_tiles} output tiles"

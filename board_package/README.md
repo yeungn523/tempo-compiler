@@ -27,7 +27,7 @@ scp build/gpt2_weights.npz <board>:board_package/
 ```
 
 `make identity` and `make kernels` need no checkpoint, so a fresh board can prove
-it runs the right bitstream and passes 16/16 before the copy finishes.
+it runs the right bitstream and passes every check before the copy finishes.
 
 `make chat` additionally needs the GPT-2 tokenizer, which is not in the board's
 Python:
@@ -71,25 +71,26 @@ scratch buffers. These costs are measured separately in `SESSION_CHECKLIST.md`.
 
 ## What the board checks prove
 
-`make kernels` runs sixteen checks. Each compares the device against a host
+`make kernels` runs eight checks. Each compares the device against a host
 reference that rounds where the device rounds, so the residual is the arithmetic
-the machine actually does, not a tolerance covering an unmodelled effect.
+the machine actually does, not a tolerance covering an unmodelled effect. Every
+GEMM a check launches is a compiled image from `images/`, summing the whole
+contraction in the device's BF16 accumulators.
+
+Summing on the device roughly doubles a deep product's error against summing
+per-group partials on the host, which is why Full GEMM sits at 0.86 % against
+its 1 % bar. Attention's block-diagonal products are unchanged by it, each
+head's rows lying inside one group and the rest adding exact zeros.
 
 | Check | Shape | Result |
 | --- | --- | --- |
-| Halt, command interleave, COPY round trip | — | control-path smoke tests |
-| BF16 mul-add | 32×32 | exact |
-| Full GEMM | `[32,768] @ [768,3072]` | 0.47 % |
-| Feed-forward layer | `[32,768] → [32,3072] → [32,768]` | 0.72 % |
-| Row-wise softmax | 16 × 64 | 0.45 % |
-| Single attention head | `softmax(QKᵀ/√d)V`, 64 × 64 | 0.89 % |
+| Halt, COPY round trip | — | control-path smoke tests |
+| Full GEMM | `[32,768] @ [768,3072]` | 0.86 % |
 | Elementwise add | `[32,768] + [32,768]` | exact |
-| Weight residency | packed per call vs resident | 2.8× faster, identical |
-| Group sum on device | host fp32 vs device BF16 | 1.08× faster, 1.81× error |
 | Prefill attention, all heads | 12 heads × 20 causal queries | 0.54 % |
 | Decode attention, all heads | 12 heads × 1 query, 48 keys | 0.67 % |
 | LayerNorm | 8 × 768 | 0.42 % |
-| **Transformer block** | 64 × 768, 12 heads | **0.68 %** |
+| **Transformer block** | 64 × 768, 12 heads, resident | **— (re-measure)** |
 
 The GEMM check runs **two** operand sets. The structured one is exactly
 representable and pins the kernel bit for bit; the varying one differs along

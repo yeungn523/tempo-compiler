@@ -49,7 +49,18 @@ done
 # the runtime reads go over the gate too, and they keep their subdirectory.
 while IFS= read -r f; do FILES+=("$f"); done < <(
   cd "$HERE" && ls board_package/minitpu/scripts/* board_package/minitpu/platform.json \
-                   board_package/minitpu/overlay.dtso 2>/dev/null)
+                   board_package/minitpu/overlay.dtso board_package/minitpu/u-dma-buf.ko 2>/dev/null)
+
+# The compiled GEMM images the layer drivers launch. The board carries no
+# compiler, so tools/build_gpt2_images.py writes them here and they travel as data.
+while IFS= read -r f; do FILES+=("$f"); done < <(
+  cd "$HERE" && ls board_package/images/* 2>/dev/null)
+
+# scp creates no directories, and a board erases the home directory once no
+# session holds it, so every directory a copy lands in is made first.
+DIRS=()
+for f in "${FILES[@]}"; do DIRS+=("$REMOTE/$(dirname "$(remote_of "$f")")"); done
+ssh -o BatchMode=yes "$ACCOUNT@$IP" "mkdir -p $(printf '%s\n' "${DIRS[@]}" | sort -u | tr '\n' ' ')"
 
 echo "deploying $((${#FILES[@]})) files to $IP"
 for f in "${FILES[@]}"; do

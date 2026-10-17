@@ -1,0 +1,38 @@
+{
+  "gemm_768x2304.bin": {
+    "depth": 768,
+    "columns": 2304,
+    "activate": false,
+    "column_tiles": 144,
+    "groups": 3,
+    "loop_blocks": 8,
+    "drain_words": 73984
+  },
+  "gemm_768x768.bin": {
+    "depth": 768,
+    "columns": 768,
+    "activate": false,
+    "column_tiles": 48,
+    "groups": 3,
+    "loop_blocks": 8,
+    "drain_words": 24832
+  },
+  "gemm_768x3072.bin": {
+    "depth": 768,
+    "columns": 3072,
+    "activate": false,
+    "column_tiles": 192,
+    "groups": 3,
+    "loop_blocks": 8,
+    "drain_words": 98560
+  },
+  "gemm_3072x768_gelu.bin": {
+    "depth": 3072,
+    "columns": 768,
+    "activate": true,
+    "column_tiles": 48,
+    "groups": 12,
+    "loop_blocks": 8,
+    "drain_words": 24832
+  }
+}

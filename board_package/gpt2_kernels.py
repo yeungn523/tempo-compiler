@@ -2,15 +2,15 @@
 """Provides the GPT-2 host drivers, the layer references and the checks that say the device path is right.
 
 Running this module on a board executes every check in order. Composition lives here, while the arithmetic is in
-bf16.py and the schedules are in kernels.py. The PL runs the hidden dimensions, being both projections, every
-attention head, both feed-forward products and LayerNorm, and the host holds the residual adds, biases, head
-reshaping and the K transpose.
+bf16.py, the hand-written schedules are in kernels.py and every GEMM image comes from the compiler through images/.
+A transformer block runs resident in DMEM, every operation in it a launch reading the previous one's output.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 
+import json
 import math
 import pathlib
 import sys
@@ -31,11 +31,8 @@ from bf16 import (  # noqa: E402,F401  (re-exported, the operand tests importing
     _BLOCK_WEIGHT_BYTES,
     _CORRUPTION_WORD,
     _ELEMENT_BYTES,
-    _INTERLEAVE_PAYLOAD_BYTES,
-    _INTERLEAVE_ROUNDS,
     _LAUNCH_REPEATS,
     _LN_EPSILON,
-    _LOOP_BLOCKS,
     _MAX_DESCRIPTOR_ROWS,
     _MODEL_WIDTH,
     _NUM_LANES,
@@ -63,12 +60,10 @@ from kernels import (  # noqa: E402
     build_head_copy,
     build_head_transpose,
     build_matrix_transpose,
-    build_tile_transpose,
     build_looped_gemm,
     build_softmax_packed,
     build_softmax_rows,
     single_halt,
-    single_mul_add,
 )
 from runtime import (  # noqa: E402
     MemcpyKind,
@@ -77,7 +72,6 @@ from runtime import (  # noqa: E402
     minitpuGetAddressSpace,
     minitpuHostAlloc,
     minitpuHostReset,
-    minitpuHostRewind,
     minitpuLaunchKernel,
     minitpuMalloc,
     minitpuMemcpy,
@@ -93,16 +87,10 @@ sys.path.insert(0, str(HERE / "minitpu_runtime"))
 
 
 
-_FFN_ERROR_LIMIT: float = 0.01
-
-
 _GEMM_ERROR_LIMIT: float = 0.01
 
 
 _SOFTMAX_ERROR_LIMIT: float = 0.02
-
-
-_ATTENTION_ERROR_LIMIT: float = 0.02
 
 
 _BLOCK_ERROR_LIMIT: float = 0.05
@@ -124,6 +112,19 @@ _KERNEL_CACHE: dict[tuple, tuple] = {}
 having measured 36.8 ms of a 47.4 ms fully resident launch. The key is the arguments rather than the kernel:
 `id` is reused once CPython collects the object, which handed a dead kernel's image to a later one, and a frozen
 dataclass cannot be memoised on."""
+
+
+_IMAGE_DIRECTORY: pathlib.Path = HERE / "images"
+"""Directory holding the compiled GEMM images and the manifest describing them, which a host writes through
+`tools/build_gpt2_images.py`."""
+
+
+_UIO_NAME: str = "minitpu"
+"""UIO node every image launches on."""
+
+
+_COMPILED_GEMMS: dict[tuple[int, int, bool], bytes] = {}
+"""Compiled GEMM images keyed by contraction depth, output columns and activation, each read from disk once."""
 
 
 _ATTENTION_MASKS: dict[tuple, DeviceTensor] = {}
@@ -346,19 +347,6 @@ def upload_bias(h_bias: NDArray[np.float32]) -> ResidentWeights:
                            nbytes=words.nbytes)
 
 
-def reset_host_staging() -> None:
-    """Returns the pinned staging arena to empty, which is safe only when nothing is live.
-
-    Notes:
-        This rewinds the bump offset rather than dropping the buffer, `minitpuHostReset` unmapping the udmabuf
-        and costing the next allocation 1.875 ms to re-open it. The weaker guarantee holds because every staging
-        region in this module dies inside the call that made it, and device allocations are a separate pool this
-        does not touch. Caching a region across this call is what is unsafe: the region becomes a view into
-        memory the allocator no longer owns, and handing one to a DMA leaves the core mid-command.
-    """
-    minitpuHostRewind()
-
-
 def upload_activations(h_activations: NDArray[np.float32]) -> DeviceTensor:
     """Packs host activations and leaves them in DMEM.
 
@@ -531,64 +519,6 @@ def transpose_2d(h_matrix: NDArray[np.float32]) -> NDArray[np.float32]:
         minitpuHostReset()
 
 
-def transpose_tiles(h_tiles: NDArray[np.float32]) -> NDArray[np.float32]:
-    """Transposes each 16x16 tile of an array on the device.
-
-    Notes:
-        `sublane_stride` permutes rows uniformly across every lane and a DMA descriptor moves whole 16-lane
-        rows, so exchanging lanes with sublanes needs the staging array `vtxin` and `vtxout` drive.
-
-    Args:
-        h_tiles: [tiles * _TILE, _TILE] host array, a stack of square tiles.
-
-    Returns:
-        The same stack with every tile transposed.
-
-    Raises:
-        ValueError: If the shape is not a whole number of square tiles.
-    """
-    rows, columns = h_tiles.shape
-    if columns != _TILE or rows % _TILE:
-        message = (
-            f"Unable to transpose a [{rows},{columns}] array. The staging tile is "
-            f"{_TILE}x{_TILE}, so this takes a whole number of {_TILE}x{_TILE} tiles."
-        )
-        raise ValueError(message)
-    tiles = rows // _TILE
-
-    kernel, image_bytes = _kernel_and_image(
-        ("transpose", tiles),
-        # A [tiles * 16, 16] stack: one matrix row is exactly one VMEM row, so the
-        # rows of a tile are consecutive, and each result lands a whole tile on.
-        lambda: build_tile_transpose(tiles=tiles, load_stride=1, store_stride=1,
-                                     store_advance=_TILE))
-    minitpuSetDevice(kernel.uio_name)
-    minitpuHostReset()
-    d_owned: list[int] = []
-    try:
-        d_image = _stage_image(image_bytes)
-        words = as_bf16_words(values=_on_bf16_grid(values=h_tiles)).reshape(-1)
-        h_in = minitpuHostAlloc(words.nbytes)
-        h_in.view.view("<u2")[: words.size] = words
-        d_in = minitpuMalloc(words.nbytes)
-        d_owned.append(d_in)
-        minitpuMemcpy(d_in, h_in, words.nbytes, MemcpyKind.HostToDevice)
-
-        h_out = minitpuHostAlloc(words.nbytes)
-        d_out = minitpuMalloc(words.nbytes)
-        d_owned.append(d_out)
-
-        minitpuLaunchKernel(d_image, len(image_bytes),
-                            args=[d_in, 0, d_out])
-        minitpuMemcpy(h_out, d_out, words.nbytes, MemcpyKind.DeviceToHost)
-        return from_bf16_words(
-            words=h_out.view.view("<u2")[: words.size]).reshape(h_tiles.shape)
-    finally:
-        for address in d_owned:
-            minitpuFree(address)
-        minitpuHostReset()
-
-
 def add_resident(d_left: DeviceTensor, d_right: DeviceTensor, *,
                  d_out: DeviceTensor | None = None) -> DeviceTensor:
     """Adds two DMEM tensors elementwise, leaving the sum in DMEM.
@@ -699,7 +629,8 @@ def gemm_resident(d_activations: DeviceTensor, d_weights: ResidentWeights, *,
         The product, resident.
 
     Raises:
-        ValueError: If the operands disagree, or a dimension is not a whole number of blocks.
+        ValueError: If the operands disagree, if a dimension is not a whole number of blocks, or if no compiled image
+            covers the shape.
     """
     tokens, depth = d_activations.shape
     columns = d_weights.columns
@@ -709,10 +640,7 @@ def gemm_resident(d_activations: DeviceTensor, d_weights: ResidentWeights, *,
             f"one. Their inner dimensions must agree."
         )
         raise ValueError(message)
-    for name, value, block in (
-        ("tokens", tokens, _BLOCK_TOKENS), ("depth", depth, _LOOP_BLOCKS * _BLOCK_DEPTH),
-        ("columns", columns, _TILE)
-    ):
+    for name, value, block in (("tokens", tokens, _BLOCK_TOKENS), ("columns", columns, _TILE)):
         if value % block:
             message = (
                 f"Unable to multiply tensors with {name} of {value}. It must be a whole number "
@@ -720,17 +648,12 @@ def gemm_resident(d_activations: DeviceTensor, d_weights: ResidentWeights, *,
             )
             raise ValueError(message)
 
-    column_tiles = columns // _TILE
-    groups = depth // (_LOOP_BLOCKS * _BLOCK_DEPTH)
-    kernel, image_bytes = _kernel_and_image(
-        ("gemm", column_tiles, groups, activate, True),
-        lambda: build_looped_gemm(column_tiles=column_tiles, groups=groups,
-                                  activate=activate, fuse_groups=True))
+    image_bytes = _compiled_gemm(depth=depth, columns=columns, activate=activate)
 
     if d_out is None:
         d_out = _allocate_tensor(tokens, columns)
 
-    minitpuSetDevice(kernel.uio_name)
+    minitpuSetDevice(_UIO_NAME)
     d_image = _stage_image(image_bytes)
 
     for block in range(tokens // _BLOCK_TOKENS):
@@ -742,14 +665,13 @@ def gemm_resident(d_activations: DeviceTensor, d_weights: ResidentWeights, *,
 
 def full_gemm(
     activations: NDArray[np.float32], weights: NDArray[np.float32] | ResidentWeights,
-    *, activate: bool = False, fuse_groups: bool = False
+    *, activate: bool = False
 ) -> NDArray[np.float32]:
-    """Multiplies two arrays of arbitrary size on the device, one launch per token block.
+    """Multiplies two arrays on the device through the compiled image for their shape, one launch per token block.
 
     Notes:
-        The device walks every output column tile and every contraction block, draining one partial per block
-        group. The host sums those groups in float32, which holds the BF16 accumulate chain to a depth the error
-        bound tolerates.
+        The device walks every output column tile and sums the whole contraction in its BF16 accumulators, so
+        each launch drains the finished product once per column tile.
 
         `weights` may be a `ResidentWeights` handle rather than an array, in which case nothing is packed or
         copied, the matrix already being in DMEM. Packing is the single largest cost of a launch, so a caller
@@ -760,16 +682,13 @@ def full_gemm(
         weights: The right operand, whose rows are the contraction and columns the output features.
         activate: Determines whether each staged tile is activated before it enters the array. Set it for a
             feed-forward layer's down projection, whose left operand is the activated intermediate.
-        fuse_groups: Sum the contraction's groups on the device instead of draining one partial per group
-            for the host to add in float32. Costs 1.16x the relative error at GPT-2's depth and removes
-            both the host reduction and `groups - 1` of every column tile's drain traffic.
 
     Returns:
         The float32 product, recovered from the BF16 values the kernel returns.
 
     Raises:
-        ValueError: If the operands' inner dimensions disagree, or a dimension is not a whole number of the
-            blocks one launch covers.
+        ValueError: If the operands' inner dimensions disagree, if a dimension is not a whole number of the
+            blocks one launch covers, or if no compiled image covers the shape.
     """
     tokens, depth = activations.shape
     resident = weights if isinstance(weights, ResidentWeights) else None
@@ -789,26 +708,14 @@ def full_gemm(
                 f"is what one launch covers."
             )
             raise ValueError(message)
-    blocks = depth // _BLOCK_DEPTH
-    if blocks % _LOOP_BLOCKS:
-        message = (
-            f"Unable to run a {depth}-deep contraction on the looped kernel. The contraction must be a whole "
-            f"number of the {_LOOP_BLOCKS} blocks one group walks, but got {blocks} blocks."
-        )
-        raise ValueError(message)
-    groups = blocks // _LOOP_BLOCKS
     column_tiles = columns // _TILE
 
-    kernel, image_bytes = _kernel_and_image(
-        ("gemm", column_tiles, groups, activate, fuse_groups),
-        lambda: build_looped_gemm(column_tiles=column_tiles, groups=groups,
-                                  activate=activate, fuse_groups=fuse_groups))
-    drained_groups = 1 if fuse_groups else groups
+    image_bytes = _compiled_gemm(depth=depth, columns=columns, activate=activate)
     weight_words = None if resident is not None else pack_weights(weights=weights)
-    drain_words = _ZERO_TILE_WORDS + column_tiles * drained_groups * _BLOCK_TOKENS * _TILE
+    drain_words = _ZERO_TILE_WORDS + column_tiles * _BLOCK_TOKENS * _TILE
     result = np.empty((tokens, columns), dtype=np.float32)
 
-    minitpuSetDevice(kernel.uio_name)
+    minitpuSetDevice(_UIO_NAME)
     minitpuHostReset()
     d_owned: list[int] = []
 
@@ -828,7 +735,7 @@ def full_gemm(
             minitpuMemcpy(d_weights, h_weights, weight_words.nbytes, MemcpyKind.HostToDevice)
 
         # The clearing tile heads the drain buffer, so one argument reaches both and the kernel steps past the
-        # tile to find where the partials land.
+        # tile to find where the product lands.
         h_drain = minitpuHostAlloc(drain_words * _ELEMENT_BYTES)
         h_drain.view.view("<u2")[:drain_words] = 0
         d_drain = minitpuMalloc(drain_words * _ELEMENT_BYTES)
@@ -848,46 +755,15 @@ def full_gemm(
                                 args=[d_activations, d_weights, d_drain])
             minitpuMemcpy(h_drain, d_drain, drain_words * _ELEMENT_BYTES, MemcpyKind.DeviceToHost)
 
-            partials = from_bf16_words(
-                words=h_drain.view.view("<u2")[_ZERO_TILE_WORDS:drain_words])
-            tiles = partials.reshape(column_tiles, drained_groups, _BLOCK_TOKENS, _TILE)
-            # With fuse_groups the device has already summed them and this axis is 1, so the sum
-            # is a no-op. Without it, this is the float32 reduction of the partials.
-            summed = tiles.sum(axis=1, dtype=np.float32)
-            result[token : token + _BLOCK_TOKENS] = summed.transpose(1, 0, 2).reshape(_BLOCK_TOKENS, columns)
+            tiles = from_bf16_words(
+                words=h_drain.view.view("<u2")[_ZERO_TILE_WORDS:drain_words]).reshape(
+                column_tiles, _BLOCK_TOKENS, _TILE)
+            result[token : token + _BLOCK_TOKENS] = tiles.transpose(1, 0, 2).reshape(_BLOCK_TOKENS, columns)
     finally:
         for address in d_owned:
             minitpuFree(address)
         minitpuHostReset()
     return result
-
-
-def full_ffn(
-    activations: NDArray[np.float32],
-    up_weight: NDArray[np.float32],
-    up_bias: NDArray[np.float32],
-    down_weight: NDArray[np.float32],
-    down_bias: NDArray[np.float32],
-) -> NDArray[np.float32]:
-    """Runs one transformer feed-forward layer at model dimensions on the MINITPU.
-
-    Notes:
-        Two full_gemm passes, since GELU needs the finished sum and these drain one partial per contraction
-        group for the host to add. The activation rides the down projection's staging, whose left operand is
-        the summed intermediate, and costs no bundle of its own.
-
-    Args:
-        activations: The layer input, whose rows are tokens.
-        up_weight: The up projection, contracted against the input's columns.
-        up_bias: The up projection's bias, added to every token row.
-        down_weight: The down projection, contracted against the activated intermediate.
-        down_bias: The down projection's bias, added to every token row.
-
-    Returns:
-        The layer output, with one row per input token.
-    """
-    hidden = full_gemm(activations=activations, weights=up_weight) + up_bias
-    return full_gemm(activations=hidden, weights=down_weight, activate=True) + down_bias
 
 
 def softmax_rows(scores: NDArray[np.float32]) -> NDArray[np.float32]:
@@ -1023,67 +899,66 @@ def layernorm_rows(
         minitpuHostReset()
 
 
-def multi_head_attention(
-    hidden: NDArray[np.float32], qkv_weight: NDArray[np.float32], qkv_bias: NDArray[np.float32],
-    proj_weight: NDArray[np.float32], proj_bias: NDArray[np.float32], *, heads: int = 12
-) -> NDArray[np.float32]:
-    """Runs one multi-head self-attention on the device.
+def transformer_block(hidden: NDArray[np.float32], weights: dict, *, heads: int = 12) -> NDArray[np.float32]:
+    """Runs one GPT-2 transformer block on the device, keeping every intermediate resident in DMEM.
 
     Notes:
-        The projections are device products at model width and the attention is `prefill_attention`, which is
-        three launches for every head rather than three per head, splitting the projection into heads being a
-        contiguous view over the same bytes. This is unmasked, as `transformer_block_reference` models it; the
-        chat path passes `causal=True`.
+        Both LayerNorms, all four projections, every bias and residual add and the attention run as launches
+        that read the previous launch's output where it lies, so the block crosses the host boundary once on
+        entry and once on exit. The four projections launch compiled images. Attention's 1/sqrt(head) rides
+        the query columns of the QKV projection, folded into its weights and bias before upload.
 
     Args:
-        hidden: [tokens, model] input.
-        qkv_weight: [model, 3*model] fused query/key/value projection.
-        qkv_bias: [3*model] bias.
-        proj_weight: [model, model] output projection.
-        proj_bias: [model] bias.
-        heads: Attention heads.
-
-    Returns:
-        The [tokens, model] attention output.
-    """
-    fused = full_gemm(activations=hidden, weights=qkv_weight) + qkv_bias
-    query, key, value = np.split(fused.astype(np.float32), 3, axis=1)
-    gathered = prefill_attention(
-        query=np.ascontiguousarray(query), key=np.ascontiguousarray(key),
-        value=np.ascontiguousarray(value), heads=heads, causal=False)
-    return full_gemm(activations=_on_bf16_grid(values=gathered), weights=proj_weight) + proj_bias
-
-
-def transformer_block(hidden: NDArray[np.float32], weights: dict) -> NDArray[np.float32]:
-    """Runs one GPT-2 transformer block on the device.
-
-    Notes:
-        LayerNorm, both projections, every attention head and both feed-forward products run on the
-        device. The residual adds, the biases and the head reshaping stay on the host, which is the
-        agreed split while the PL covers the hidden dimensions and the PS covers the gaps.
-
-    Args:
-        hidden: [tokens, model] block input.
+        hidden: [tokens, model] block input, a whole number of token blocks and at most `MAX_ATTENTION_ROWS`.
         weights: The block's parameters, keyed as GPT-2 names them: ``ln_1.g``, ``ln_1.b``,
             ``attn.qkv.w``, ``attn.qkv.b``, ``attn.proj.w``, ``attn.proj.b``, ``ln_2.g``,
             ``ln_2.b``, ``mlp.fc.w``, ``mlp.fc.b``, ``mlp.proj.w``, ``mlp.proj.b``.
+        heads: Attention heads the model width splits into.
 
     Returns:
         The [tokens, model] block output.
     """
-    normalised = layernorm_rows(rows=hidden, gamma=weights["ln_1.g"], beta=weights["ln_1.b"])
-    attended = multi_head_attention(
-        hidden=_on_bf16_grid(values=normalised),
-        qkv_weight=weights["attn.qkv.w"], qkv_bias=weights["attn.qkv.b"],
-        proj_weight=weights["attn.proj.w"], proj_bias=weights["attn.proj.b"])
-    residual = _on_bf16_grid(values=hidden + attended)
+    model = hidden.shape[1]
+    scale = np.ones(3 * model, dtype=np.float32)
+    scale[:model] = 1.0 / math.sqrt(model // heads)
 
-    normalised = layernorm_rows(rows=residual, gamma=weights["ln_2.g"], beta=weights["ln_2.b"])
-    expanded = full_gemm(activations=_on_bf16_grid(values=normalised),
-                         weights=weights["mlp.fc.w"]) + weights["mlp.fc.b"]
-    contracted = full_gemm(activations=_on_bf16_grid(values=expanded),
-                           weights=weights["mlp.proj.w"], activate=True) + weights["mlp.proj.b"]
-    return _on_bf16_grid(values=residual + contracted)
+    d_owned: list[DeviceTensor | ResidentWeights] = []
+    d_constants: list[int] = []
+
+    def kept(d_tensor):
+        """Records a device allocation so the block frees it however it exits."""
+        d_owned.append(d_tensor)
+        return d_tensor
+
+    try:
+        d_weights = {name: kept(upload_weights(weights[name] * (scale if name == "attn.qkv.w" else 1.0)))
+                     for name in ("attn.qkv.w", "attn.proj.w", "mlp.fc.w", "mlp.proj.w")}
+        d_biases = {name: kept(upload_bias(weights[name] * (scale if name == "attn.qkv.b" else 1.0)))
+                    for name in ("attn.qkv.b", "attn.proj.b", "mlp.fc.b", "mlp.proj.b")}
+        for gamma, beta in (("ln_1.g", "ln_1.b"), ("ln_2.g", "ln_2.b")):
+            d_constants.append(upload_layernorm_constants(weights[gamma], weights[beta]))
+
+        d_hidden = kept(upload_activations(hidden))
+        d_normed = kept(layernorm_resident(d_hidden, d_constants[0]))
+        d_fused = kept(add_bias_resident(kept(gemm_resident(d_normed, d_weights["attn.qkv.w"])),
+                                         d_biases["attn.qkv.b"]))
+        d_attended = kept(attention(d_fused, heads=heads, causal=False))
+        d_projected = kept(add_bias_resident(kept(gemm_resident(d_attended, d_weights["attn.proj.w"])),
+                                             d_biases["attn.proj.b"]))
+        d_residual = kept(add_resident(d_hidden, d_projected))
+
+        d_normed = kept(layernorm_resident(d_residual, d_constants[1]))
+        d_wide = kept(add_bias_resident(kept(gemm_resident(d_normed, d_weights["mlp.fc.w"])),
+                                        d_biases["mlp.fc.b"]))
+        # Applies the GELU while staging the down projection's operand, so it costs no launch of its own.
+        d_narrow = kept(add_bias_resident(kept(gemm_resident(d_wide, d_weights["mlp.proj.w"], activate=True)),
+                                          d_biases["mlp.proj.b"]))
+        return download_activations(kept(add_resident(d_residual, d_narrow)))
+    finally:
+        for d_tensor in d_owned:
+            d_tensor.free()
+        for address in d_constants:
+            minitpuFree(address)
 
 
 def transformer_block_reference(hidden: NDArray[np.float32], weights: dict) -> NDArray[np.float32]:
@@ -1110,55 +985,6 @@ def transformer_block_reference(hidden: NDArray[np.float32], weights: dict) -> N
     contracted = (activated.astype(np.float64) @ weights["mlp.proj.w"].astype(np.float64)
                   + weights["mlp.proj.b"]).astype(np.float32)
     return _on_bf16_grid(values=residual + contracted)
-
-
-def attention_head(
-    query: NDArray[np.float32], key: NDArray[np.float32], value: NDArray[np.float32]
-) -> NDArray[np.float32]:
-    """Runs one attention head on the device: softmax(Q Kᵀ / √d) V.
-
-    Notes:
-        Three launches, composed the way `full_ffn` composes two: a product, a softmax, a product. Two steps
-        ride on the host. The transpose does, because nothing in the ISA exchanges lanes with sublanes and the
-        packer already materialises a copy it can transpose in. The contraction padding does, because the
-        looped GEMM drains on a whole number of `_LOOP_BLOCKS * _BLOCK_DEPTH` and a head is 64 deep, so both
-        products pad with zeros: exact, but moving three times the operand bytes they need. The 1/√d scale
-        folds into the packed query at no device cost.
-
-    Args:
-        query: [tokens, head] queries.
-        key: [tokens, head] keys.
-        value: [tokens, head] values.
-
-    Returns:
-        The [tokens, head] attention output.
-
-    Raises:
-        ValueError: If the token count is not the width one VREG reduces over.
-    """
-    tokens, head = query.shape
-    if tokens != _VREG_ELEMENTS:
-        message = (
-            f"Unable to attend over {tokens} tokens. The softmax reduces over a whole VREG, so a "
-            f"score row, one per token, must be exactly {_VREG_ELEMENTS} wide."
-        )
-        raise ValueError(message)
-
-    contraction = _LOOP_BLOCKS * _BLOCK_DEPTH
-    def padded(values: NDArray[np.float32]) -> NDArray[np.float32]:
-        """Zero-extends a contraction to the depth one block group covers."""
-        if values.shape[0] >= contraction:
-            return values
-        extended = np.zeros((contraction, values.shape[1]), dtype=np.float32)
-        extended[: values.shape[0]] = values
-        return extended
-
-    # This takes unscaled queries and applies 1/sqrt(d) itself, being a single head with no projection in
-    # front of it to fold into, unlike the prefill and decode paths whose scale rides the QKV weights.
-    scaled = (query / math.sqrt(head)).astype(np.float32)
-    scores = full_gemm(activations=_pad_columns(scaled, contraction), weights=padded(key.T.copy()))
-    weights = softmax_rows(scores=scores)
-    return full_gemm(activations=_pad_columns(weights, contraction), weights=padded(value))
 
 
 def attention(d_fused: DeviceTensor, *, heads: int = 12, causal: bool = True,
@@ -1344,8 +1170,8 @@ def decode_attention(
         each: head h's transposed keys sit at block (h, h) of a block-diagonal operand, everything off the
         diagonal is zero, and no head sees another's keys. That wastes eleven twelfths of the multiplies, which
         is the right trade while the device is idle for most of a token and the launch is what costs. Contexts
-        shorter than a full VREG need their unused score columns pushed to zero probability, a [heads, 64] add
-        that exists only because the contraction must be a whole number of `_LOOP_BLOCKS * _BLOCK_DEPTH`.
+        shorter than a full VREG need their unused score columns pushed to zero probability, since each head's
+        score row is one whole VREG the softmax reduces over.
 
     Args:
         query: [heads, head] one query row per head, unscaled.
@@ -1459,56 +1285,6 @@ def check_kernel_launch(kernel: MinitpuKernel) -> None:
         minitpuHostReset()
 
 
-def check_command_interleave(kernel: MinitpuKernel, *, nbytes: int) -> None:
-    """Verifies that COPY and LAUNCH commands alternate correctly and that a launch preserves device data.
-
-    Notes:
-        One ready flag reports both sub-FSMs idle, so each round issues a COPY against a flag the preceding LAUNCH
-        has just released and vice versa. The kernel halts without touching memory, which leaves the payload the
-        round reads back equal to the payload it sent.
-
-    Args:
-        kernel: The assembled program launched between the transfers, which halts without writing memory.
-        nbytes: The payload size each round sends through device memory.
-
-    Raises:
-        AssertionError: If a round reads back a payload a launch or a transfer disturbed.
-    """
-    image_bytes = _image_of(kernel)
-    address_space = minitpuGetAddressSpace()
-    pattern = np.arange(nbytes // 4, dtype="<u4")
-
-    minitpuSetDevice(kernel.uio_name)
-    minitpuHostReset()
-    device_address = None
-    try:
-        staging = minitpuHostAlloc(len(image_bytes))
-        source = minitpuHostAlloc(nbytes)
-        destination = minitpuHostAlloc(nbytes)
-        staging.view[: len(image_bytes) // 4] = np.frombuffer(image_bytes, dtype="<u4")
-        source.view[: pattern.size] = pattern
-        minitpuMemcpy(
-            dst=address_space.kernel_base,
-            src=staging,
-            nbytes=len(image_bytes),
-            kind=MemcpyKind.HostToDevice,
-        )
-
-        device_address = minitpuMalloc(nbytes)
-        for _ in range(_INTERLEAVE_ROUNDS):
-            minitpuMemcpy(dst=device_address, src=source, nbytes=nbytes, kind=MemcpyKind.HostToDevice)
-            minitpuLaunchKernel(kbin_addr=address_space.kernel_base, kbin_size=len(image_bytes))
-
-            destination.view[: pattern.size] = _CORRUPTION_WORD
-            destination.sync_to_device()
-            minitpuMemcpy(dst=destination, src=device_address, nbytes=nbytes, kind=MemcpyKind.DeviceToHost)
-            np.testing.assert_array_equal(destination.view[: pattern.size], pattern)
-    finally:
-        if device_address is not None:
-            minitpuFree(device_address)
-        minitpuHostReset()
-
-
 def check_copy_roundtrip(words: NDArray[np.uint32], *, uio_name: str = "minitpu") -> None:
     """Verifies that a kernel's argument words cross to device memory and return byte for byte unchanged.
 
@@ -1583,37 +1359,6 @@ def check_halt() -> str:
     return f"staged and launched {_LAUNCH_REPEATS} times"
 
 
-def check_launch_interleave() -> str:
-    """Alternates COPY and LAUNCH commands against one payload.
-
-    Returns:
-        The detail the report line carries.
-
-    Raises:
-        AssertionError: If a round reads back a payload a launch or a transfer disturbed.
-    """
-    check_command_interleave(kernel=single_halt, nbytes=_INTERLEAVE_PAYLOAD_BYTES)
-    return f"{_INTERLEAVE_ROUNDS} rounds of alternating COPY and LAUNCH"
-
-
-def check_mul_add() -> str:
-    """Runs a BF16 multiply-add through the callable that hides allocation, transfers and the launch.
-
-    Returns:
-        The detail the report line carries.
-
-    Raises:
-        AssertionError: If the program disagrees with the host reference.
-    """
-    side = 32
-    left = np.full((side, side), 2, dtype=np.float32)
-    right = np.full_like(left, 2)
-    destination = np.empty(left.size, dtype="<u2")
-    single_mul_add(as_bf16_words(values=left).ravel(), as_bf16_words(values=right).ravel(), destination)
-    np.testing.assert_array_equal(from_bf16_words(words=destination).reshape(left.shape), left * right + left)
-    return f"{side}x{side} C = A * B + A, {len(single_mul_add.image.bundles)} VLIW bundles"
-
-
 def check_copy_argument() -> str:
     """Sends one GEMM argument through device memory and reads it back.
 
@@ -1629,7 +1374,7 @@ def check_copy_argument() -> str:
 
 
 def check_full_gemm(*, tokens: int = 32, depth: int = 768, columns: int = 3072) -> str:
-    """Runs a product at model dimensions and verifies the loop kernel against a host reference.
+    """Runs a product at model dimensions through its compiled image and verifies it against a host reference.
 
     Notes:
         Runs two operand sets, either alone being blind. The structured set is exactly representable and pins
@@ -1640,14 +1385,14 @@ def check_full_gemm(*, tokens: int = 32, depth: int = 768, columns: int = 3072) 
 
     Args:
         tokens: Rows the product covers, which must be a whole number of token blocks.
-        depth: The contraction, which must be a whole number of the block groups one launch drains.
+        depth: The contraction, which a compiled image in the manifest must cover together with `columns`.
         columns: Output features, which must be a whole number of tiles.
 
     Returns:
         The detail the report line carries, naming the shapes, the launch count and the measured time.
 
     Raises:
-        AssertionError: If the loop kernel disagrees with the host reference on either operand set.
+        AssertionError: If the compiled image disagrees with the host reference on either operand set.
     """
     launches = tokens // _BLOCK_TOKENS
 
@@ -1675,192 +1420,9 @@ def check_full_gemm(*, tokens: int = 32, depth: int = 768, columns: int = 3072) 
         raise AssertionError(message)
 
     return (
-        f"[{tokens},{depth}] @ [{depth},{columns}], {2 * launches} launches in {elapsed:.1f} s "
+        f"[{tokens},{depth}] @ [{depth},{columns}] compiled, {2 * launches} launches in {elapsed:.1f} s "
         f"({1e6 * elapsed / launches:.0f} us each), varying-operand relative error {error:.2%}"
     )
-
-
-def check_full_ffn(*, tokens: int = 32, model: int = 768, hidden: int = 3072) -> str:
-    """Runs one feed-forward layer at model dimensions and verifies it against a host reference.
-
-    Notes:
-        Defaults to GPT-2 small's feed-forward shape, so a pass means two launches carry a real layer rather
-        than a tile. The reference quantizes both operands to BF16 and applies the SFU's own table, leaving only
-        the accumulate to differ, so the bound below is what the BF16 partials contribute rather than a
-        tolerance for an unmodelled effect.
-
-    Args:
-        tokens: Rows the layer processes, which must be a whole number of token blocks.
-        model: The layer's input and output width.
-        hidden: The intermediate width the up projection expands to.
-
-    Returns:
-        The detail the report line carries, naming the shapes, the launch count and the measured error.
-
-    Raises:
-        AssertionError: If the relative error exceeds the bound BF16 partial sums explain.
-    """
-    rng = np.random.default_rng(0)
-    activations = _on_bf16_grid(values=rng.standard_normal((tokens, model)).astype(np.float32))
-    up_weight = _on_bf16_grid(values=(rng.standard_normal((model, hidden)) * 0.14).astype(np.float32))
-    down_weight = _on_bf16_grid(values=(rng.standard_normal((hidden, model)) * 0.09).astype(np.float32))
-    up_bias = np.zeros(hidden, dtype=np.float32)
-    down_bias = np.zeros(model, dtype=np.float32)
-
-    # Both projections cover a token block in one launch.
-    launches = 2 * (tokens // _BLOCK_TOKENS)
-    started = time.perf_counter()
-    actual = full_ffn(
-        activations=activations, up_weight=up_weight, up_bias=up_bias,
-        down_weight=down_weight, down_bias=down_bias,
-    )
-    elapsed = time.perf_counter() - started
-
-    hidden_reference = activations.astype(np.float64) @ up_weight.astype(np.float64) + up_bias
-    activated = from_bf16_words(
-        words=gelu_lut_reference(words=as_bf16_words(values=hidden_reference.astype(np.float32)))
-    )
-    expected = activated.astype(np.float64) @ down_weight.astype(np.float64) + down_bias
-
-    error = float(np.linalg.norm(actual - expected) / np.linalg.norm(expected))
-    if error >= _FFN_ERROR_LIMIT:
-        message = (
-            f"Unable to verify the feed-forward layer against the host reference. The relative error must stay "
-            f"below {_FFN_ERROR_LIMIT:.0%}, which is what the BF16 partial sums explain, but got {error:.3%}."
-        )
-        raise AssertionError(message)
-    return (
-        f"[{tokens},{model}] @ [{model},{hidden}] -> GELU -> "
-        f"[{tokens},{hidden}] @ [{hidden},{model}], {launches} launches in {elapsed:.1f} s "
-        f"({1e6 * elapsed / launches:.0f} us each), relative error {error:.2%}"
-    )
-
-
-def check_softmax(*, rows: int = 16) -> str:
-    """Runs a row-wise softmax on the device and verifies it against the host reference.
-
-    Notes:
-        The scores are spread wide enough that the maximum matters: without subtracting it these
-        would leave the SFU exp table's non-positive domain, which `sfu.sv` asserts on. A check whose
-        scores all sat near zero would pass whether or not the subtraction happened.
-
-    Args:
-        rows: Rows to reduce, each one VREG wide.
-
-    Returns:
-        The detail the report line carries.
-
-    Raises:
-        AssertionError: If the relative error exceeds what the BF16 steps and the table explain.
-    """
-    rng = np.random.default_rng(0)
-    scores = _on_bf16_grid(values=(rng.standard_normal((rows, _VREG_ELEMENTS)) * 4.0).astype(np.float32))
-    actual = softmax_rows(scores=scores)
-    expected = softmax_reference(scores=scores)
-    error = float(np.linalg.norm(actual - expected) / np.linalg.norm(expected))
-    if error >= _SOFTMAX_ERROR_LIMIT:
-        message = (
-            f"Unable to verify the softmax against the host reference. The relative error must stay "
-            f"below {_SOFTMAX_ERROR_LIMIT:.0%}, which is what the BF16 steps and the SFU's tables "
-            f"explain, but got {error:.3%}."
-        )
-        raise AssertionError(message)
-    return f"[{rows},{_VREG_ELEMENTS}] rows, relative error {error:.2%}"
-
-
-def check_attention(*, tokens: int = 64, head: int = 64) -> str:
-    """Runs one attention head on the device and verifies it against the host reference.
-
-    Notes:
-        Three launches: a product, a softmax, a product. The transpose and the contraction padding
-        ride on the host for the reasons `attention_head` documents.
-
-    Args:
-        tokens: Tokens attended over, which the softmax fixes at one VREG's width.
-        head: Head dimension.
-
-    Returns:
-        The detail the report line carries.
-
-    Raises:
-        AssertionError: If the relative error exceeds what the chained BF16 steps explain.
-    """
-    rng = np.random.default_rng(0)
-    query, key, value = (
-        _on_bf16_grid(values=rng.standard_normal((tokens, head)).astype(np.float32))
-        for _ in range(3))
-    started = time.perf_counter()
-    actual = attention_head(query=query, key=key, value=value)
-    elapsed = time.perf_counter() - started
-    expected = attention_reference(query=query, key=key, value=value)
-    error = float(np.linalg.norm(actual - expected) / np.linalg.norm(expected))
-    if error >= _ATTENTION_ERROR_LIMIT:
-        message = (
-            f"Unable to verify one attention head against the host reference. The relative error "
-            f"must stay below {_ATTENTION_ERROR_LIMIT:.0%}, which is what a product, a softmax and a "
-            f"second product contribute in BF16, but got {error:.3%}."
-        )
-        raise AssertionError(message)
-    return (f"softmax([{tokens},{head}] @ [{head},{tokens}]) @ [{tokens},{head}] in {elapsed:.1f} s, "
-            f"relative error {error:.2%}")
-
-
-def check_fused_groups(*, tokens: int = 32, depth: int = 768, columns: int = 3072) -> str:
-    """Times and prices summing the contraction's groups on the device.
-
-    Returns:
-        The detail the report line carries.
-
-    Raises:
-        AssertionError: If the fused product drifts further than BF16 explains.
-    """
-    rng = np.random.default_rng(37)
-    activations = _on_bf16_grid(values=rng.standard_normal((tokens, depth)).astype(np.float32))
-    weights = _on_bf16_grid(values=rng.standard_normal((depth, columns)).astype(np.float32))
-    expected = activations.astype(np.float64) @ weights.astype(np.float64)
-
-    handle = upload_weights(weights)
-    try:
-        timings, errors = {}, {}
-        for label, fuse in (("host", False), ("device", True)):
-            full_gemm(activations=activations, weights=handle, fuse_groups=fuse)
-            started = time.time()
-            product = full_gemm(activations=activations, weights=handle, fuse_groups=fuse)
-            timings[label] = time.time() - started
-            errors[label] = float(
-                np.linalg.norm(product - expected) / np.linalg.norm(expected))
-    finally:
-        handle.free()
-
-    assert errors["device"] < 0.05, (
-        f"device group sum relative error {errors['device']:.4%} is too large")
-    return (f"group sum on host {timings['host'] * 1e3:.0f} ms / {errors['host']:.2%} vs "
-            f"on device {timings['device'] * 1e3:.0f} ms / {errors['device']:.2%} "
-            f"({timings['host'] / timings['device']:.2f}x, "
-            f"{errors['device'] / errors['host']:.2f}x error)")
-
-
-def check_tile_transpose(*, tiles: int = 4) -> str:
-    """Transposes tiles on the device and compares against numpy.
-
-    Returns:
-        The detail the report line carries.
-
-    Raises:
-        AssertionError: If any tile is not exactly its transpose.
-    """
-    rng = np.random.default_rng(103)
-    h_tiles = _on_bf16_grid(
-        values=rng.standard_normal((tiles * _TILE, _TILE)).astype(np.float32))
-    started = time.time()
-    actual = transpose_tiles(h_tiles)
-    elapsed = time.time() - started
-
-    expected = np.concatenate(
-        [h_tiles[i * _TILE:(i + 1) * _TILE].T for i in range(tiles)])
-    assert np.array_equal(actual, expected), (
-        f"device transpose differs by up to {np.abs(actual - expected).max():.3e}")
-    return f"{tiles} tiles of {_TILE}x{_TILE} in {elapsed * 1e3:.0f} ms, exact"
 
 
 def check_elementwise_add(*, tokens: int = 32, features: int = 768) -> str:
@@ -1892,39 +1454,6 @@ def check_elementwise_add(*, tokens: int = 32, features: int = 768) -> str:
     assert np.array_equal(actual, expected), (
         f"device sum differs from the host by up to {np.abs(actual - expected).max():.3e}")
     return f"[{tokens},{features}] + [{tokens},{features}] in {elapsed * 1e3:.0f} ms, exact"
-
-
-def check_weight_residency(*, tokens: int = 32, depth: int = 768, columns: int = 3072) -> str:
-    """Times the same product with the weights packed per call and left resident.
-
-    Returns:
-        The detail the report line carries.
-
-    Raises:
-        AssertionError: If residency changes the answer, or fails to be faster.
-    """
-    rng = np.random.default_rng(31)
-    activations = _on_bf16_grid(values=rng.standard_normal((tokens, depth)).astype(np.float32))
-    weights = _on_bf16_grid(values=rng.standard_normal((depth, columns)).astype(np.float32))
-
-    per_call = full_gemm(activations=activations, weights=weights)   # warms the image cache
-    started = time.time()
-    per_call = full_gemm(activations=activations, weights=weights)
-    packed_seconds = time.time() - started
-
-    handle = upload_weights(weights)
-    try:
-        started = time.time()
-        resident = full_gemm(activations=activations, weights=handle)
-        resident_seconds = time.time() - started
-    finally:
-        handle.free()
-
-    assert np.array_equal(per_call, resident), (
-        "resident weights changed the product; the packing or the address is wrong")
-    return (f"[{tokens},{depth}] @ [{depth},{columns}]: {packed_seconds * 1e3:.0f} ms packed "
-            f"per call vs {resident_seconds * 1e3:.0f} ms resident, "
-            f"{packed_seconds / resident_seconds:.2f}x")
 
 
 def check_prefill_attention(*, tokens: int = 20, heads: int = 12, model: int = 768) -> str:
@@ -2016,9 +1545,8 @@ def check_transformer_block(*, tokens: int = 64) -> str:
     """Runs one GPT-2 transformer block on the device and verifies it against the host reference.
 
     Notes:
-        The whole block: two LayerNorms, the fused QKV projection, twelve attention heads, the output
-        projection and both feed-forward products, all on the device. Residual adds, biases and head
-        reshaping stay on the host.
+        The whole block runs resident on the device: two LayerNorms, all four projections, every bias and
+        residual add, and twelve attention heads.
 
     Args:
         tokens: Sequence length, which the softmax fixes at one VREG's width.
@@ -2081,6 +1609,53 @@ def _kernel_and_image(key: tuple, build) -> tuple:
         cached = (kernel, bytes(kernel.image.to_bytes(pad_to=4)))
         _KERNEL_CACHE[key] = cached
     return cached
+
+
+def _compiled_gemm(*, depth: int, columns: int, activate: bool) -> bytes:
+    """Returns the compiled image that runs one GEMM shape with the contraction summed on the device.
+
+    Args:
+        depth: Contraction depth the product covers.
+        columns: Output columns the product covers.
+        activate: Determines whether the left operand passes through the GELU before it enters the array.
+
+    Returns:
+        The image bytes, padded to the loader's boundary.
+
+    Raises:
+        ValueError: If no compiled image covers the shape, or if the image drains other than one partial per
+            column tile for a block of token rows.
+    """
+    key = (depth, columns, activate)
+    cached = _COMPILED_GEMMS.get(key)
+    if cached is not None:
+        return cached
+
+    manifest = json.loads((_IMAGE_DIRECTORY / "manifest.json").read_text())
+    found = next((name for name, entry in manifest.items()
+                  if (entry["depth"], entry["columns"], entry["activate"]) == key), None)
+    if found is None:
+        message = (
+            f"Unable to launch a [{depth}, {columns}] GEMM{' activating its left operand' if activate else ''}. "
+            f"No image in {_IMAGE_DIRECTORY} covers that shape, so add it to tools/build_gpt2_images.py and rerun "
+            f"that tool on a host."
+        )
+        raise ValueError(message)
+
+    # Holds the image to the drain these drivers allocate, since an image draining any other layout writes its
+    # product into the wrong rows rather than failing.
+    expected = _ZERO_TILE_WORDS + columns // _TILE * _BLOCK_TOKENS * _TILE
+    entry = manifest[found]
+    if entry["drain_words"] != expected:
+        message = (
+            f"Unable to launch the image {found}. A product drains {expected} words, one partial per column tile, "
+            f"but the image drains {entry['drain_words']}."
+        )
+        raise ValueError(message)
+
+    image_bytes = (_IMAGE_DIRECTORY / found).read_bytes()
+    _COMPILED_GEMMS[key] = image_bytes
+    return image_bytes
 
 
 def _stage_image(image_bytes: bytes) -> int:
@@ -2278,7 +1853,7 @@ def _grouped_product(d_left, d_weights: ResidentWeights, *, heads: int, rows: in
         (name, columns // _TILE, depth, heads),
         lambda: build_looped_gemm(
             column_tiles=columns // _TILE, groups=1, activate=False,
-            fuse_groups=True, loop_blocks=depth // _BLOCK_DEPTH, batch=heads,
+            loop_blocks=depth // _BLOCK_DEPTH, batch=heads,
             batch_activation_bytes=_BLOCK_TOKENS * depth * _ELEMENT_BYTES))
     minitpuSetDevice(kernel.uio_name)
     d_image = _stage_image(image_bytes)
@@ -2317,15 +1892,6 @@ def _pad_tokens_for_launch(rows: NDArray[np.float32]) -> NDArray[np.float32]:
     return extended
 
 
-def _pad_columns(values: NDArray[np.float32], columns: int) -> NDArray[np.float32]:
-    """Zero-extends an activation's contraction to `columns`, which pads with exact zeros."""
-    if values.shape[1] >= columns:
-        return values
-    extended = np.zeros((values.shape[0], columns), dtype=np.float32)
-    extended[:, : values.shape[1]] = values
-    return extended
-
-
 def _block_weights(model: int, seed: int) -> dict:
     """Builds one block's parameters at GPT-2 initialisation scales, on the BF16 grid."""
     rng = np.random.default_rng(seed)
@@ -2358,17 +1924,9 @@ def main() -> int:
     """
     outcomes = [
         run_check(name="Halt", check=check_halt),
-        run_check(name="Command interleave", check=check_launch_interleave),
-        run_check(name="BF16 mul-add", check=check_mul_add),
         run_check(name="COPY round trip", check=check_copy_argument),
         run_check(name="Full GEMM", check=check_full_gemm),
-        run_check(name="Full single layer FFN", check=check_full_ffn),
-        run_check(name="Row-wise softmax", check=check_softmax),
-        run_check(name="Single attention head", check=check_attention),
-        run_check(name="Tile transpose on device", check=check_tile_transpose),
         run_check(name="Elementwise add on device", check=check_elementwise_add),
-        run_check(name="Weight residency", check=check_weight_residency),
-        run_check(name="Group sum on device", check=check_fused_groups),
         run_check(name="Prefill attention, all heads", check=check_prefill_attention),
         run_check(name="Decode attention, all heads", check=check_decode_attention),
         run_check(name="LayerNorm rows", check=check_layernorm),

@@ -25,7 +25,7 @@ from compiler.planner import _machine_tile  # noqa: E402
 def gemm_half_k(ap, wp, op, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
                 M: tl.constexpr = 64, N: tl.constexpr = 48, K: tl.constexpr = 192,
                 BLOCK_M: tl.constexpr = 32, BLOCK_N: tl.constexpr = 16, BLOCK_K: tl.constexpr = 32):
-    """Multiplies with a reduction step of 32, which the planner pads to the 64-depth machine quantum."""
+    """Multiplies with a reduction step of 32, which the planner pads to the 64 rows one unrolled group covers."""
     offs_k = tl.arange(0, BLOCK_K)
     for block in range(0, M, BLOCK_M):
         offs_m = block + tl.arange(0, BLOCK_M)
@@ -46,26 +46,6 @@ def gemm_quarter_k(ap, wp, op, stride_am, stride_ak, stride_bk, stride_bn, strid
                    M: tl.constexpr = 64, N: tl.constexpr = 48, K: tl.constexpr = 192,
                    BLOCK_M: tl.constexpr = 32, BLOCK_N: tl.constexpr = 16, BLOCK_K: tl.constexpr = 16):
     """Multiplies with a reduction step of 16, which the planner pads to 64."""
-    offs_k = tl.arange(0, BLOCK_K)
-    for block in range(0, M, BLOCK_M):
-        offs_m = block + tl.arange(0, BLOCK_M)
-        for tile in range(0, N, BLOCK_N):
-            offs_n = tile + tl.arange(0, BLOCK_N)
-            a = ap + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-            b = wp + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
-            accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-            for _ in range(0, K, BLOCK_K):
-                accumulator += tl.dot(tl.load(a), tl.load(b))
-                a += BLOCK_K * stride_ak
-                b += BLOCK_K * stride_bk
-            tl.store(op + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, accumulator)
-
-
-@triton.jit
-def gemm_wide_n(ap, wp, op, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
-                M: tl.constexpr = 64, N: tl.constexpr = 128, K: tl.constexpr = 192,
-                BLOCK_M: tl.constexpr = 32, BLOCK_N: tl.constexpr = 64, BLOCK_K: tl.constexpr = 64):
-    """Multiplies with a wide N tile of 64."""
     offs_k = tl.arange(0, BLOCK_K)
     for block in range(0, M, BLOCK_M):
         offs_m = block + tl.arange(0, BLOCK_M)
@@ -195,45 +175,18 @@ def _compile_helper(kernel, *, dims=None):
 class TileRelaxationTest(unittest.TestCase):
     """Verifies that relaxed tile sizes compile and pad appropriately."""
 
-    def test_sub_depth_reduction_padded(self) -> None:
-        """Asserts a reduction step of 32 is padded to the 64-depth machine quantum."""
-        matmuls, planned = _compile_helper(gemm_half_k)
-        launch = planned.launches[0]
-        self.assertEqual(matmuls[0].depth, 32)
-        self.assertEqual(launch.loop_blocks, 2)
-        pad_axes = [p.axis for p in planned.padding]
-        self.assertIn("k_tile", pad_axes)
-        k_pad = next(p for p in planned.padding if p.axis == "k_tile")
-        self.assertEqual(k_pad.extent, 32)
-        self.assertEqual(k_pad.padded, 64)
-
-        image, staging = compile_launch(launch)
-        self.assertGreater(len(image), 0)
-        self.assertEqual(staging.rows, 32)
-
-    def test_quarter_depth_reduction_padded(self) -> None:
-        """Asserts a reduction step of 16 is padded to the 64-depth machine quantum."""
-        matmuls, planned = _compile_helper(gemm_quarter_k)
-        launch = planned.launches[0]
-        self.assertEqual(matmuls[0].depth, 16)
-        self.assertEqual(launch.loop_blocks, 2)
-        pad_axes = [p.axis for p in planned.padding]
-        self.assertIn("k_tile", pad_axes)
-        k_pad = next(p for p in planned.padding if p.axis == "k_tile")
-        self.assertEqual(k_pad.extent, 16)
-        self.assertEqual(k_pad.padded, 64)
-
-        image, staging = compile_launch(launch)
-        self.assertGreater(len(image), 0)
-        self.assertEqual(staging.rows, 32)
-
-    def test_wide_tile_compiles(self) -> None:
-        """Asserts that BLOCK_N=64 compiles successfully."""
-        _, planned = _compile_helper(gemm_wide_n)
-        launch = planned.launches[0]
-        image, staging = compile_launch(launch)
-        self.assertGreater(len(image), 0)
-        self.assertEqual(launch.block_n, 64)
+    def test_a_shallow_reduction_step_is_padded(self) -> None:
+        """Asserts a reduction step shallower than two blocks is padded to the 64 rows one unrolled group covers."""
+        for kernel, depth in ((gemm_half_k, 32), (gemm_quarter_k, 16)):
+            with self.subTest(depth=depth):
+                matmuls, planned = _compile_helper(kernel)
+                launch = planned.launches[0]
+                self.assertEqual(matmuls[0].depth, depth)
+                self.assertEqual(launch.loop_blocks, 2)
+                padded = next(padding for padding in planned.padding if padding.axis == "k_tile")
+                self.assertEqual((padded.extent, padded.padded), (depth, 64))
+                _, staging = compile_launch(launch)
+                self.assertEqual(staging.rows, 32)
 
     def test_wide_columns_stand_as_written_where_the_image_fits(self) -> None:
         """Asserts a BLOCK_N of 128 runs at the width the kernel asked for, the columns spilling to VMEM."""
@@ -258,7 +211,7 @@ class TileRelaxationTest(unittest.TestCase):
         # 160 rows that tell a derived bound from a fixed one.
         tile = MatMul(rows=160, columns=16, depth=64, accumulator="f32", epilogue=frozenset(),
                       prologue=frozenset(), left_source=None, reduction=64, tile_loops=(), nest=("k",),
-                      accesses={}, stores_inside_reduction=False)
+                      accesses={})
         self.assertEqual(_machine_tile(index=0, matmul=tile)[1], 80)
         self.assertEqual(_machine_tile(index=0, matmul=replace(tile, rows=128))[1], 64)
         self.assertEqual(_machine_tile(index=0, matmul=replace(tile, rows=48))[1], 48)
@@ -275,13 +228,10 @@ class TileRelaxationTest(unittest.TestCase):
         launch = planned.launches[0]
         self.assertEqual(launch.block_m, 32)
         self.assertEqual(launch.row_blocks, 8)
+        # Reads the folded column loop as its tile while the grid walks the rows.
+        self.assertEqual(launch.column_tiles, 4)
         image, _ = compile_launch(launch)
         self.assertGreater(len(image), 0)
-
-    def test_folded_loop_beside_a_grid_axis_still_plans(self) -> None:
-        """Asserts a folded loop on one axis is read as its tile while the grid walks the other."""
-        _, planned = _compile_helper(gemm_grid_m, dims=({"m": 256},))
-        self.assertEqual(planned.launches[0].column_tiles, 4)
 
     def test_unplaceable_columns_fault_with_the_measured_image(self) -> None:
         """Asserts an image no placement fits in IRAM is refused, counting the bundles that prove it."""
@@ -297,8 +247,7 @@ class TileRelaxationTest(unittest.TestCase):
         # Reads the planner directly, since plan refuses a reducing epilogue ahead of the guard asserted here.
         reducing = MatMul(rows=128, columns=16, depth=64, accumulator="f32",
                           epilogue=frozenset({"arith.maxnumf", "arith.addf"}), prologue=frozenset(),
-                          left_source=None, reduction=64, tile_loops=(), nest=("k",), accesses={},
-                          stores_inside_reduction=False)
+                          left_source=None, reduction=64, tile_loops=(), nest=("k",), accesses={})
         with self.assertRaises(ProgramError) as ctx:
             _machine_tile(index=0, matmul=reducing)
         self.assertIn("once per machine tile", str(ctx.exception))

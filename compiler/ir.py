@@ -154,8 +154,6 @@ class MatMul:
         nest: Axis each enclosing loop walks, outermost first, holding "k" for the contraction. An axis whose loop
             ran once is absent, since canonicalization folds it before the reader sees the module.
         accesses: How each operand is addressed, keyed by role.
-        stores_inside_reduction: Determines whether the kernel writes its accumulator to memory on every step of
-            the contraction, rather than carrying it across the whole of it.
         grid_axes: Output axes the kernel's grid walks, named as the loops are. An axis the grid carries is
             walked outside the module, so it reaches a launch rather than the module and states no extent the
             plan can read from the loops. This is what tells such an axis from one whose single trip loop
@@ -173,7 +171,6 @@ class MatMul:
     tile_loops: tuple[TileLoop, ...]
     nest: tuple[str, ...]
     accesses: dict[str, Access]
-    stores_inside_reduction: bool
     grid_axes: frozenset[str] = frozenset()
     carried: tuple[Carried, ...] = ()
     epilogue_chain: tuple[Operation, ...] = ()
@@ -248,14 +245,13 @@ class Launch:
         loop_blocks: Accumulation blocks one group carries.
         activate: Determines whether each staged tile is activated entering the array, which is where this
             machine computes the transform a kernel writes ahead of its matmul.
-        fuse_groups: Determines whether groups accumulate on the device rather than draining a partial each.
         block_m: Token rows one block covers, which the emitter lays its registers out for.
         block_n: Output columns one block covers, which `column_tiles` cannot say because it counts tiles rather
             than the blocks holding them.
         nest: Axis each loop walks in the order the kernel wrote them, outermost first. The emitter walks
             `_EMITTED_NEST`, so a launch naming another order is emitted in that one.
-        partials: Partial products each column tile leaves, being one when the device sums the groups itself. A
-            block accumulating in VMEM leaves two of each, since consecutive blocks fold into opposite banks.
+        partials: Partial products each column tile leaves, being one for a block the registers hold. A block
+            accumulating in VMEM leaves two, since consecutive blocks fold into opposite banks.
     """
 
     row_blocks: int
@@ -263,7 +259,6 @@ class Launch:
     groups: int
     loop_blocks: int
     activate: bool
-    fuse_groups: bool
     block_m: int
     block_n: int
     nest: tuple[str, ...] = _EMITTED_NEST
@@ -271,9 +266,8 @@ class Launch:
 
     def __post_init__(self) -> None:
         """Settles the partial count from the block, which decides where the accumulators live."""
-        counted = 1 if self.fuse_groups else self.groups
         spilled = register_map(block_m=self.block_m, block_n=self.block_n).spilled
-        object.__setattr__(self, "partials", counted * (2 if spilled else 1))
+        object.__setattr__(self, "partials", 2 if spilled else 1)
 
     @property
     def output_tiles(self) -> int:

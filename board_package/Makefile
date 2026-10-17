@@ -12,7 +12,7 @@ help:
 	@echo "make reproduce - every headline claim in the README, in order (~6 min)"
 	@echo
 	@echo "  make identity   - which bitstream is loaded            (seconds)"
-	@echo "  make kernels    - 16/16 board checks, block 0.68 %     (~2 min)"
+	@echo "  make kernels    - the 8 board checks                   (~2 min)"
 	@echo "  make batch      - B = 1..16 give bit-identical results (~10 s)"
 	@echo "  make boundary   - the 2 activation copies a pass makes (~30 s)"
 	@echo "  make throughput - warm body time, tokens/s, FLOP rates (~60 s)"

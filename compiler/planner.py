@@ -170,9 +170,6 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
             groups=covered["k"] // (blocks * _BLOCK_DEPTH),
             loop_blocks=blocks,
             activate=_PROLOGUES[matmul.prologue] == "gelu",
-            # Places the accumulator where the kernel put it, summing the groups on the device for one it
-            # carries across the reduction and draining a partial each for one it writes to memory per step.
-            fuse_groups=not matmul.stores_inside_reduction,
             # Covers every block the nest keeps live, which is what a tile loop inside the reduction asks for
             # and the kernel's own tile otherwise.
             block_m=block_m,

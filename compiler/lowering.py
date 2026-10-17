@@ -12,7 +12,7 @@ from isa_model import PROFILE
 
 from .allocation import COMMIT, Place, Placement
 from .dataflow import CONSTANT, Trip
-from .ir import Operation, Pointwise, ProgramError, RowTerm, Rows
+from .ir import MASK, Operation, Pointwise, ProgramError, RowTerm, Rows
 
 _COMBINERS: dict[str, str] = {
     "arith.addf": "vadd",
@@ -53,6 +53,9 @@ _RECIPROCAL_REGION: str = "staged"
 _ZERO_REGION: str = "zero"
 """Region the tile of zeros lies in, which an attention block stages to clear its accumulators from."""
 
+_MASK_REGION: str = "mask"
+"""Region the mask tiles lie in, one per key block, which a trip reads its own through the key loop's counter."""
+
 _CONSTANT_REGION: str = "constant"
 """Region the tile of every other stated number lies in, one tile each in the order the trip states them."""
 
@@ -73,6 +76,9 @@ def lower_operation(operation: Operation, *, into: str, sources: tuple[str, ...]
             the operands the operation reads.
     """
     name = operation.name
+    if name == MASK:
+        _require(operation, sources=sources, wanted=2)
+        return (Combine(kind="vadd", into=into, left=sources[0], right=sources[1]),)
     if name in _COMBINERS:
         _require(operation, sources=sources, wanted=2)
         return (Combine(kind=_COMBINERS[name], into=into, left=sources[0], right=sources[1]),)
@@ -164,7 +170,7 @@ def unnameable(chain: tuple[Operation, ...]) -> tuple[str, ...]:
     Returns:
         The names, empty where every operation lowers.
     """
-    known = _COMBINERS.keys() | _TRANSFORMS.keys() | _REDUCTIONS.keys() | {_RECIPROCAL}
+    known = _COMBINERS.keys() | _TRANSFORMS.keys() | _REDUCTIONS.keys() | {_RECIPROCAL, MASK}
     return tuple(dict.fromkeys(step.name for step in chain if step.name not in known))
 
 
@@ -570,17 +576,20 @@ def _attended_product(place: Place, *, tiles: int) -> tuple[Step, ...]:
 
 
 def _stage_constants(place: Place, *, trip: Trip) -> tuple[Step, ...]:
-    """Returns the loads placing every number one operation reads into the slot it reads it from.
+    """Returns the loads placing every number and mask tile one operation reads into the slot it reads it from.
 
     Args:
         place: The operation, the region its result lands in and the region of each value it reads.
         trip: The dataflow the placement was made of, which states what number each value carries.
 
     Returns:
-        The loads, empty where the operation reads no stated number.
+        The loads, empty where the operation reads no stated number and no mask.
     """
     staged: list[Step] = []
     for operand, source in zip(place.operation.operands, place.sources, strict=True):
+        if trip.masked is not None and operand == trip.masked:
+            staged.append(Load(into=source, region=_MASK_REGION, walked=True))
+            continue
         value = trip.values.get(operand)
         if value is None or value.role != CONSTANT or value.number is None:
             continue

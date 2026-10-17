@@ -142,6 +142,9 @@ _TILE_SHIFT: int = _TILE.bit_length() - 1
 _BLOCK_SHIFT: int = _BLOCK_TOKENS.bit_length() - 1
 """Shift the AGU walks the input and the output by per iteration, each covering a token block of rows."""
 
+_KEY_LOOP_LEVEL: int = 1
+"""Loop level an attention block's key loop runs at, inside the loop walking its query blocks."""
+
 _POINTWISE_POINTERS: tuple[int, int, int] = (0, 1, 2)
 """Scalar registers holding a pointwise image's left, right and output pointers, each bound from the launch argument
 of the same position."""
@@ -185,11 +188,14 @@ class Load:
         into: Register region the tile lands in.
         region: VMEM region the tile is read from.
         tile: Which tile of that region.
+        walked: Determines whether the key loop's counter advances the tile by one per trip, so each key block
+            reads a tile of its own.
     """
 
     into: str
     region: str
     tile: int = 0
+    walked: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1031,7 +1037,9 @@ def emit_steps(put: Callable[..., None], builder: asm_module.AsmBuilder, slot: i
         if isinstance(step, Load):
             for vreg in range(_TILE_VREGS):
                 put(offset=slot, x=builder.vld(region(step.into) + vreg,
-                                               _tile_row(rows[step.region], step.tile, vreg)))
+                                               _tile_row(rows[step.region], step.tile, vreg),
+                                               agu=step.walked, shift=_TILE_SHIFT if step.walked else 0,
+                                               level=_KEY_LOOP_LEVEL if step.walked else 0))
                 slot += 1
         elif isinstance(step, Store):
             for vreg in range(_TILE_VREGS):
@@ -1072,7 +1080,7 @@ def emit_steps(put: Callable[..., None], builder: asm_module.AsmBuilder, slot: i
 def flash_attention(*, key_blocks: int, queries: int = _TILE, head: int = _VREG_ELEMENTS,
                     turnaround: int = _VMEM_TURNAROUND, body: tuple[Step, ...],
                     epilogue: tuple[Step, ...], constants: int = 0,
-                    row_blocks: int = 1) -> tuple[dict[int, dict[str, int]], Staging]:
+                    row_blocks: int = 1, masked: bool = False) -> tuple[dict[int, dict[str, int]], Staging]:
     """Returns one attention block's bundles and what a host stages for them, the scores never reaching DMEM.
 
     Args:
@@ -1085,6 +1093,8 @@ def flash_attention(*, key_blocks: int, queries: int = _TILE, head: int = _VREG_
         constants: Tiles of stated numbers the kernel reads, staged ahead of the keys.
         row_blocks: Query blocks the image walks itself, each staging its own queries and draining its own
             output, which is one launch however many blocks the problem covers.
+        masked: Determines whether each query block stages a mask tile per key block after its constants, which
+            the body's walked loads read.
 
     Returns:
         The image's bundles, keyed by offset, and the staging a host reads them back with.
@@ -1114,7 +1124,8 @@ def flash_attention(*, key_blocks: int, queries: int = _TILE, head: int = _VREG_
         )
         raise ValueError(message)
 
-    rows = _flash_vmem_map(head=head, constants=constants)
+    rows = _flash_vmem_map(head=head, constants=constants, masks=key_blocks if masked else 0)
+    staged_rows = head + (2 + constants + (key_blocks if masked else 0)) * _TILE
     tiles = registers.output_tiles
     maximum, total = _tile_registers(registers.row_max), _tile_registers(registers.row_sum)
     builder = asm_module.AsmBuilder()
@@ -1136,11 +1147,22 @@ def flash_attention(*, key_blocks: int, queries: int = _TILE, head: int = _VREG_
     # Walks the query blocks here rather than over launches, each staging its own queries into the same rows.
     put(offset=slot, f=builder.lbegin(row_blocks))
     slot += 1
-    put(offset=slot, d=builder.dma_load(0, rows["query"], head + (2 + constants) * _TILE,
-                                        _FLASH_QUERY_POINTER, _STRIDE_REGISTER))
-    slot += 1
-    put(offset=slot, f=builder.flush_slot(mask=1))
-    slot += 1
+    # Stages the block's queries, its entering tiles, its constants and its mask tiles in as many descriptors as
+    # their rows need, the query pointer walking each one's span.
+    staged = 0
+    while staged < staged_rows:
+        span = min(staged_rows - staged, _MAX_DESCRIPTOR_ROWS)
+        put(offset=slot, d=builder.dma_load(0, rows["query"] + staged, span, _FLASH_QUERY_POINTER,
+                                            _STRIDE_REGISTER))
+        slot += 1
+        put(offset=slot, f=builder.flush_slot(mask=1))
+        slot += 1
+        staged += span
+        if staged < staged_rows:
+            put(offset=slot, s=builder.saddi(rd=_FLASH_QUERY_POINTER, rs=_FLASH_QUERY_POINTER,
+                                             value=span * _ROW_BYTES))
+            slot += _SCALAR_GAP
+    walked_rows = staged - span
 
     # Enters the maximum below every score, so the first rescale multiplies by zero.
     for vreg in range(_TILE_VREGS):
@@ -1185,7 +1207,7 @@ def flash_attention(*, key_blocks: int, queries: int = _TILE, head: int = _VREG_
     slot += 1
 
     # Advances to the next block's queries and output, and rewinds the keys every block reads from the start.
-    advances = ((_FLASH_QUERY_POINTER, (head + (2 + constants) * _TILE) * _ROW_BYTES),
+    advances = ((_FLASH_QUERY_POINTER, (staged_rows - walked_rows) * _ROW_BYTES),
                 (_FLASH_OUTPUT_POINTER, head * _ROW_BYTES),
                 (_FLASH_OPERAND_POINTER, -key_blocks * 2 * head * _ROW_BYTES))
     for register, value in advances:
@@ -1204,7 +1226,7 @@ def flash_attention(*, key_blocks: int, queries: int = _TILE, head: int = _VREG_
 def flash_attention_stream(*, key_blocks: int, queries: int = _TILE, head: int = _VREG_ELEMENTS,
                            turnaround: int = _VMEM_TURNAROUND, body: tuple[Step, ...],
                            epilogue: tuple[Step, ...], constants: int = 0,
-                           row_blocks: int = 1) -> tuple[tuple[int, ...], Staging]:
+                           row_blocks: int = 1, masked: bool = False) -> tuple[tuple[int, ...], Staging]:
     """Returns one attention block as the contiguous bundle words it places.
 
     Args:
@@ -1216,13 +1238,14 @@ def flash_attention_stream(*, key_blocks: int, queries: int = _TILE, head: int =
         epilogue: The steps the block runs once the loop has ended.
         constants: Tiles of stated numbers the kernel reads, staged ahead of the keys.
         row_blocks: Query blocks the image walks itself, one launch covering all of them.
+        masked: Determines whether each query block stages a mask tile per key block.
 
     Returns:
         The bundle words in placement order, and the staging a host reads them back with.
     """
     bundles, staging = flash_attention(key_blocks=key_blocks, queries=queries, head=head,
                                        turnaround=turnaround, body=body, epilogue=epilogue,
-                                       constants=constants, row_blocks=row_blocks)
+                                       constants=constants, row_blocks=row_blocks, masked=masked)
     return _flatten(bundles), staging
 
 
@@ -2319,18 +2342,19 @@ def _emit_tile_update(put: Callable[..., None], builder: asm_module.AsmBuilder, 
     return slot + turnaround
 
 
-def _flash_vmem_map(*, head: int, constants: int = 0) -> dict[str, int]:
+def _flash_vmem_map(*, head: int, constants: int = 0, masks: int = 0) -> dict[str, int]:
     """Returns the first VMEM row of each region one attention block stages.
 
     Args:
         head: Width of the head the block accumulates, which is the rows every operand of it spans.
-        constants: Tiles of stated numbers the kernel reads, which ride the queries' own descriptor.
+        constants: Tiles of stated numbers the kernel reads, which ride the queries' own staging.
+        masks: Mask tiles each query block stages, one per key block, which follow the constants.
 
     Returns:
         The first row of each region, keyed by what it stages.
     """
     spans = (("query", head), ("initial", _TILE), ("zero", _TILE), ("constant", constants * _TILE),
-             ("key", head), ("value", head), ("output", head), ("scratch", _TILE * 2))
+             ("mask", masks * _TILE), ("key", head), ("value", head), ("output", head), ("scratch", _TILE * 2))
     rows, cursor = {}, _ROW_FLASH_BASE
     for name, span in spans:
         rows[name] = cursor

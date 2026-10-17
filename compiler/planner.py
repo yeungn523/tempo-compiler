@@ -291,7 +291,7 @@ def _attention_launch(matmuls: tuple[MatMul, ...], *, produces: int, consumes: i
     return FlashLaunch(**extents,
                        body=attention_body(placement, trip=trip, steps=extents["head"] // _TILE, tiles=tiles),
                        epilogue=attention_epilogue(trip, tiles=tiles), constants=trip.constants,
-                       entering=staged_maximum(0.0 if entering is None else entering))
+                       entering=staged_maximum(0.0 if entering is None else entering), mask=trip.mask)
 
 
 def _check_dimensions_match(*, index: int, matmul: MatMul, covered: dict[str, int],

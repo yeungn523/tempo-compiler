@@ -71,7 +71,7 @@ def main() -> int:
     bundles = len(image) // BUNDLE_BYTES
     print(f"launch  row_blocks={launch.row_blocks} key_blocks={launch.key_blocks} "
           f"queries={launch.queries} head={launch.head} entering={launch.entering:g} "
-          f"constants={len(launch.constants)}")
+          f"constants={len(launch.constants)} masked={launch.mask is not None}")
     print(f"image   {bundles} bundles over {staging.rows}x{staging.columns}, "
           f"{100 * bundles / IRAM_DEPTH:.0f}% of IRAM, draining {drain.words} words shaped {drain.shape}")
 
@@ -108,9 +108,10 @@ def _pack(*, path: pathlib.Path, launch: FlashLaunch, drain, query: np.ndarray, 
         value: Every value the block attends over.
     """
     staged, streamed = pack_attention(query, key, value, initial_maximum=launch.entering,
-                                      constants=launch.constants)
-    expected = attention_reference(query, key, value).astype(np.float32)
-    modelled = attention_bf16_reference(query, key, value, initial_maximum=launch.entering)
+                                      constants=launch.constants, masks=launch.mask_tiles)
+    expected = attention_reference(query, key, value, mask=launch.mask_scores).astype(np.float32)
+    modelled = attention_bf16_reference(query, key, value, initial_maximum=launch.entering,
+                                        mask=launch.mask_scores)
     np.savez(
         path,
         queries=staged,

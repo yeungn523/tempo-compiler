@@ -830,8 +830,8 @@ def transformer_block(hidden: NDArray[np.float32], weights: dict, *, heads: int 
     Notes:
         Both LayerNorms, all four projections, every bias and residual add and the attention run as launches
         that read the previous launch's output where it lies, so the block crosses the host boundary once on
-        entry and once on exit. Every launch outside attention runs a compiled image. Attention's 1/sqrt(head) rides
-        the query columns of the QKV projection, folded into its weights and bias before upload.
+        entry and once on exit. Every launch outside attention runs a compiled image. Attention is causal, and its
+        1/sqrt(head) rides the query columns of the QKV projection, folded into its weights and bias before upload.
 
     Args:
         hidden: [tokens, model] block input, a whole number of token blocks and at most `MAX_ATTENTION_ROWS`.
@@ -867,7 +867,7 @@ def transformer_block(hidden: NDArray[np.float32], weights: dict, *, heads: int 
         d_normed = kept(layernorm_resident(d_hidden, d_constants[0]))
         d_fused = kept(add_bias_resident(kept(gemm_resident(d_normed, d_weights["attn.qkv.w"])),
                                          d_biases["attn.qkv.b"]))
-        d_attended = kept(attention(d_fused, heads=heads, causal=False))
+        d_attended = kept(attention(d_fused, heads=heads, causal=True))
         d_projected = kept(add_bias_resident(kept(gemm_resident(d_attended, d_weights["attn.proj.w"])),
                                              d_biases["attn.proj.b"]))
         d_residual = kept(add_resident(d_hidden, d_projected))
@@ -897,7 +897,7 @@ def transformer_block_reference(hidden: NDArray[np.float32], weights: dict) -> N
     gathered = np.concatenate(
         [attention_reference(query=np.ascontiguousarray(query[:, i * head:(i + 1) * head]),
                              key=np.ascontiguousarray(key[:, i * head:(i + 1) * head]),
-                             value=np.ascontiguousarray(value[:, i * head:(i + 1) * head]))
+                             value=np.ascontiguousarray(value[:, i * head:(i + 1) * head]), causal=True)
          for i in range(heads)], axis=1)
     attended = (_on_bf16_grid(values=gathered).astype(np.float64)
                 @ weights["attn.proj.w"].astype(np.float64) + weights["attn.proj.b"]).astype(np.float32)
@@ -1162,13 +1162,27 @@ def decode_attention(
 
 
 def attention_reference(
-    query: NDArray[np.float32], key: NDArray[np.float32], value: NDArray[np.float32]
+    query: NDArray[np.float32], key: NDArray[np.float32], value: NDArray[np.float32], *, causal: bool = False
 ) -> NDArray[np.float32]:
-    """Returns the attention output a BF16 device computes, on the host."""
+    """Returns the attention output a BF16 device computes, on the host.
+
+    Args:
+        query: [tokens, head] queries.
+        key: [tokens, head] keys.
+        value: [tokens, head] values.
+        causal: Determines whether a query attends only at or before its own position, every later key's score
+            replaced by the large negative constant the device's mask adds.
+
+    Returns:
+        The [tokens, head] attention output.
+    """
     head = query.shape[1]
     scaled = _on_bf16_grid(values=(query / math.sqrt(head)).astype(np.float32))
     scores = _on_bf16_grid(values=(scaled.astype(np.float64) @ _on_bf16_grid(values=key).T
                                    .astype(np.float64)).astype(np.float32))
+    if causal:
+        later = np.arange(key.shape[0])[None, :] > np.arange(query.shape[0])[:, None]
+        scores = np.where(later, np.float32(-1.0e30), scores)
     weights = softmax_reference(scores=scores)
     return (weights.astype(np.float64) @ _on_bf16_grid(values=value).astype(np.float64)).astype(np.float32)
 
@@ -1485,7 +1499,7 @@ def check_transformer_block(*, tokens: int = 64) -> str:
 
     Notes:
         The whole block runs resident on the device: two LayerNorms, all four projections, every bias and
-        residual add, and twelve attention heads.
+        residual add, and twelve causal attention heads.
 
     Args:
         tokens: Sequence length, which the softmax fixes at one VREG's width.

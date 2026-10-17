@@ -9,9 +9,11 @@ from dataclasses import dataclass, field
 
 from triton.runtime import JITFunction
 
+from bf16 import _ENTERING_MAXIMUM
+
 from .frontend import compile_to_ttir
-from .ir import (_REDUCTION_AXIS, Access, Carried, Guard, MatMul, Operation, Pointwise, ProgramError, RowTerm,
-                 Rows, TileLoop)
+from .ir import (_REDUCTION_AXIS, MASK, Access, Affine, Carried, Guard, MatMul, Operation, Pointwise, ProgramError,
+                 RowTerm, Rows, ScoreMask, TileLoop)
 
 _ASSUMED_ACCUMULATOR_ELEMENT: str = "f32"
 """Element type a dot accumulates in when its printed result type states none."""
@@ -325,6 +327,12 @@ class _Graph:
                 continue
             if name == "tt.load" or name in _ADDRESS_OPERATIONS or operation.get_num_operands() == 0:
                 continue
+            if name == "arith.select":
+                scores, recorded = self._select_as_mask(operation)
+                found.add(recorded.name)
+                chain[id(operation)] = recorded
+                pending.append(scores)
+                continue
 
             if name not in _WIDTH_CASTS:
                 recorded = self.record(operation)
@@ -403,6 +411,97 @@ class _Graph:
     def defining(self, value):
         """Returns the operation defining a value, or None where a block argument carries it."""
         return self._definitions.get(value.id())
+
+    def induction(self, loop):
+        """Returns the induction variable one loop's body reads."""
+        return self._body_of_loop[id(loop)].get_argument(0)
+
+    def position(self, value, *, variables: dict[int, str]) -> Affine:
+        """Returns the integer position one index value computes, as the coefficient of each thing it reads.
+
+        Args:
+            value: The index value to read.
+            variables: The Affine field each loop's induction variable counts toward, keyed by its identifier.
+
+        Returns:
+            The position.
+
+        Raises:
+            ProgramError: If the value reads anything but those variables, the tile's rows and columns, and
+                integer constants, or combines them other than by addition and by multiplication with a constant.
+        """
+        placed, pending = self._position(value, variables=variables)
+        if pending:
+            message = (
+                "Unable to read an index range the comparison never places on the tile's rows or columns. A mask "
+                "compares positions of the score tile, so every range must be expanded into it."
+            )
+            raise ProgramError(message)
+        return placed
+
+    def _position(self, value, *, variables: dict[int, str]) -> tuple[Affine, int]:
+        """Returns the position one index value computes, and the coefficient of a range not yet placed on an axis."""
+        key = value.id()
+        if key in variables:
+            return Affine(**{variables[key]: 1}), 0
+        operation = self.defining(value)
+        name = None if operation is None else operation.get_name()
+        if name in ("tt.splat", "tt.broadcast", "arith.extsi", "arith.trunci"):
+            return self._position(operation.get_operand(0), variables=variables)
+        if name == "arith.constant":
+            number = self.constant(value)
+            number = self.constant_values().get(key) if number is None else number
+            if number is not None and float(number).is_integer():
+                return Affine(constant=int(number)), 0
+        elif name == "tt.make_range":
+            return Affine(constant=operation.get_int_attr("start")), 1
+        elif name == "tt.expand_dims":
+            placed, pending = self._position(operation.get_operand(0), variables=variables)
+            axis = Affine(row=pending) if operation.get_int_attr("axis") == 1 else Affine(column=pending)
+            return placed + axis, 0
+        elif name in ("arith.addi", "arith.subi"):
+            (left, left_pending), (right, right_pending) = (
+                self._position(operation.get_operand(index), variables=variables) for index in range(2))
+            sign = 1 if name == "arith.addi" else -1
+            return left + right.scaled(sign), left_pending + sign * right_pending
+        elif name == "arith.muli":
+            sides = [self._position(operation.get_operand(index), variables=variables) for index in range(2)]
+            for (scaled, pending), (factor, factor_pending) in (sides, sides[::-1]):
+                if factor_pending == 0 and factor == Affine(constant=factor.constant):
+                    return scaled.scaled(factor.constant), pending * factor.constant
+        message = (
+            f"Unable to read a position computed by {name or 'a value no operation defines'}. A mask compares "
+            f"positions built from the loops' induction variables, the tile's index ranges and integer constants, "
+            f"by addition, subtraction and multiplication by a constant."
+        )
+        raise ProgramError(message)
+
+    def _select_as_mask(self, operation) -> tuple[object, Operation]:
+        """Returns the scores one select replaces some of, and the select recorded as the mask add standing for it.
+
+        Args:
+            operation: The arith.select operation to read.
+
+        Returns:
+            The value whose elements the select keeps, and the record, which reads that value and the predicate.
+
+        Raises:
+            ProgramError: If neither or both of the selected values is a stated number.
+        """
+        numbers = self.constant_values()
+        kept, replaced = operation.get_operand(1), operation.get_operand(2)
+        stated = [self.resolve_view(choice) in numbers for choice in (kept, replaced)]
+        if stated == [True, False]:
+            kept, replaced = replaced, kept
+        elif stated != [False, True]:
+            message = (
+                "Unable to read a select choosing between two computed values or two stated numbers. The image "
+                "runs a select as a mask tile added to the scores, so one side must be a stated number."
+            )
+            raise ProgramError(message)
+        recorded = Operation(name=MASK, position=self._positions[id(operation)], result=operation.get_result(0).id(),
+                             operands=(self.resolve_view(kept), operation.get_operand(0).id()))
+        return kept, recorded
 
     def accumulated(self, value):
         """Returns what each trip adds into a running total a loop carries out from zero, or None for another value.
@@ -855,6 +954,7 @@ def read_program(kernel: JITFunction, *, signature: dict[str, str],
     stores = graph.by_name("tt.store")
     consumers = [*dots[1:], *stores]
     accumulators = graph.accumulator_elements()
+    mask = _score_mask(graph=graph)
 
     matmuls = []
     for index, dot in enumerate(dots):
@@ -906,6 +1006,7 @@ def read_program(kernel: JITFunction, *, signature: dict[str, str],
             accumulator_chain=graph.trace(dot.get_operand(2), among=dots)[2],
             product=graph.record(dot),
             constants=tuple(graph.constant_values().items()),
+            mask=mask,
         ))
     return tuple(matmuls)
 
@@ -1350,3 +1451,67 @@ def _summed(*, graph: _Graph, operation, written: _Expression):
         )
         raise ProgramError(message)
     return addend
+
+
+def _score_mask(*, graph: _Graph) -> tuple[ScoreMask, int] | None:
+    """Returns the predicate a kernel's one select replaces scores under, and the identifier the select reads it as.
+
+    Args:
+        graph: The kernel's module.
+
+    Returns:
+        The mask and the predicate's identifier, or None where the kernel selects nothing.
+
+    Raises:
+        ProgramError: If the kernel selects more than once, selects outside a loop, selects by something other than
+            one integer comparison of positions, or replaces scores by a number some score could reach.
+    """
+    selects = graph.by_name("arith.select")
+    if not selects:
+        return None
+    if len(selects) > 1:
+        message = (
+            f"Unable to read a kernel selecting {len(selects)} times. The image stages one mask tile per block pair, "
+            f"so fold the predicates into one comparison."
+        )
+        raise ProgramError(message)
+    select = selects[0]
+    loops = graph.enclosing_loops(select)
+    comparison = graph.defining(select.get_operand(0))
+    if not loops or comparison is None or comparison.get_name() != "arith.cmpi":
+        message = (
+            "Unable to read a select outside a loop or chosen by other than one arith.cmpi. A mask is one comparison "
+            "of positions inside the key loop, which the compiler evaluates for every block pair."
+        )
+        raise ProgramError(message)
+
+    key_loop, query_loop = loops[-1], (loops[-2] if len(loops) > 1 else None)
+    variables = {graph.induction(key_loop).id(): "key"}
+    if query_loop is not None:
+        variables[graph.induction(query_loop).id()] = "query"
+    numbers = graph.constant_values()
+    kept_first = graph.resolve_view(select.get_operand(2)) in numbers
+    fill = numbers[graph.resolve_view(select.get_operand(2 if kept_first else 1))]
+    if fill > _ENTERING_MAXIMUM:
+        message = (
+            f"Unable to mask scores to {fill:g}. A masked score must stay below every real one, so a select replaces "
+            f"it by {_ENTERING_MAXIMUM:g} or less, where its probability is exactly zero."
+        )
+        raise ProgramError(message)
+
+    def bounds(loop) -> tuple[int, int]:
+        """Returns the value one loop's induction variable starts at and the step it advances by."""
+        start, step = graph.constant(loop.get_operand(0)), graph.constant(loop.get_operand(2))
+        if start is None or step is None:
+            message = "Unable to read a mask whose loops start or step by values set at runtime."
+            raise ProgramError(message)
+        return start, step
+
+    key_start, key_step = bounds(key_loop)
+    query_start, query_step = (0, 0) if query_loop is None else bounds(query_loop)
+    mask = ScoreMask(predicate=comparison.get_int_attr("predicate"),
+                     left=graph.position(comparison.get_operand(0), variables=variables),
+                     right=graph.position(comparison.get_operand(1), variables=variables),
+                     keeps=kept_first, fill=fill, query_start=query_start, query_step=query_step,
+                     key_start=key_start, key_step=key_step)
+    return mask, select.get_operand(0).id()

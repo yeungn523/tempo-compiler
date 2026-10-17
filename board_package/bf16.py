@@ -451,8 +451,8 @@ def staged_maximum(stated: float) -> float:
 
 
 def pack_attention(query: NDArray[np.float32], key: NDArray[np.float32], value: NDArray[np.float32], *,
-                   initial_maximum: float,
-                   constants: tuple[float, ...] = ()) -> tuple[NDArray[np.uint16], NDArray[np.uint16]]:
+                   initial_maximum: float, constants: tuple[float, ...] = (),
+                   masks: NDArray[np.float32] | None = None) -> tuple[NDArray[np.uint16], NDArray[np.uint16]]:
     """Lays one attention block's operands out in the order its image visits them.
 
     Args:
@@ -460,12 +460,14 @@ def pack_attention(query: NDArray[np.float32], key: NDArray[np.float32], value: 
         key: Every key the block attends over, laid out as the queries are.
         value: Every value the block attends over, laid out as the queries are.
         initial_maximum: Value the running maximum enters below, which every score clears.
-        constants: Numbers the kernel states, a tile of each riding the queries' own descriptor.
+        constants: Numbers the kernel states, a tile of each riding the queries' own staging.
+        masks: The tile added to the scores of each pair of a query block and a key block, shaped [query blocks,
+            key blocks, queries, keys], or None for an unmasked kernel.
 
     Returns:
-        The query words of each block followed by the initial maximum, the zeros that block clears from and a
-        tile of every stated number, and the key and value words, each key block's transposed keys ahead of
-        its values.
+        The query words of each block followed by the initial maximum, the zeros that block clears from, a tile
+        of every stated number and its mask tiles, and the key and value words, each key block's transposed keys
+        ahead of its values.
 
     Raises:
         ValueError: If a dimension is not a whole number of tiles, or if the three operands disagree on the head
@@ -496,9 +498,10 @@ def pack_attention(query: NDArray[np.float32], key: NDArray[np.float32], value: 
     initial = np.full((_TILE, _NUM_LANES), initial_maximum, dtype=np.float32)
     cleared = np.zeros((_TILE, _NUM_LANES), dtype=np.float32)
     stated = [np.full((_TILE, _NUM_LANES), number, dtype=np.float32) for number in constants]
+    masked = [() if masks is None else tuple(masks[block]) for block in range(queries // _TILE)]
     staged = np.concatenate([piece for block in range(queries // _TILE)
                              for piece in (_by_tile(query[block * _TILE: (block + 1) * _TILE]),
-                                           initial, cleared, *stated)], axis=0)
+                                           initial, cleared, *stated, *masked[block])], axis=0)
 
     blocks: list[NDArray[np.float32]] = []
     for block in range(key.shape[0] // _TILE):
@@ -561,24 +564,28 @@ def fused_ffn_bf16_reference(activations: NDArray[np.float32], up_weight: NDArra
 
 
 def attention_reference(query: NDArray[np.float32], key: NDArray[np.float32],
-                        value: NDArray[np.float32]) -> NDArray[np.float64]:
+                        value: NDArray[np.float32], *, mask: NDArray[np.float32] | None = None) -> NDArray[np.float64]:
     """Returns the attention the block computes, in float64, for a drained image to be held against.
 
     Args:
         query: The block's queries, whose rows are tokens and columns the head.
         key: Every key the block attends over.
         value: Every value the block attends over.
+        mask: The number added to each score, one row per query and one column per key, or None for none.
 
     Returns:
         The attended output, with one row per query token.
     """
     scores = np.asarray(query, dtype=np.float64) @ np.asarray(key, dtype=np.float64).T
+    if mask is not None:
+        scores = scores + mask
     weights = np.exp(scores - scores.max(axis=1, keepdims=True))
     return (weights / weights.sum(axis=1, keepdims=True)) @ np.asarray(value, dtype=np.float64)
 
 
 def attention_bf16_reference(query: NDArray[np.float32], key: NDArray[np.float32],
-                             value: NDArray[np.float32], *, initial_maximum: float) -> NDArray[np.float32]:
+                             value: NDArray[np.float32], *, initial_maximum: float,
+                             mask: NDArray[np.float32] | None = None) -> NDArray[np.float32]:
     """Returns one attention block computed as the image computes it, rounded at every point it writes a VREG.
 
     Args:
@@ -586,6 +593,7 @@ def attention_bf16_reference(query: NDArray[np.float32], key: NDArray[np.float32
         key: Every key the block attends over.
         value: Every value the block attends over.
         initial_maximum: Value the running maximum enters below, which the image reads from its operands.
+        mask: The number added to each score, one row per query and one column per key, or None for none.
 
     Returns:
         The attended output, one BF16 container per value throughout.
@@ -605,6 +613,8 @@ def attention_bf16_reference(query: NDArray[np.float32], key: NDArray[np.float32
         for step in range(0, head, _TILE):
             piece = held(query[:, step:step + _TILE] @ keys[:, step:step + _TILE].T)
             scores = piece if step == 0 else held(scores + piece)
+        if mask is not None:
+            scores = held(scores + mask[:, block:block + _TILE])
 
         maximum = held(np.maximum(running_maximum, scores.max(axis=1, keepdims=True)))
         alpha = held(np.exp(held(running_maximum - maximum)))

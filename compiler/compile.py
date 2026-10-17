@@ -64,7 +64,8 @@ def compile_launch(launch: Launch | FusedLaunch | FlashLaunch) -> tuple[bytes, S
                                                   head=launch.head, body=launch.body,
                                                   epilogue=launch.epilogue,
                                                   constants=len(launch.constants),
-                                                  row_blocks=launch.row_blocks)
+                                                  row_blocks=launch.row_blocks,
+                                                  masked=launch.mask is not None)
         # Pins the hand placement, whose gaps carry the VMEM and staging array dependencies the hazard model
         # cannot see, so a packed image would move a load ahead of the store it reads.
         return _assemble(name="flash_attention", bundles=bundles, placements=("",),

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Provides the GEMM kernels GPT-2 small's layers compile from, a plain product and one activating its left operand.
+"""Provides the kernels GPT-2 small's layers compile from, being its GEMMs, its LayerNorms and the adds between them.
 
 A host issues each compiled image once per block of BLOCK_M token rows, the image walking every output column itself.
 """
@@ -17,6 +17,9 @@ _MODEL: int = 768
 
 _ROOT_TWO: tl.constexpr = tl.constexpr(1.4142135623730951)
 """Divisor the exact GELU scales its argument by, which Triton reaches from a kernel only as a constexpr."""
+
+_EPSILON: tl.constexpr = tl.constexpr(1e-5)
+"""Variance floor GPT-2's LayerNorm adds before taking the reciprocal square root."""
 
 
 @triton.jit
@@ -92,3 +95,76 @@ def gpt2_matmul_gelu(
                 activation_pointers += BLOCK_K * stride_ak
                 weight_pointers += BLOCK_K * stride_bk
             tl.store(output_pointer + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, accumulator)
+
+
+@triton.jit
+def gpt2_add(
+    left_pointer: "*bf16",
+    right_pointer: "*bf16",
+    output_pointer: "*bf16",
+    M: tl.constexpr = _TOKENS,
+    N: tl.constexpr = _MODEL,
+    BLOCK_M: tl.constexpr = 32,
+    BLOCK_N: tl.constexpr = 256,
+):
+    """Adds two [tokens, features] tensors element by element, being a block's residual add."""
+    for block in range(0, M, BLOCK_M):
+        offs_m = block + tl.arange(0, BLOCK_M)
+        for tile in range(0, N, BLOCK_N):
+            offsets = offs_m[:, None] * N + (tile + tl.arange(0, BLOCK_N))[None, :]
+            tl.store(output_pointer + offsets, tl.load(left_pointer + offsets) + tl.load(right_pointer + offsets))
+
+
+@triton.jit
+def gpt2_add_bias(
+    left_pointer: "*bf16",
+    bias_pointer: "*bf16",
+    output_pointer: "*bf16",
+    M: tl.constexpr = _TOKENS,
+    N: tl.constexpr = _MODEL,
+    BLOCK_M: tl.constexpr = 32,
+    BLOCK_N: tl.constexpr = 256,
+):
+    """Adds one bias row to every token row of a [tokens, features] tensor, being a projection's bias."""
+    for block in range(0, M, BLOCK_M):
+        offs_m = block + tl.arange(0, BLOCK_M)
+        for tile in range(0, N, BLOCK_N):
+            offs_n = tile + tl.arange(0, BLOCK_N)
+            offsets = offs_m[:, None] * N + offs_n[None, :]
+            bias = tl.load(bias_pointer + offs_n)
+            tl.store(output_pointer + offsets, tl.load(left_pointer + offsets) + bias[None, :])
+
+
+@triton.jit
+def gpt2_layernorm(
+    input_pointer: "*bf16",
+    gamma_pointer: "*bf16",
+    beta_pointer: "*bf16",
+    output_pointer: "*bf16",
+    M: tl.constexpr = _TOKENS,
+    N: tl.constexpr = _MODEL,
+    BLOCK_M: tl.constexpr = 32,
+    BLOCK_N: tl.constexpr = 256,
+):
+    """Normalises each token row of a [tokens, features] tensor, then scales and shifts it by gamma and beta."""
+    for block in range(0, M, BLOCK_M):
+        offs_m = block + tl.arange(0, BLOCK_M)
+        total = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for tile in range(0, N, BLOCK_N):
+            offsets = offs_m[:, None] * N + (tile + tl.arange(0, BLOCK_N))[None, :]
+            total += tl.load(input_pointer + offsets).to(tl.float32)
+        mean = tl.sum(total, 1) / N
+        squares = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for tile in range(0, N, BLOCK_N):
+            offsets = offs_m[:, None] * N + (tile + tl.arange(0, BLOCK_N))[None, :]
+            centered = tl.load(input_pointer + offsets).to(tl.float32) - mean[:, None]
+            squares += centered * centered
+        scale = tl.rsqrt(tl.sum(squares, 1) / N + _EPSILON)
+        for tile in range(0, N, BLOCK_N):
+            offs_n = tile + tl.arange(0, BLOCK_N)
+            offsets = offs_m[:, None] * N + offs_n[None, :]
+            centered = tl.load(input_pointer + offsets).to(tl.float32) - mean[:, None]
+            gamma = tl.load(gamma_pointer + offs_n).to(tl.float32)
+            beta = tl.load(beta_pointer + offs_n).to(tl.float32)
+            normalised = centered * scale[:, None] * gamma[None, :] + beta[None, :]
+            tl.store(output_pointer + offsets, normalised.to(tl.bfloat16))

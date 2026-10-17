@@ -363,6 +363,97 @@ class FlashLaunch:
 
 
 @dataclass(frozen=True, slots=True)
+class Pointwise:
+    """Describes a kernel computing every output element from the elements its operands hold at the same position.
+
+    Attributes:
+        operands: Identifier of each loaded operand in the module, the left one first.
+        broadcast_right: Determines whether the right operand is one feature row broadcast down the tokens.
+        chain: The operations between the loads and the store, in program order.
+        features: Features one token row holds.
+    """
+
+    operands: tuple[int, int]
+    broadcast_right: bool
+    chain: tuple[Operation, ...]
+    features: int
+
+
+@dataclass(frozen=True, slots=True)
+class PointwiseLaunch:
+    """Holds what one pointwise image is emitted from, the host issuing it once per token block.
+
+    Attributes:
+        chunks: Descriptor chunks one token block spans.
+        broadcast_right: Determines whether the right operand is one feature row broadcast down the tokens.
+        body: The vector operations one VREG runs.
+    """
+
+    chunks: int
+    broadcast_right: bool
+    body: tuple
+
+
+@dataclass(frozen=True, slots=True)
+class RowTerm:
+    """Describes one value a row kernel computes, as the operation producing it over the values it reads.
+
+    Attributes:
+        name: "input" for the streamed tensor's element, "row" for a per-feature row's, "constant" for a stated
+            number, "sum" for the total of its operand over a token's features, or the operation's name otherwise.
+        operands: The terms the value is computed from.
+        value: The constant's number, or the row's pointer parameter, and None otherwise.
+    """
+
+    name: str
+    operands: tuple[RowTerm, ...] = ()
+    value: float | str | None = None
+
+    @property
+    def per_token(self) -> bool:
+        """Returns whether the term holds one value per token, which every feature of that token shares."""
+        if self.name in ("constant", "sum"):
+            return True
+        if self.name in ("input", "row"):
+            return False
+        return all(operand.per_token for operand in self.operands)
+
+
+@dataclass(frozen=True, slots=True)
+class Rows:
+    """Describes a kernel computing each token's output row from that token's input row and its sums over it.
+
+    Attributes:
+        output: The term the kernel stores, per element.
+        rows: Pointer parameter of each per-feature row the output reads, in the order the signature declares them.
+        features: Features one token row holds.
+    """
+
+    output: RowTerm
+    rows: tuple[str, ...]
+    features: int
+
+
+@dataclass(frozen=True, slots=True)
+class RowLaunch:
+    """Holds what one row image is emitted from, the host issuing it once per token block.
+
+    Attributes:
+        features: Features one token row holds.
+        rows: Per-feature rows the image stages, in the order the host packs them.
+        scalars: Number each broadcast constant the image stages holds, in the order the host packs them.
+        prologue: The register loads the image runs once, before its token loop.
+        body: The operations one token runs, every register already assigned.
+    """
+
+    features: int
+    rows: int
+    scalars: tuple[float, ...]
+    prologue: tuple
+    body: tuple
+
+
+@dataclass(frozen=True, slots=True)
 class Plan:
     """Holds the launches a kernel becomes and what the host must stage for them.
 

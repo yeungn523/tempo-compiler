@@ -7,9 +7,10 @@ from numpy.typing import NDArray
 
 from asm import IRAM_DEPTH, AsmKernel
 from bf16 import _BLOCK_DEPTH, _TILE
-from emit import Staging, flash_attention_stream, fused_ffn_stream, looped_gemm_stream
+from emit import (Staging, flash_attention_stream, fused_ffn_stream, looped_gemm_stream, pointwise_stream,
+                  row_stream)
 
-from .ir import FlashLaunch, FusedLaunch, Launch, MatMul, ProgramError
+from .ir import FlashLaunch, FusedLaunch, Launch, MatMul, PointwiseLaunch, ProgramError, RowLaunch
 
 
 def stage(left: NDArray[np.float32], right: NDArray[np.float32], *, matmul: MatMul,
@@ -83,6 +84,41 @@ def compile_launch(launch: Launch | FusedLaunch | FlashLaunch) -> tuple[bytes, S
         f"narrow the tile width, where a BLOCK_N of {launch.block_n} unrolls {launch.output_tiles} output tiles"
     )
     return _assemble(name="looped_gemm", bundles=bundles, remedy=remedy), staging
+
+
+def compile_pointwise(launch: PointwiseLaunch) -> bytes:
+    """Returns the image one pointwise launch compiles to.
+
+    Args:
+        launch: The launch the planner produced.
+
+    Returns:
+        The image bytes padded to the loader's boundary.
+
+    Raises:
+        ProgramError: If the compiled bundles exceed the IRAM depth limit.
+    """
+    bundles = pointwise_stream(chunks=launch.chunks, broadcast_right=launch.broadcast_right, body=launch.body)
+    # Pins the hand placement, whose gaps carry the VMEM dependencies the hazard model cannot see.
+    return _assemble(name="pointwise", bundles=bundles, placements=("",), remedy="shorten the arithmetic it runs")
+
+
+def compile_rows(launch: RowLaunch) -> bytes:
+    """Returns the image one row launch compiles to.
+
+    Args:
+        launch: The launch the planner produced.
+
+    Returns:
+        The image bytes padded to the loader's boundary.
+
+    Raises:
+        ProgramError: If the compiled bundles exceed the IRAM depth limit.
+    """
+    bundles = row_stream(features=launch.features, rows=launch.rows, scalars=len(launch.scalars),
+                         prologue=launch.prologue, body=launch.body)
+    # Packs because the image waits on a dependent chain of reductions, which co-issuing the work between shortens.
+    return _assemble(name="rows", bundles=bundles, placements=("pack",), remedy="sum fewer values over the row")
 
 
 def _assemble(*, name: str, bundles: tuple[int, ...], remedy: str,

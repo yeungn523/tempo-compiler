@@ -74,8 +74,8 @@ scratch buffers. These costs are measured separately in `SESSION_CHECKLIST.md`.
 `make kernels` runs eight checks. Each compares the device against a host
 reference that rounds where the device rounds, so the residual is the arithmetic
 the machine actually does, not a tolerance covering an unmodelled effect. Every
-GEMM a check launches is a compiled image from `images/`, summing the whole
-contraction in the device's BF16 accumulators.
+GEMM, add and LayerNorm a check launches is a compiled image from `images/`, each
+GEMM summing the whole contraction in the device's BF16 accumulators.
 
 Summing on the device roughly doubles a deep product's error against summing
 per-group partials on the host, which is why Full GEMM sits at 0.86 % against
@@ -89,7 +89,7 @@ head's rows lying inside one group and the rest adding exact zeros.
 | Elementwise add | `[32,768] + [32,768]` | exact |
 | Prefill attention, all heads | 12 heads × 20 causal queries | 0.54 % |
 | Decode attention, all heads | 12 heads × 1 query, 48 keys | 0.67 % |
-| LayerNorm | 8 × 768 | 0.42 % |
+| LayerNorm | 32 × 768, resident | 0.54 % in RTL simulation, not yet run on the board |
 | **Transformer block** | 64 × 768, 12 heads, resident | **1.27 %** |
 
 The GEMM check runs **two** operand sets. The structured one is exactly

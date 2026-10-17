@@ -10,7 +10,8 @@ from dataclasses import dataclass, field
 from triton.runtime import JITFunction
 
 from .frontend import compile_to_ttir
-from .ir import _REDUCTION_AXIS, Access, Carried, Guard, MatMul, Operation, ProgramError, TileLoop
+from .ir import (_REDUCTION_AXIS, Access, Carried, Guard, MatMul, Operation, Pointwise, ProgramError, RowTerm,
+                 Rows, TileLoop)
 
 _ASSUMED_ACCUMULATOR_ELEMENT: str = "f32"
 """Element type a dot accumulates in when its printed result type states none."""
@@ -53,6 +54,12 @@ _WIDTH_CASTS: frozenset[str] = frozenset({"arith.extf", "arith.truncf"})
 """Operations changing an element's width alone, which a traced transform records none of. The machine stages one
 width whatever width the kernel wrote its arithmetic in, so recording them would key one fused transform under as
 many sets as there are ways to spell its precision."""
+
+_ROW_ARITHMETIC: frozenset[str] = frozenset(
+    {"arith.addf", "arith.subf", "arith.mulf", "arith.divf", "arith.maxnumf", "arith.minnumf", "math.exp",
+     "math.rsqrt"}
+)
+"""Operations a row kernel's terms are built from, each one the vector unit runs or spells as a reciprocal."""
 
 _ORDERING_PREDICATES: dict[int, tuple[bool, bool]] = {
     2: (True, False), 3: (True, True), 6: (True, False), 7: (True, True),
@@ -392,6 +399,41 @@ class _Graph:
                                  result=loop.get_result(index - 1).id(), shape=shape,
                                  chain=self.trace(yielded.get_operand(index - 1), among=among)[2]))
         return tuple(found)
+
+    def defining(self, value):
+        """Returns the operation defining a value, or None where a block argument carries it."""
+        return self._definitions.get(value.id())
+
+    def accumulated(self, value):
+        """Returns what each trip adds into a running total a loop carries out from zero, or None for another value.
+
+        Args:
+            value: The loop result to read.
+
+        Returns:
+            The addend each trip folds in, or None where the value is not a loop result entering at zero and
+            updated by one addition of the carried total and something else.
+        """
+        loop = self.defining(value)
+        if loop is None or loop.get_name() != "scf.for":
+            return None
+        index = next(position for position in range(loop.get_num_results())
+                     if loop.get_result(position).id() == value.id())
+        body, terminator = self._body_of_loop.get(id(loop)), self._yield_of_loop.get(id(loop))
+        if body is None or terminator is None:
+            return None
+        if self.constant_values().get(loop.get_operand(3 + index).id()) != 0.0:
+            return None
+        update = self.defining(terminator.get_operand(index))
+        if update is None or update.get_name() != "arith.addf":
+            return None
+        inside = body.get_argument(1 + index).id()
+        left, right = update.get_operand(0), update.get_operand(1)
+        if left.id() == inside and right.id() != inside:
+            return right
+        if right.id() == inside and left.id() != inside:
+            return left
+        return None
 
     def reduce_kind(self, operation) -> str | None:
         """Returns the operation one reduce folds its axis under, read from the region it carries.
@@ -868,6 +910,112 @@ def read_program(kernel: JITFunction, *, signature: dict[str, str],
     return tuple(matmuls)
 
 
+def read_pointwise(kernel: JITFunction, *, signature: dict[str, str], constexprs: dict[str, int]) -> Pointwise:
+    """Reads a kernel computing every output element from two operands' elements at the same position.
+
+    Args:
+        kernel: The function the triton.jit decorator returned.
+        signature: Parameter name to Triton type string, in declaration order.
+        constexprs: Values of the constexpr parameters, which fix the tile.
+
+    Returns:
+        The kernel's operands, the arithmetic between them and the features one token row holds.
+
+    Raises:
+        ProgramError: If the kernel computes a product or a reduction, stores other than once, masks an access,
+            covers part of a row, takes other than two loaded inputs, or reads one at a position its store does not
+            share.
+    """
+    graph = _Graph(compile_to_ttir(kernel, signature=signature, constexprs=constexprs), signature=signature)
+    for name in ("tt.dot", "tt.reduce"):
+        if graph.by_name(name):
+            message = (
+                f"Unable to read a pointwise kernel computing {name}. A pointwise image combines the elements its "
+                f"operands hold at one position, while a product or a reduction combines elements across positions."
+            )
+            raise ProgramError(message)
+
+    store, written = _row_major_store(graph=graph, kind="pointwise")
+    features = written.axes[0]
+
+    _, _, chain = graph.trace(store.get_operand(1), among=[])
+    produced = {operation.result for operation in chain}
+    loads = {load.get_result(0).id(): load for load in graph.by_name("tt.load")}
+    inputs = tuple(dict.fromkeys(operand for operation in chain for operand in operation.operands
+                                 if operand not in produced))
+    if len(inputs) != 2 or any(operand not in loads for operand in inputs):
+        message = (
+            f"Unable to read a pointwise kernel whose arithmetic takes {len(inputs)} inputs, "
+            f"{sum(operand not in loads for operand in inputs)} of them stated rather than loaded. A pointwise image "
+            f"stages exactly two operands from memory and holds no number of its own."
+        )
+        raise ProgramError(message)
+
+    rows = tuple(operand for operand in inputs if len(loads[operand].get_result(0).get_shape()) == 1)
+    for operand in inputs:
+        read = graph.resolve(loads[operand].get_operand(0))
+        broadcast = operand in rows and read.axes == {-1: 1} and _expands_down_tokens(graph=graph, value=operand)
+        if read.axes != written.axes and not broadcast:
+            message = (
+                f"Unable to read an operand addressed with strides {read.axes} against a store addressed with "
+                f"{written.axes}. Each operand must hold the stored element's position, or be one contiguous feature "
+                f"row broadcast down the tokens."
+            )
+            raise ProgramError(message)
+    if len(rows) == 2:
+        message = (
+            "Unable to read a pointwise kernel whose operands are both broadcast rows. The left operand streams a "
+            "[tokens, features] tensor, and only the right one may be a row."
+        )
+        raise ProgramError(message)
+    left, right = (inputs[1], inputs[0]) if inputs[0] in rows else inputs
+    return Pointwise(operands=(left, right), broadcast_right=bool(rows), chain=chain, features=features)
+
+
+def read_rows(kernel: JITFunction, *, signature: dict[str, str], constexprs: dict[str, int]) -> Rows:
+    """Reads a kernel computing each token's output row from its input row and from sums over that row.
+
+    Args:
+        kernel: The function the triton.jit decorator returned.
+        signature: Parameter name to Triton type string, in declaration order.
+        constexprs: Values of the constexpr parameters, which fix the tile.
+
+    Returns:
+        The term the kernel stores, the per-feature rows it reads and the features one token row holds.
+
+    Raises:
+        ProgramError: If the kernel computes a product, stores other than once, masks an access, covers part of a
+            row, reads a tensor other than one input and per-feature rows, or computes something the vector unit
+            does not run.
+    """
+    graph = _Graph(compile_to_ttir(kernel, signature=signature, constexprs=constexprs), signature=signature)
+    if graph.by_name("tt.dot"):
+        message = (
+            "Unable to read a row kernel computing tt.dot. A row image runs on the vector unit, and a product needs "
+            "the matrix array."
+        )
+        raise ProgramError(message)
+    store, written = _row_major_store(graph=graph, kind="row")
+    output = _row_term(graph=graph, value=store.get_operand(1), written=written, memo={})
+
+    inputs, rows = set(), set()
+    pending = [output]
+    while pending:
+        term = pending.pop()
+        pending.extend(term.operands)
+        if term.name == "input":
+            inputs.add(term.value)
+        elif term.name == "row":
+            rows.add(term.value)
+    if len(inputs) != 1:
+        message = (
+            f"Unable to read a row kernel reading {len(inputs)} [tokens, features] tensors. A row image streams "
+            f"exactly one, and every other operand must be a per-feature row or a stated number."
+        )
+        raise ProgramError(message)
+    return Rows(output=output, rows=tuple(name for name in signature if name in rows), features=written.axes[0])
+
+
 def _as_number(stated: str) -> float | None:
     """Returns the number one printed literal carries, or None where it is printed in another form.
 
@@ -1013,3 +1161,192 @@ def _annotated(annotation: str) -> str:
     if len(text) > 1 and text[0] == text[-1] and text[0] in "\"'":
         return text[1:-1]
     return text
+
+
+def _cover_whole_rows(*, graph: _Graph, store, features: int) -> None:
+    """Refuses a pointwise kernel whose loops leave part of a token row unwritten.
+
+    Args:
+        graph: The kernel's module.
+        store: The kernel's one store.
+        features: Features one token row holds.
+
+    Raises:
+        ProgramError: If no loop walks the row in steps of the stored tile and the tile is narrower than the row.
+    """
+    columns = store.get_operand(1).get_shape()[1]
+    walked = any(graph.constant(loop.get_operand(0)) == 0 and graph.constant(loop.get_operand(1)) == features
+                 and graph.constant(loop.get_operand(2)) == columns for loop in graph.enclosing_loops(store))
+    if not walked and columns != features:
+        message = (
+            f"Unable to read a pointwise kernel storing {columns}-feature tiles of {features}-feature rows. A loop "
+            f"must walk the whole row from zero in steps of the tile, since the image writes every feature."
+        )
+        raise ProgramError(message)
+
+
+def _expands_down_tokens(*, graph: _Graph, value: int) -> bool:
+    """Returns whether a loaded row is expanded along the token axis, which broadcasts it down every token."""
+    return any(graph.resolve_view(expansion.get_operand(0)) == value and expansion.get_int_attr("axis") == 0
+               for expansion in graph.by_name("tt.expand_dims"))
+
+
+def _row_major_store(*, graph: _Graph, kind: str) -> tuple[object, _Expression]:
+    """Returns a kernel's one store and its addressing, refusing one that does not write whole row-major rows.
+
+    Args:
+        graph: The kernel's module.
+        kind: The kind of kernel being read, which the diagnostics name.
+
+    Returns:
+        The store and the expression it writes through, whose token stride is the features one row holds.
+
+    Raises:
+        ProgramError: If the kernel stores other than once, masks an access, writes other than a [tokens, features]
+            tile of a row-major tensor, or leaves part of a row unwritten.
+    """
+    stores = graph.by_name("tt.store")
+    masked = [access.get_name() for access in (*graph.by_name("tt.load"), *stores)
+              if access.get_num_operands() > (2 if access.get_name() == "tt.store" else 1)]
+    if len(stores) != 1:
+        message = f"Unable to read a {kind} kernel with {len(stores)} stores. It must store one tile per trip."
+        raise ProgramError(message)
+    if masked:
+        message = (
+            f"Unable to read a {kind} kernel masking {len(masked)} of its accesses. The host lays the tensor out "
+            f"in whole tiles, so every access must be unmasked."
+        )
+        raise ProgramError(message)
+    store = stores[0]
+    written = graph.resolve(store.get_operand(0))
+    if set(written.axes) != {0, 1} or written.axes[1] != 1 or not isinstance(written.axes[0], int):
+        message = (
+            f"Unable to read a {kind} kernel whose store strides its tile by {written.axes}. It must write a "
+            f"[tokens, features] tile of a row-major tensor, features contiguous and a token row a constant apart."
+        )
+        raise ProgramError(message)
+    _cover_whole_rows(graph=graph, store=store, features=written.axes[0])
+    return store, written
+
+
+def _row_term(*, graph: _Graph, value, written: _Expression, memo: dict[int, RowTerm]) -> RowTerm:
+    """Returns the term one value of a row kernel computes, built back to the loads and numbers it reads.
+
+    Args:
+        graph: The kernel's module.
+        value: The value to read.
+        written: The expression the kernel's store writes through, which an input element is addressed as.
+        memo: The term each value already read computes, keyed by its identifier.
+
+    Returns:
+        The term.
+
+    Raises:
+        ProgramError: If the value reads memory other than an input element or a per-feature row, sums other than
+            a token's features, places a per-token value or a row along the wrong axis, or comes from an operation
+            the vector unit does not run.
+    """
+    key = value.id()
+    if key in memo:
+        return memo[key]
+    operation = graph.defining(value)
+    name = None if operation is None else operation.get_name()
+
+    def read(operand) -> RowTerm:
+        """Returns the term one operand of this operation computes."""
+        return _row_term(graph=graph, value=operand, written=written, memo=memo)
+
+    if name is None:
+        message = (
+            "Unable to read a value a loop carries in a row kernel. A carried value is read only as the running "
+            "total a sum over the row folds into."
+        )
+        raise ProgramError(message)
+    if name in _WIDTH_CASTS or name == "tt.broadcast":
+        term = read(operation.get_operand(0))
+    elif name == "tt.expand_dims":
+        term = read(operation.get_operand(0))
+        axis = operation.get_int_attr("axis")
+        if term.per_token != (axis == 1):
+            message = (
+                f"Unable to read a {'per-token value' if term.per_token else 'per-feature row'} expanded along "
+                f"axis {axis}. A value one token shares expands along the features, axis 1, and a per-feature row "
+                f"expands down the tokens, axis 0."
+            )
+            raise ProgramError(message)
+    elif name == "arith.constant":
+        number = graph.constant_values().get(key)
+        if number is None:
+            message = "Unable to read a constant a row kernel states in a form other than one number."
+            raise ProgramError(message)
+        term = RowTerm(name="constant", value=number)
+    elif name == "tt.load":
+        read_through = graph.resolve(operation.get_operand(0))
+        if read_through.base is not None and read_through.axes == written.axes:
+            term = RowTerm(name="input", value=read_through.base)
+        elif read_through.base is not None and read_through.axes == {_PENDING_AXIS: 1}:
+            term = RowTerm(name="row", value=read_through.base)
+        else:
+            message = (
+                f"Unable to read an operand addressed with strides {read_through.axes} against a store addressed "
+                f"with {written.axes}. A row kernel reads its input at the stored element's position and every other "
+                f"tensor as one contiguous per-feature row."
+            )
+            raise ProgramError(message)
+    elif name == "tt.reduce":
+        term = RowTerm(name="sum", operands=(read(_summed(graph=graph, operation=operation, written=written)),))
+    elif name in _ROW_ARITHMETIC:
+        term = RowTerm(name=name, operands=tuple(read(operation.get_operand(index))
+                                                 for index in range(operation.get_num_operands())))
+    else:
+        message = (
+            f"Unable to read {name} in a row kernel. Its terms are built from {', '.join(sorted(_ROW_ARITHMETIC))} "
+            f"and sums over a token's features, which are what the vector unit runs."
+        )
+        raise ProgramError(message)
+    memo[key] = term
+    return term
+
+
+def _summed(*, graph: _Graph, operation, written: _Expression):
+    """Returns the value a row kernel's reduce totals over a token's features, read through the loop folding it.
+
+    Args:
+        graph: The kernel's module.
+        operation: The tt.reduce operation to read.
+        written: The expression the kernel's store writes through, whose token stride is the row's features.
+
+    Returns:
+        The per-element value whose total over the row the reduce computes.
+
+    Raises:
+        ProgramError: If the reduce folds other than by addition, reduces other than the feature axis, or totals a
+            tile narrower than the row other than through a loop walking the whole row from a zero total.
+    """
+    features = written.axes[0]
+    if graph.reduce_kind(operation) != "arith.addf" or operation.get_int_attr("axis") != 1:
+        message = (
+            f"Unable to read a reduce folding by {graph.reduce_kind(operation)} along axis "
+            f"{operation.get_int_attr('axis')}. A row image sums a token's features, axis 1, and nothing else."
+        )
+        raise ProgramError(message)
+    reduced = operation.get_operand(0)
+    addend = graph.accumulated(reduced)
+    if addend is None:
+        if reduced.get_shape()[1] == features:
+            return reduced
+        message = (
+            f"Unable to read a sum over a {reduced.get_shape()[1]}-feature tile of {features}-feature rows. A tile "
+            f"narrower than the row is summed through a loop adding each tile into a total that starts at zero."
+        )
+        raise ProgramError(message)
+    loop = graph.tile_loop(graph.defining(reduced))
+    if (loop is None or loop.bound != features or loop.trips * loop.step != features
+            or loop.step != reduced.get_shape()[1]):
+        walked = "a bound set at runtime" if loop is None else f"to {loop.bound} in steps of {loop.step}"
+        message = (
+            f"Unable to read a sum whose loop walks {walked}. It must walk the whole {features}-feature row from "
+            f"zero in steps of the tile it adds."
+        )
+        raise ProgramError(message)
+    return addend

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compiles every GEMM image a GPT-2 small layer launches and writes them, with their manifest, into the board package.
+"""Compiles every image a GPT-2 small layer launches and writes them, with their manifest, into the board package.
 
 A board carries neither Triton nor the compiler, so the images are compiled here and travel to it as data.
 """
@@ -18,9 +18,11 @@ sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE / "board_package"))
 
 from bf16 import _BLOCK_TOKENS  # noqa: E402
-from compiler import ProgramError, compile_launch, plan, read_program, signature_of  # noqa: E402
+from compiler import (ProgramError, compile_launch, compile_pointwise, compile_rows, plan,  # noqa: E402
+                      plan_pointwise, plan_rows, read_pointwise, read_program, read_rows, signature_of)
 from compiler.ir import Launch  # noqa: E402
-from gpt2_triton import gpt2_matmul, gpt2_matmul_gelu  # noqa: E402
+from gpt2_triton import gpt2_add, gpt2_add_bias, gpt2_layernorm, gpt2_matmul, gpt2_matmul_gelu  # noqa: E402
+from triton.runtime import JITFunction  # noqa: E402
 
 _MODEL: int = 768
 """GPT-2 small's model width."""
@@ -33,12 +35,29 @@ _SHAPES: tuple[tuple[int, int, bool], ...] = (
 )
 """Contraction depth, output columns, and whether the left operand is activated, for each GEMM one layer launches."""
 
+_POINTWISE: tuple[tuple[str, int], ...] = (
+    ("add", _MODEL),
+    ("add_bias", _MODEL),
+    ("add_bias", 3 * _MODEL),
+    ("add_bias", 4 * _MODEL),
+)
+"""Kind and feature width of each pointwise image one layer launches, being its residual adds and its biases."""
+
+_POINTWISE_KERNELS: dict[str, JITFunction] = {"add": gpt2_add, "add_bias": gpt2_add_bias}
+"""Kernel each pointwise kind is compiled from."""
+
+_ROWS: tuple[tuple[str, int], ...] = (("layernorm", _MODEL),)
+"""Kind and feature width of each row image one layer launches, being its LayerNorms."""
+
+_ROW_KERNELS: dict[str, JITFunction] = {"layernorm": gpt2_layernorm}
+"""Kernel each row kind is compiled from."""
+
 _MANIFEST: str = "manifest.json"
 """Name the manifest is written under, beside the images it describes."""
 
 
 def main() -> int:
-    """Compiles every shape in `_SHAPES` and writes the images and the manifest.
+    """Compiles every shape in `_SHAPES`, `_POINTWISE` and `_ROWS` and writes the images and the manifest.
 
     Returns:
         Zero once every image is written.
@@ -58,6 +77,18 @@ def main() -> int:
         manifest[name] = entry
         print(f"wrote {written / name}  {len(image)} bytes  groups={entry['groups']} "
               f"loop_blocks={entry['loop_blocks']} activate={entry['activate']}")
+    for kind, features in _POINTWISE:
+        image, entry = _compile_pointwise(kind=kind, features=features)
+        name = f"{kind}_{features}.bin"
+        (written / name).write_bytes(image)
+        manifest[name] = entry
+        print(f"wrote {written / name}  {len(image)} bytes  chunks={entry['chunks']}")
+    for kind, features in _ROWS:
+        image, entry = _compile_rows(kind=kind, features=features)
+        name = f"{kind}_{features}.bin"
+        (written / name).write_bytes(image)
+        manifest[name] = entry
+        print(f"wrote {written / name}  {len(image)} bytes  rows={entry['rows']} scalars={entry['scalars']}")
     (written / _MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"wrote {written / _MANIFEST}")
     return 0
@@ -68,7 +99,7 @@ def _image_name(*, depth: int, columns: int, activate: bool) -> str:
     return f"gemm_{depth}x{columns}{'_gelu' if activate else ''}.bin"
 
 
-def _compile_gemm(*, depth: int, columns: int, activate: bool) -> tuple[bytes, dict[str, int | bool]]:
+def _compile_gemm(*, depth: int, columns: int, activate: bool) -> tuple[bytes, dict[str, int | bool | str]]:
     """Compiles one GEMM shape and returns its image and the launch fields a host issues it with.
 
     Args:
@@ -112,6 +143,7 @@ def _compile_gemm(*, depth: int, columns: int, activate: bool) -> tuple[bytes, d
 
     image, staging = compile_launch(launch)
     entry = {
+        "kind": "gemm",
         "depth": depth,
         "columns": columns,
         "activate": launch.activate,
@@ -121,6 +153,50 @@ def _compile_gemm(*, depth: int, columns: int, activate: bool) -> tuple[bytes, d
         "drain_words": staging.drain_words,
     }
     return image, entry
+
+
+def _compile_pointwise(*, kind: str, features: int) -> tuple[bytes, dict[str, int | bool | str]]:
+    """Compiles one pointwise kind at one feature width and returns its image and manifest entry.
+
+    Args:
+        kind: The pointwise kind, naming its kernel in `_POINTWISE_KERNELS`.
+        features: Features one token row holds.
+
+    Returns:
+        The image bytes, and the manifest entry recording the kind, the width and the chunks one token block spans.
+
+    Raises:
+        ProgramError: If the kernel is not one a pointwise image runs at that width.
+    """
+    kernel = _POINTWISE_KERNELS[kind]
+    declared = {parameter.name: parameter.default for parameter in kernel.params if parameter.is_constexpr}
+    pointwise = read_pointwise(kernel, signature=signature_of(kernel, operands={}),
+                               constexprs=declared | {"N": features})
+    launch = plan_pointwise(pointwise)
+    entry = {"kind": kind, "features": features, "chunks": launch.chunks, "broadcast_right": launch.broadcast_right}
+    return compile_pointwise(launch), entry
+
+
+def _compile_rows(*, kind: str, features: int) -> tuple[bytes, dict[str, int | float | list | str]]:
+    """Compiles one row kind at one feature width and returns its image and manifest entry.
+
+    Args:
+        kind: The row kind, naming its kernel in `_ROW_KERNELS`.
+        features: Features one token row holds.
+
+    Returns:
+        The image bytes, and the manifest entry recording the kind, the width, the per-feature rows the constants
+        block opens with and the number each broadcast constant after them holds.
+
+    Raises:
+        ProgramError: If the kernel is not one a row image runs at that width.
+    """
+    kernel = _ROW_KERNELS[kind]
+    declared = {parameter.name: parameter.default for parameter in kernel.params if parameter.is_constexpr}
+    rows = read_rows(kernel, signature=signature_of(kernel, operands={}), constexprs=declared | {"N": features})
+    launch = plan_rows(rows)
+    entry = {"kind": kind, "features": features, "rows": list(rows.rows), "scalars": list(launch.scalars)}
+    return compile_rows(launch), entry
 
 
 if __name__ == "__main__":

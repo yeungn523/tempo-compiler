@@ -51,7 +51,7 @@ while IFS= read -r f; do FILES+=("$f"); done < <(
   cd "$HERE" && ls board_package/minitpu/scripts/* board_package/minitpu/platform.json \
                    board_package/minitpu/overlay.dtso board_package/minitpu/u-dma-buf.ko 2>/dev/null)
 
-# The compiled GEMM images the layer drivers launch. The board carries no
+# The compiled images the layer drivers launch. The board carries no
 # compiler, so tools/build_gpt2_images.py writes them here and they travel as data.
 while IFS= read -r f; do FILES+=("$f"); done < <(
   cd "$HERE" && ls board_package/images/* 2>/dev/null)

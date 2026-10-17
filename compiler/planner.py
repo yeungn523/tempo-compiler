@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import math
 
-from bf16 import _BLOCK_DEPTH, _BLOCK_TOKENS, _TILE, _ZERO_TILE_WORDS, staged_maximum
+from bf16 import (_BLOCK_DEPTH, _BLOCK_TOKENS, _MAX_DESCRIPTOR_ROWS, _NUM_LANES, _TILE, _VREG_ELEMENTS,
+                  _ZERO_TILE_WORDS, staged_maximum)
 from layout import LayoutError, flash_register_map, register_map
 
 from .ir import (_EMITTED_NEST, _REDUCTION_AXIS, Drain, FlashLaunch, FusedLaunch, Launch, MatMul, Padding,
-                 Plan, ProgramError, Repack)
+                 Plan, Pointwise, PointwiseLaunch, ProgramError, Repack, RowLaunch, Rows)
 from .allocation import allocate
 from .dataflow import attention_trip
-from .lowering import attention_block, attention_body, attention_epilogue, attention_extents, unnameable
+from .lowering import (attention_block, attention_body, attention_epilogue, attention_extents, pointwise_body,
+                       row_body, unnameable)
 
 _MINIMUM_LOOP_BLOCKS: int = 2
 """Smallest number of accumulation blocks a group carries, set by the two way unroll of the block loop."""
@@ -204,6 +206,54 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
 
     return Plan(launches=tuple(launches), drains=tuple(drains), padding=tuple(padding), repack=tuple(repack),
                 masks_covered=tuple(masks_covered), issued_over_useful=ratio)
+
+
+def plan_pointwise(pointwise: Pointwise) -> PointwiseLaunch:
+    """Plans the image a pointwise kernel runs, which a host issues once per token block.
+
+    Args:
+        pointwise: The kernel the reader recovered.
+
+    Returns:
+        The launch.
+
+    Raises:
+        ProgramError: If one token block of the row is not a whole number of descriptor chunks, or an operation has
+            no vector operation to run as.
+    """
+    rows = _BLOCK_TOKENS * pointwise.features // _NUM_LANES
+    if pointwise.features % _TILE or rows % _MAX_DESCRIPTOR_ROWS:
+        message = (
+            f"Unable to plan a pointwise image over {pointwise.features} features. One token block of them is {rows} "
+            f"VMEM rows, which must be a whole number of the {_MAX_DESCRIPTOR_ROWS} rows one descriptor moves."
+        )
+        raise ProgramError(message)
+    return PointwiseLaunch(chunks=rows // _MAX_DESCRIPTOR_ROWS, broadcast_right=pointwise.broadcast_right,
+                           body=pointwise_body(pointwise))
+
+
+def plan_rows(rows: Rows) -> RowLaunch:
+    """Plans the image a row kernel runs, which a host issues once per token block.
+
+    Args:
+        rows: The kernel the reader recovered.
+
+    Returns:
+        The launch.
+
+    Raises:
+        ProgramError: If a row is not a whole number of VREGs or outgrows one descriptor, or the row's arithmetic
+            has no vector operation to run as or outnumbers the registers.
+    """
+    if rows.features % _VREG_ELEMENTS or rows.features // _NUM_LANES > _MAX_DESCRIPTOR_ROWS:
+        message = (
+            f"Unable to plan a row image over {rows.features} features. `vredsum` reduces one VREG, so a row must be "
+            f"a whole number of {_VREG_ELEMENTS} features, and one descriptor gathers at most "
+            f"{_MAX_DESCRIPTOR_ROWS * _NUM_LANES} of them."
+        )
+        raise ProgramError(message)
+    scalars, prologue, body = row_body(rows)
+    return RowLaunch(features=rows.features, rows=len(rows.rows), scalars=scalars, prologue=prologue, body=body)
 
 
 def _attention_launch(matmuls: tuple[MatMul, ...], *, produces: int, consumes: int) -> FlashLaunch:

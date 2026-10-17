@@ -49,14 +49,11 @@ from bf16 import (  # noqa: E402,F401  (re-exported, the operand tests importing
     build_operands,
     from_bf16_words,
     gelu_lut_reference,
-    layernorm_constants,
     pack_activations,
     pack_bias,
     pack_weights,
 )
 from kernels import (  # noqa: E402
-    build_layernorm_rows,
-    build_elementwise_add,
     build_head_copy,
     build_head_transpose,
     build_matrix_transpose,
@@ -115,7 +112,7 @@ dataclass cannot be memoised on."""
 
 
 _IMAGE_DIRECTORY: pathlib.Path = HERE / "images"
-"""Directory holding the compiled GEMM images and the manifest describing them, which a host writes through
+"""Directory holding the compiled images and the manifest describing them, which a host writes through
 `tools/build_gpt2_images.py`."""
 
 
@@ -123,8 +120,8 @@ _UIO_NAME: str = "minitpu"
 """UIO node every image launches on."""
 
 
-_COMPILED_GEMMS: dict[tuple[int, int, bool], bytes] = {}
-"""Compiled GEMM images keyed by contraction depth, output columns and activation, each read from disk once."""
+_COMPILED_IMAGES: dict[tuple, tuple[bytes, dict]] = {}
+"""Compiled images and their manifest entries, keyed by kind and shape, each read from disk once."""
 
 
 _ATTENTION_MASKS: dict[tuple, DeviceTensor] = {}
@@ -401,7 +398,11 @@ def download_activations(d_tensor: DeviceTensor) -> NDArray[np.float32]:
 
 def upload_layernorm_constants(h_gamma: NDArray[np.float32],
                                h_beta: NDArray[np.float32]) -> int:
-    """Uploads one LayerNorm's packed constants and returns their DMEM address.
+    """Uploads one LayerNorm's constants block and returns its DMEM address.
+
+    Notes:
+        The block is gamma and beta followed by every number the compiled image states, each broadcast across one
+        VREG, in the order its manifest entry lists them.
 
     Args:
         h_gamma: Per-feature scale, on the host.
@@ -409,8 +410,19 @@ def upload_layernorm_constants(h_gamma: NDArray[np.float32],
 
     Returns:
         The device address the kernel binds as its constants argument.
+
+    Raises:
+        ValueError: If no compiled LayerNorm covers the width, or its image reads other rows than gamma and beta.
     """
-    h_constants = layernorm_constants(gamma=h_gamma, beta=h_beta)
+    _, entry = _compiled_image(kind="layernorm", features=h_gamma.size)
+    if entry["rows"] != ["gamma_pointer", "beta_pointer"]:
+        message = (
+            f"Unable to pack the constants of a LayerNorm image reading the rows {entry['rows']}. These drivers "
+            f"pack gamma and then beta, so the image must read exactly those two."
+        )
+        raise ValueError(message)
+    broadcast = [np.full(_VREG_ELEMENTS, scalar, dtype=np.float32) for scalar in entry["scalars"]]
+    h_constants = as_bf16_words(values=np.concatenate([h_gamma, h_beta, *broadcast]))
     h_staging = minitpuHostAlloc(h_constants.nbytes)
     h_staging.view.view("<u2")[: h_constants.size] = h_constants
     d_address = minitpuMalloc(h_constants.nbytes)
@@ -421,10 +433,10 @@ def upload_layernorm_constants(h_gamma: NDArray[np.float32],
 
 def layernorm_resident(d_rows: DeviceTensor, d_constants: int, *,
                        d_out: DeviceTensor | None = None) -> DeviceTensor:
-    """Normalises a resident tensor in place of the layout, leaving it resident.
+    """Normalises a resident tensor through the compiled LayerNorm image, leaving it resident.
 
     Notes:
-        The kernel reads and writes in the layout a GEMM operand uses, so a normalised tensor feeds the next
+        The image reads and writes in the layout a GEMM operand uses, so a normalised tensor feeds the next
         projection where it lies rather than returning to PS DDR to be re-packed.
 
     Args:
@@ -436,21 +448,13 @@ def layernorm_resident(d_rows: DeviceTensor, d_constants: int, *,
         The normalised rows, resident.
 
     Raises:
-        ValueError: If the rows are not the model width the kernel is built for.
+        ValueError: If no compiled LayerNorm covers the rows' width.
     """
-    if d_rows.features != _MODEL_WIDTH:
-        message = (
-            f"Unable to normalise rows of {d_rows.features}. The kernel's tile count is "
-            f"derived from {_MODEL_WIDTH}, so a row must be exactly that wide."
-        )
-        raise ValueError(message)
+    image_bytes, _ = _compiled_image(kind="layernorm", features=d_rows.features)
     if d_out is None:
         d_out = _allocate_tensor(d_rows.tokens, d_rows.features)
 
-    kernel, image_bytes = _kernel_and_image(
-        ("layernorm_packed", _BLOCK_TOKENS),
-        lambda: build_layernorm_rows(rows=_BLOCK_TOKENS, packed=True))
-    minitpuSetDevice(kernel.uio_name)
+    minitpuSetDevice(_UIO_NAME)
     d_image = _stage_image(image_bytes)
     for block in range(d_rows.blocks):
         minitpuLaunchKernel(
@@ -536,7 +540,7 @@ def add_resident(d_left: DeviceTensor, d_right: DeviceTensor, *,
         The sum, resident.
 
     Raises:
-        ValueError: If the operands disagree in shape.
+        ValueError: If the operands disagree in shape, or no compiled image covers their width.
     """
     if d_left.shape != d_right.shape:
         message = (
@@ -544,22 +548,11 @@ def add_resident(d_left: DeviceTensor, d_right: DeviceTensor, *,
             f"Elementwise addition needs the same shape."
         )
         raise ValueError(message)
+    image_bytes, _ = _compiled_image(kind="add", features=d_left.features)
     if d_out is None:
         d_out = _allocate_tensor(d_left.tokens, d_left.features)
 
-    rows_per_block = _BLOCK_TOKENS * d_left.features // _NUM_LANES
-    if rows_per_block % _MAX_DESCRIPTOR_ROWS:
-        message = (
-            f"Unable to add tensors of {d_left.features} features. A block is "
-            f"{rows_per_block} VMEM rows and the kernel moves {_MAX_DESCRIPTOR_ROWS} "
-            f"per iteration, so it must divide evenly."
-        )
-        raise ValueError(message)
-    chunks = rows_per_block // _MAX_DESCRIPTOR_ROWS
-
-    kernel, image_bytes = _kernel_and_image(
-        ("add", chunks), lambda: build_elementwise_add(chunks=chunks))
-    minitpuSetDevice(kernel.uio_name)
+    minitpuSetDevice(_UIO_NAME)
     d_image = _stage_image(image_bytes)
     for block in range(d_left.blocks):
         minitpuLaunchKernel(
@@ -576,27 +569,20 @@ def add_bias_resident(d_left: DeviceTensor, d_bias: ResidentWeights, *,
         The bias is packed with each feature tile repeated across the four sublane rows, so the kernel stages
         it once and one contiguous read broadcasts it across tokens, rather than materialising a
         `[tokens, features]` tensor per layer and shape.
+
+    Raises:
+        ValueError: If the bias is not one row of the tensor's width, or no compiled image covers that width.
     """
     if d_bias.depth != 1 or d_bias.columns != d_left.features:
         raise ValueError(
             f"Unable to broadcast bias {d_bias.shape} over {d_left.shape}. The "
             "bias must be one row with the tensor's feature width."
         )
+    image_bytes, _ = _compiled_image(kind="add_bias", features=d_left.features)
     if d_out is None:
         d_out = _allocate_tensor(d_left.tokens, d_left.features)
 
-    rows_per_block = _BLOCK_TOKENS * d_left.features // _NUM_LANES
-    if rows_per_block % _MAX_DESCRIPTOR_ROWS:
-        raise ValueError(
-            f"Unable to add a bias over {d_left.features} features. A block is "
-            f"{rows_per_block} VMEM rows and the kernel moves "
-            f"{_MAX_DESCRIPTOR_ROWS} per iteration."
-        )
-    chunks = rows_per_block // _MAX_DESCRIPTOR_ROWS
-    kernel, image_bytes = _kernel_and_image(
-        ("add_bias", chunks),
-        lambda: build_elementwise_add(chunks=chunks, broadcast_right=True))
-    minitpuSetDevice(kernel.uio_name)
+    minitpuSetDevice(_UIO_NAME)
     d_image = _stage_image(image_bytes)
     for block in range(d_left.blocks):
         minitpuLaunchKernel(
@@ -838,74 +824,13 @@ def softmax_rows(scores: NDArray[np.float32]) -> NDArray[np.float32]:
     return h_result
 
 
-def layernorm_rows(
-    rows: NDArray[np.float32], gamma: NDArray[np.float32], beta: NDArray[np.float32]
-) -> NDArray[np.float32]:
-    """Applies LayerNorm to every hidden row on the device, in one launch.
-
-    Args:
-        rows: One hidden row per token, each `_MODEL_WIDTH` wide.
-        gamma: Per-feature scale.
-        beta: Per-feature shift.
-
-    Returns:
-        The normalised rows.
-
-    Raises:
-        ValueError: If the rows are not the model width.
-    """
-    count, width = rows.shape
-    if width != _MODEL_WIDTH:
-        message = (
-            f"Unable to normalise rows of {width}. The kernel's tile count is derived from "
-            f"{_MODEL_WIDTH}, so a row must be exactly that wide."
-        )
-        raise ValueError(message)
-
-    kernel, image_bytes = _kernel_and_image(
-        ("layernorm", count), lambda: build_layernorm_rows(rows=count))
-    constants = layernorm_constants(gamma=gamma, beta=beta)
-    words = as_bf16_words(values=rows).reshape(-1)
-
-    minitpuSetDevice(kernel.uio_name)
-    minitpuHostReset()
-    d_owned: list[int] = []
-    try:
-        d_image = _stage_image(image_bytes)
-
-        input_host = minitpuHostAlloc(words.nbytes)
-        input_host.view.view("<u2")[: words.size] = words
-        input_base = minitpuMalloc(words.nbytes)
-        d_owned.append(input_base)
-        minitpuMemcpy(input_base, input_host, words.nbytes, MemcpyKind.HostToDevice)
-
-        const_host = minitpuHostAlloc(constants.nbytes)
-        const_host.view.view("<u2")[: constants.size] = constants
-        const_base = minitpuMalloc(constants.nbytes)
-        d_owned.append(const_base)
-        minitpuMemcpy(const_base, const_host, constants.nbytes, MemcpyKind.HostToDevice)
-
-        h_out = minitpuHostAlloc(words.nbytes)
-        d_out = minitpuMalloc(words.nbytes)
-        d_owned.append(d_out)
-
-        minitpuLaunchKernel(d_image, len(image_bytes),
-                            args=[input_base, const_base, d_out])
-        minitpuMemcpy(h_out, d_out, words.nbytes, MemcpyKind.DeviceToHost)
-        return from_bf16_words(words=h_out.view.view("<u2")[: words.size]).reshape(count, width)
-    finally:
-        for address in d_owned:
-            minitpuFree(address)
-        minitpuHostReset()
-
-
 def transformer_block(hidden: NDArray[np.float32], weights: dict, *, heads: int = 12) -> NDArray[np.float32]:
     """Runs one GPT-2 transformer block on the device, keeping every intermediate resident in DMEM.
 
     Notes:
         Both LayerNorms, all four projections, every bias and residual add and the attention run as launches
         that read the previous launch's output where it lies, so the block crosses the host boundary once on
-        entry and once on exit. The four projections launch compiled images. Attention's 1/sqrt(head) rides
+        entry and once on exit. Every launch outside attention runs a compiled image. Attention's 1/sqrt(head) rides
         the query columns of the QKV projection, folded into its weights and bias before upload.
 
     Args:
@@ -1528,13 +1453,22 @@ def check_decode_attention(*, heads: int = 12, head: int = 64, context: int = 48
             f"relative error {error:.2%}")
 
 
-def check_layernorm(*, rows: int = 8) -> str:
-    """Runs LayerNorm over several hidden rows and verifies it against the host reference."""
+def check_layernorm(*, tokens: int = 32) -> str:
+    """Runs the compiled LayerNorm over a resident tensor and verifies it against the host reference."""
     rng = np.random.default_rng(0)
-    values = _on_bf16_grid(values=(rng.standard_normal((rows, _MODEL_WIDTH)) * 2.0).astype(np.float32))
+    values = _on_bf16_grid(values=(rng.standard_normal((tokens, _MODEL_WIDTH)) * 2.0).astype(np.float32))
     gamma = _on_bf16_grid(values=(1.0 + 0.1 * rng.standard_normal(_MODEL_WIDTH)).astype(np.float32))
     beta = _on_bf16_grid(values=(0.1 * rng.standard_normal(_MODEL_WIDTH)).astype(np.float32))
-    actual = layernorm_rows(rows=values, gamma=gamma, beta=beta)
+    d_rows, d_constants = upload_activations(values), upload_layernorm_constants(gamma, beta)
+    try:
+        d_normed = layernorm_resident(d_rows, d_constants)
+        try:
+            actual = download_activations(d_normed)
+        finally:
+            d_normed.free()
+    finally:
+        d_rows.free()
+        minitpuFree(d_constants)
     expected = layernorm_reference(rows=values, gamma=gamma, beta=beta)
     error = float(np.linalg.norm(actual - expected) / np.linalg.norm(expected))
     if error >= _SOFTMAX_ERROR_LIMIT:
@@ -1543,7 +1477,7 @@ def check_layernorm(*, rows: int = 8) -> str:
             f"below {_SOFTMAX_ERROR_LIMIT:.0%}, but got {error:.3%}."
         )
         raise AssertionError(message)
-    return f"[{rows},{_MODEL_WIDTH}] rows, relative error {error:.2%}"
+    return f"[{tokens},{_MODEL_WIDTH}] rows compiled, relative error {error:.2%}"
 
 
 def check_transformer_block(*, tokens: int = 64) -> str:
@@ -1631,36 +1565,50 @@ def _compiled_gemm(*, depth: int, columns: int, activate: bool) -> bytes:
         ValueError: If no compiled image covers the shape, or if the image drains other than one partial per
             column tile for a block of token rows.
     """
-    key = (depth, columns, activate)
-    cached = _COMPILED_GEMMS.get(key)
+    image_bytes, entry = _compiled_image(kind="gemm", depth=depth, columns=columns, activate=activate)
+    # Holds the image to the drain these drivers allocate, since an image draining any other layout writes its
+    # product into the wrong rows rather than failing.
+    expected = _ZERO_TILE_WORDS + columns // _TILE * _BLOCK_TOKENS * _TILE
+    if entry["drain_words"] != expected:
+        message = (
+            f"Unable to launch the [{depth}, {columns}] GEMM image. A product drains {expected} words, one partial "
+            f"per column tile, but the image drains {entry['drain_words']}."
+        )
+        raise ValueError(message)
+    return image_bytes
+
+
+def _compiled_image(*, kind: str, **shape: int | bool) -> tuple[bytes, dict]:
+    """Returns the compiled image of one kind and shape, and the manifest entry describing it.
+
+    Args:
+        kind: The kind of launch the image runs, as the manifest names it.
+        shape: The fields the image's entry must carry, such as its depth, columns or features.
+
+    Returns:
+        The image bytes padded to the loader's boundary, and its manifest entry.
+
+    Raises:
+        ValueError: If no compiled image carries that kind and shape.
+    """
+    key = (kind, *sorted(shape.items()))
+    cached = _COMPILED_IMAGES.get(key)
     if cached is not None:
         return cached
 
     manifest = json.loads((_IMAGE_DIRECTORY / "manifest.json").read_text())
     found = next((name for name, entry in manifest.items()
-                  if (entry["depth"], entry["columns"], entry["activate"]) == key), None)
+                  if entry["kind"] == kind and all(entry.get(field) == value for field, value in shape.items())), None)
     if found is None:
+        stated = ", ".join(f"{field}={value}" for field, value in shape.items())
         message = (
-            f"Unable to launch a [{depth}, {columns}] GEMM{' activating its left operand' if activate else ''}. "
-            f"No image in {_IMAGE_DIRECTORY} covers that shape, so add it to tools/build_gpt2_images.py and rerun "
-            f"that tool on a host."
+            f"Unable to launch the {kind} image with {stated}. No image in {_IMAGE_DIRECTORY} covers that shape, so "
+            f"add it to tools/build_gpt2_images.py and rerun that tool on a host."
         )
         raise ValueError(message)
-
-    # Holds the image to the drain these drivers allocate, since an image draining any other layout writes its
-    # product into the wrong rows rather than failing.
-    expected = _ZERO_TILE_WORDS + columns // _TILE * _BLOCK_TOKENS * _TILE
-    entry = manifest[found]
-    if entry["drain_words"] != expected:
-        message = (
-            f"Unable to launch the image {found}. A product drains {expected} words, one partial per column tile, "
-            f"but the image drains {entry['drain_words']}."
-        )
-        raise ValueError(message)
-
-    image_bytes = (_IMAGE_DIRECTORY / found).read_bytes()
-    _COMPILED_GEMMS[key] = image_bytes
-    return image_bytes
+    cached = ((_IMAGE_DIRECTORY / found).read_bytes(), manifest[found])
+    _COMPILED_IMAGES[key] = cached
+    return cached
 
 
 def _stage_image(image_bytes: bytes) -> int:
@@ -1934,7 +1882,7 @@ def main() -> int:
         run_check(name="Elementwise add on device", check=check_elementwise_add),
         run_check(name="Prefill attention, all heads", check=check_prefill_attention),
         run_check(name="Decode attention, all heads", check=check_decode_attention),
-        run_check(name="LayerNorm rows", check=check_layernorm),
+        run_check(name="LayerNorm", check=check_layernorm),
         run_check(name="Transformer block", check=check_transformer_block),
     ]
     print(f"\n{sum(outcomes)} of {len(outcomes)} checks passed")

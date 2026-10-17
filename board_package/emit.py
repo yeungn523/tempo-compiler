@@ -21,8 +21,14 @@ from bf16 import (  # noqa: E402
     _BLOCK_DEPTH,
     _BLOCK_TOKENS,
     _BLOCK_WEIGHT_BYTES,
+    _LN_ROW_OUT,
+    _LN_ROW_X,
     _MAX_DESCRIPTOR_ROWS,
     _NUM_SUBLANES,
+    _ROW_ADD_BIAS,
+    _ROW_ADD_LEFT,
+    _ROW_ADD_OUT,
+    _ROW_ADD_RIGHT,
     _ROW_FLASH_BASE,
     _ROW_BYTES,
     _STEPS,
@@ -30,6 +36,7 @@ from bf16 import (  # noqa: E402
     _TILE_ROWS,
     _TILE_VREGS,
     _TOKEN_GROUPS,
+    _VMEM_ENTRIES_PER_LANE,
     _VMEM_SLOT_STRIDE,
     _VREG_ELEMENTS,
     _ZERO_TILE_BYTES,
@@ -134,6 +141,26 @@ _TILE_SHIFT: int = _TILE.bit_length() - 1
 
 _BLOCK_SHIFT: int = _BLOCK_TOKENS.bit_length() - 1
 """Shift the AGU walks the input and the output by per iteration, each covering a token block of rows."""
+
+_POINTWISE_POINTERS: tuple[int, int, int] = (0, 1, 2)
+"""Scalar registers holding a pointwise image's left, right and output pointers, each bound from the launch argument
+of the same position."""
+
+POINTWISE_LEFT: int = 0
+"""VREG a pointwise body reads its left operand from."""
+
+POINTWISE_RIGHT: int = 1
+"""VREG a pointwise body reads its right operand from."""
+
+_POINTWISE_TILE_SHIFT: int = (_MAX_DESCRIPTOR_ROWS // _BLOCK_TOKENS * _NUM_SUBLANES).bit_length() - 1
+"""Shift the AGU walks a broadcast row by per chunk, a chunk spanning that many replicated rows of feature tiles."""
+
+_ALU_KINDS: frozenset[str] = frozenset({"vadd", "vsub", "vmul", "vmax", "vmin"})
+"""Vector operations the ALU runs, whose results land after its writeback."""
+
+_ROW_POINTERS: tuple[int, int, int] = (0, 1, 2)
+"""Scalar registers holding a row image's input, constants and output pointers, each bound from the launch argument
+of the same position."""
 
 
 @dataclass(frozen=True)
@@ -258,6 +285,51 @@ class Accumulate:
     tile: int
     operand: str
     store: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class VectorOp:
+    """Describes one vector operation a pointwise body runs on every VREG it walks.
+
+    Attributes:
+        kind: The builder mnemonic the operation issues as, such as "vadd".
+        into: The VREG the result lands in.
+        sources: The VREGs the operation reads, in operand order.
+    """
+
+    kind: str
+    into: int
+    sources: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RowLoad:
+    """Describes one VREG a row image loads from the regions it stages.
+
+    Attributes:
+        into: The VREG the load lands in.
+        region: "input" for the token's own row, "row" for a per-feature row, or "scalar" for a broadcast constant.
+        index: Which per-feature row or constant the load reads, zero for the input.
+        tile: Which VREG of the row the load reads, zero for a constant.
+    """
+
+    into: int
+    region: str
+    index: int
+    tile: int
+
+
+@dataclass(frozen=True, slots=True)
+class RowStore:
+    """Describes one VREG of the output row a row image stores.
+
+    Attributes:
+        source: The VREG holding the result.
+        tile: Which VREG of the output row it fills.
+    """
+
+    source: int
+    tile: int
 
 
 Step = Load | Store | Product | Combine | Transform | RowReduce | Accumulate
@@ -1152,6 +1224,244 @@ def flash_attention_stream(*, key_blocks: int, queries: int = _TILE, head: int =
                                        turnaround=turnaround, body=body, epilogue=epilogue,
                                        constants=constants, row_blocks=row_blocks)
     return _flatten(bundles), staging
+
+
+def pointwise(*, chunks: int, broadcast_right: bool, body: tuple[VectorOp, ...]) -> dict[int, dict[str, int]]:
+    """Returns the bundles of a pointwise image, which runs `body` on every VREG of one token block.
+
+    Notes:
+        Each chunk moves `_MAX_DESCRIPTOR_ROWS` rows of every operand into VMEM, runs the body one VREG at a time, and
+        moves the result back out. A broadcast right operand is staged once, its feature tiles replicated across the
+        sublanes, and each chunk reads its own tiles through the AGU. The body reuses its registers on every VREG,
+        so each operation issues once its operands have landed and the result is stored before the next VREG loads.
+
+    Args:
+        chunks: Descriptor chunks one token block spans.
+        broadcast_right: Determines whether the right operand is one feature row broadcast down the tokens.
+        body: The operations one VREG runs, reading the left operand from `POINTWISE_LEFT` and the right one from
+            `POINTWISE_RIGHT`, and leaving the result in the last operation's `into`.
+
+    Returns:
+        The image's bundles, keyed by offset.
+
+    Raises:
+        ValueError: If the chunk count is not positive or the body runs no operation.
+    """
+    if chunks < 1 or not body:
+        message = (
+            f"Unable to emit a pointwise image over {chunks} chunks running {len(body)} operations. It needs at "
+            f"least one chunk and one operation."
+        )
+        raise ValueError(message)
+
+    builder = asm_module.AsmBuilder()
+    bundles: dict[int, dict[str, int]] = {}
+
+    def put(*, offset: int, **slots: int) -> None:
+        """Merges slot words into one bundle, so co-issue reads at the call site."""
+        _merge(bundles=bundles, offset=offset, slots=slots)
+
+    left, right, output = _POINTWISE_POINTERS
+    put(offset=0, s=builder.smovi(rd=_STRIDE_REGISTER, value=_ROW_BYTES))
+    for at, pointer in enumerate(_POINTWISE_POINTERS, start=1):
+        put(offset=at, s=builder.smov_arg(rd=pointer, arg=pointer))
+    at = len(_POINTWISE_POINTERS) + _SCALAR_GAP
+
+    if broadcast_right:
+        rows = chunks * _MAX_DESCRIPTOR_ROWS // _BLOCK_TOKENS * _NUM_SUBLANES
+        staged = 0
+        while staged < rows:
+            span = min(rows - staged, _MAX_DESCRIPTOR_ROWS)
+            put(offset=at, d=builder.dma_load(slot=1, vmem_address=_ROW_ADD_BIAS + staged, rows=span,
+                                              base_sreg=right, stride_sreg=_STRIDE_REGISTER))
+            put(offset=at + 1, f=builder.flush_slot(mask=2))
+            at += 2
+            staged += span
+            if staged < rows:
+                at = _emit_split_advance(put=put, builder=builder, at=at, register=right,
+                                         delta=span * _ROW_BYTES, gap=_SCALAR_GAP)
+
+    put(offset=at, f=builder.lbegin(chunks))
+    put(offset=at + 1, d=builder.dma_load(slot=0, vmem_address=_ROW_ADD_LEFT, rows=_MAX_DESCRIPTOR_ROWS,
+                                          base_sreg=left, stride_sreg=_STRIDE_REGISTER))
+    at += 2
+    if not broadcast_right:
+        put(offset=at, d=builder.dma_load(slot=1, vmem_address=_ROW_ADD_RIGHT, rows=_MAX_DESCRIPTOR_ROWS,
+                                          base_sreg=right, stride_sreg=_STRIDE_REGISTER))
+        at += 1
+    put(offset=at, f=builder.flush_slot(mask=1 if broadcast_right else 3))
+    at += 1
+
+    load_latency = RTL_PARAMS["WB_W_VLD"] + 1
+    vregs_per_tile = _BLOCK_TOKENS // _NUM_SUBLANES
+    for vreg in range(_MAX_DESCRIPTOR_ROWS // _NUM_SUBLANES):
+        row = _NUM_SUBLANES * vreg
+        put(offset=at, x=builder.vld(vreg=POINTWISE_LEFT, row=_ROW_ADD_LEFT + row))
+        if broadcast_right:
+            right_load = builder.vld(vreg=POINTWISE_RIGHT, row=_ROW_ADD_BIAS + vreg // vregs_per_tile * _NUM_SUBLANES,
+                                     agu=True, shift=_POINTWISE_TILE_SHIFT, level=0)
+        else:
+            right_load = builder.vld(vreg=POINTWISE_RIGHT, row=_ROW_ADD_RIGHT + row)
+        put(offset=at + 1, x=right_load)
+        at = _emit_vector_body(put=put, builder=builder,
+                               ready={POINTWISE_LEFT: at + load_latency, POINTWISE_RIGHT: at + 1 + load_latency},
+                               body=body)
+        put(offset=at, x=builder.vst(vreg=body[-1].into, row=_ROW_ADD_OUT + row))
+        at += 1
+
+    put(offset=at, d=builder.dma_store(slot=0, vmem_address=_ROW_ADD_OUT, rows=_MAX_DESCRIPTOR_ROWS,
+                                       base_sreg=output, stride_sreg=_STRIDE_REGISTER))
+    put(offset=at + 1, f=builder.flush_slot(mask=1))
+    at += 2
+    advanced = (left, output) if broadcast_right else (left, right, output)
+    for pointer in advanced:
+        put(offset=at, s=builder.saddi(rd=pointer, rs=pointer, value=_MAX_DESCRIPTOR_ROWS * _ROW_BYTES))
+        at += 1
+    # Closes the chunk loop on the bundle carrying the last pointer advance, as the hand schedule does.
+    put(offset=at - 1, f=builder.loop_end())
+    put(offset=at, f=builder.halt())
+    return bundles
+
+
+def pointwise_stream(*, chunks: int, broadcast_right: bool, body: tuple[VectorOp, ...]) -> tuple[int, ...]:
+    """Returns a pointwise image as the contiguous bundle words it places.
+
+    Args:
+        chunks: Descriptor chunks one token block spans.
+        broadcast_right: Determines whether the right operand is one feature row broadcast down the tokens.
+        body: The operations one VREG runs.
+
+    Returns:
+        The bundle words in placement order.
+    """
+    return _flatten(pointwise(chunks=chunks, broadcast_right=broadcast_right, body=body))
+
+
+def row_stream(*, features: int, rows: int, scalars: int, prologue: tuple[RowLoad, ...],
+               body: tuple[RowLoad | VectorOp | RowStore, ...]) -> tuple[int, ...]:
+    """Returns a row image, which runs `body` once per token of one token block, as one operation per bundle.
+
+    Notes:
+        The constants block, holding the per-feature rows and then the broadcast constants, is staged once and the
+        prologue's loads are taken from it before the token loop. Each trip gathers one token's feature tiles, which
+        lie a token block of rows apart in DMEM, into contiguous VMEM rows through the descriptor stride, so every
+        VREG of the row holds one token's features. The body is emitted unplaced, leaving co-issue to the packing
+        pass that every operation's register dependencies drive.
+
+    Args:
+        features: Features one token row holds.
+        rows: Per-feature rows the constants block opens with.
+        scalars: Broadcast constants the constants block closes with, one VREG each.
+        prologue: The constant loads run once, before the token loop.
+        body: The operations one token runs.
+
+    Returns:
+        The bundle words in program order.
+
+    Raises:
+        ValueError: If a row is not a whole number of VREGs, or the staged regions do not fit beneath the output.
+    """
+    width_rows = features // _TILE
+    if features <= 0 or features % _VREG_ELEMENTS or width_rows > _MAX_DESCRIPTOR_ROWS:
+        message = (
+            f"Unable to emit a row image over {features} features. `vredsum` reduces one VREG, so a row must be a "
+            f"whole number of {_VREG_ELEMENTS} features, and one descriptor gathers at most {_MAX_DESCRIPTOR_ROWS} "
+            f"rows of it."
+        )
+        raise ValueError(message)
+    constants_row = _LN_ROW_X + width_rows
+    constants_rows = rows * width_rows + scalars * _NUM_SUBLANES
+    if constants_row + constants_rows > _LN_ROW_OUT or _LN_ROW_OUT + width_rows > _VMEM_ENTRIES_PER_LANE:
+        message = (
+            f"Unable to place a row image's regions. The token's row and the constants occupy VMEM rows "
+            f"[{_LN_ROW_X}:{constants_row + constants_rows}), which must end by the output at row {_LN_ROW_OUT}."
+        )
+        raise ValueError(message)
+
+    builder = asm_module.AsmBuilder()
+    words: list[dict[str, int]] = []
+
+    def emit(**slots: int) -> None:
+        """Appends one bundle carrying the given slot words."""
+        words.append(slots)
+
+    def region_row(load: RowLoad) -> int:
+        """Returns the VMEM row one load reads."""
+        if load.region == "input":
+            return _LN_ROW_X + _NUM_SUBLANES * load.tile
+        if load.region == "row":
+            return constants_row + load.index * width_rows + _NUM_SUBLANES * load.tile
+        return constants_row + rows * width_rows + load.index * _NUM_SUBLANES
+
+    source, constants, output = _ROW_POINTERS
+    emit(s=builder.smovi(rd=_STRIDE_REGISTER, value=_ROW_BYTES))
+    for pointer in _ROW_POINTERS:
+        emit(s=builder.smov_arg(rd=pointer, arg=pointer))
+    for _ in range(_SCALAR_GAP - 1):
+        emit()
+    staged = 0
+    while staged < constants_rows:
+        span = min(constants_rows - staged, _MAX_DESCRIPTOR_ROWS)
+        emit(d=builder.dma_load(slot=0, vmem_address=constants_row + staged, rows=span, base_sreg=constants,
+                                stride_sreg=_STRIDE_REGISTER))
+        emit(f=builder.flush_slot(mask=1))
+        staged += span
+        if staged < constants_rows:
+            emit(s=builder.saddi(rd=constants, rs=constants, value=span * _ROW_BYTES))
+            for _ in range(_SCALAR_GAP - 1):
+                emit()
+    # Strides the gather by one feature tile of the packed block, so the descriptor reads a token's tiles in turn.
+    emit(s=builder.smovi(rd=_STRIDE_REGISTER, value=_BLOCK_TOKENS * _ROW_BYTES))
+    for _ in range(_SCALAR_GAP - 1):
+        emit()
+    for load in prologue:
+        emit(x=builder.vld(vreg=load.into, row=region_row(load)))
+
+    emit(f=builder.lbegin(_BLOCK_TOKENS))
+    emit(d=builder.dma_load(slot=0, vmem_address=_LN_ROW_X, rows=width_rows, base_sreg=source,
+                            stride_sreg=_STRIDE_REGISTER))
+    emit(s=builder.saddi(rd=source, rs=source, value=_ROW_BYTES))
+    emit(f=builder.flush_slot(mask=1))
+    for operation in body:
+        if isinstance(operation, RowLoad):
+            emit(x=builder.vld(vreg=operation.into, row=region_row(operation)))
+        elif isinstance(operation, RowStore):
+            emit(x=builder.vst(vreg=operation.source, row=_LN_ROW_OUT + _NUM_SUBLANES * operation.tile))
+        else:
+            names = ("va", "vb")[:len(operation.sources)]
+            emit(e=getattr(builder, operation.kind)(vd=operation.into,
+                                                    **dict(zip(names, operation.sources, strict=True))))
+    emit(d=builder.dma_store(slot=0, vmem_address=_LN_ROW_OUT, rows=width_rows, base_sreg=output,
+                             stride_sreg=_STRIDE_REGISTER))
+    emit(f=builder.flush_slot(mask=1))
+    emit(s=builder.saddi(rd=output, rs=output, value=_ROW_BYTES))
+    emit(f=builder.loop_end())
+    emit(f=builder.halt())
+    return _flatten(dict(enumerate(words)))
+
+
+def _emit_vector_body(*, put: Callable[..., None], builder: asm_module.AsmBuilder, ready: dict[int, int],
+                      body: tuple[VectorOp, ...]) -> int:
+    """Places a pointwise body's operations in order, each once its operands have landed.
+
+    Args:
+        put: Merges slot words into the bundle at one offset.
+        builder: Encodes each slot word.
+        ready: Offset each loaded VREG lands at, which the body's own results extend.
+        body: The operations to place.
+
+    Returns:
+        The offset the last result lands at, where its store may issue.
+    """
+    landed = dict(ready)
+    for operation in body:
+        at = max(landed[source] for source in operation.sources)
+        names = ("va", "vb")[:len(operation.sources)]
+        put(offset=at, e=getattr(builder, operation.kind)(vd=operation.into,
+                                                          **dict(zip(names, operation.sources, strict=True))))
+        writeback = RTL_PARAMS["WB_W_ALU"] if operation.kind in _ALU_KINDS else RTL_PARAMS["WB_W_SFU"]
+        landed[operation.into] = at + writeback + 1
+    return landed[body[-1].into]
 
 
 def _innermost_staging(*, nest: tuple[LoopLevel, ...], operands: tuple[StagedOperand, ...],

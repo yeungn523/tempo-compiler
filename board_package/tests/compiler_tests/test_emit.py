@@ -21,8 +21,8 @@ sys.path.insert(0, str(_HERE / "minitpu_runtime"))
 import asm  # noqa: E402
 import bf16  # noqa: E402
 import emit  # noqa: E402
-import kernels  # noqa: E402
 import numpy as np  # noqa: E402
+from compiler_tests import hand_images  # noqa: E402
 from compiler_tests.test_layout import renaming_onto  # noqa: E402
 from layout import register_map  # noqa: E402
 
@@ -50,9 +50,8 @@ class EmitterSerialisationTest(unittest.TestCase):
                     for loop_blocks in (2, 4, 6):
                         with self.subTest(activate=activate, column_tiles=column_tiles,
                                           groups=groups, loop_blocks=loop_blocks):
-                            hand = kernels.build_looped_gemm(
-                                column_tiles, groups, activate=activate,
-                                loop_blocks=loop_blocks).image.assemble(pad_to=4)
+                            hand = hand_images.looped_gemm(column_tiles, groups, activate=activate,
+                                                           loop_blocks=loop_blocks)
                             derived = asm.AsmKernel(
                                 name="looped_gemm",
                                 bundles=emit.looped_gemm_stream(

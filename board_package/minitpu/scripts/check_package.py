@@ -34,11 +34,11 @@ def require(path: pathlib.Path, *, minimum_bytes: int = 1) -> bool:
     non-zero size alone reads as success.
     """
     if not path.is_file():
-        print(f"  MISSING: {path.relative_to(HERE)}")
+        print(f"  missing: {path.relative_to(HERE)}")
         return False
     size = path.stat().st_size
     if size < minimum_bytes:
-        print(f"  TRUNCATED: {path.relative_to(HERE)} ({size} bytes, expected {minimum_bytes} or more)")
+        print(f"  truncated: {path.relative_to(HERE)} ({size} bytes, expected {minimum_bytes} or more)")
         return False
     print(f"  {path.relative_to(HERE)} ({size} bytes)")
     return True
@@ -62,7 +62,7 @@ def check_sources_are_not_truncated() -> bool:
         if path.stat().st_size == 0 and rel not in DELIBERATELY_EMPTY:
             empty.append(rel)
     if empty:
-        print(f"  TRUNCATED ({len(empty)} of {counted} source files are empty):")
+        print(f"  truncated ({len(empty)} of {counted} source files are empty):")
         for rel in empty[:10]:
             print(f"    {rel}")
         if len(empty) > 10:
@@ -72,8 +72,8 @@ def check_sources_are_not_truncated() -> bool:
     return True
 
 
-def check_kernels_assemble() -> bool:
-    """The strongest cheap statement: the images this package exists to run build.
+def check_assembler_runs() -> bool:
+    """Assembles the halt image, which imports the assembler and the ISA model it schedules against.
 
     Catches a partial file that is non-empty but cut mid-statement, which a size
     check cannot see.
@@ -83,15 +83,15 @@ def check_kernels_assemble() -> bool:
 
     probe = (
         "import sys; sys.path[:0] = [%r, %r]; "
-        "import kernels; "
-        "n = len(bytes(kernels.single_halt.image.to_bytes(pad_to=4))); "
-        "assert n > 0; print('  kernels assemble (%%d bytes for the halt image)' %% n)"
+        "import asm; "
+        "n = len(asm.AsmKernel(name='halt', bundles=(asm.AsmBuilder().halt(),)).to_bytes(pad_to=4)); "
+        "assert n > 0; print('  the assembler runs (%%d bytes for the halt image)' %% n)"
     ) % (str(HERE), str(HERE / "minitpu_runtime"))
     result = subprocess.run(
         [sys.executable, "-c", probe], capture_output=True, text=True
     )
     if result.returncode != 0:
-        print("  KERNELS FAILED TO ASSEMBLE:")
+        print("  the assembler failed to build the halt image:")
         for line in result.stderr.strip().splitlines()[-6:]:
             print(f"    {line}")
         return False
@@ -105,8 +105,8 @@ def main() -> int:
              and require(OVERLAY) and require(UDMABUF_MODULE))
     print("\npackage integrity:")
     sources = check_sources_are_not_truncated()
-    kernels = check_kernels_assemble() if sources else False
-    if not (blobs and sources and kernels):
+    assembles = check_assembler_runs() if sources else False
+    if not (blobs and sources and assembles):
         return 1
     print("\npackage OK")
     return 0

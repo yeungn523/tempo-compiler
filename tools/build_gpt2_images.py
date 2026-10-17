@@ -22,8 +22,8 @@ from compiler import (ProgramError, compile_copy, compile_launch, compile_pointw
                       compile_resident_attention, compile_rows, plan, plan_pointwise, plan_rows, read_pointwise,
                       read_program, read_rows, signature_of)
 from compiler.ir import FlashLaunch, Launch  # noqa: E402
-from gpt2_triton import (gpt2_add, gpt2_add_bias, gpt2_attention, gpt2_layernorm, gpt2_matmul,  # noqa: E402
-                         gpt2_matmul_gelu)
+from gpt2_triton import (gpt2_add, gpt2_add_bias, gpt2_attention, gpt2_decode_attention,  # noqa: E402
+                         gpt2_layernorm, gpt2_matmul, gpt2_matmul_gelu)
 from triton.runtime import JITFunction  # noqa: E402
 
 _MODEL: int = 768
@@ -56,6 +56,10 @@ _ROW_KERNELS: dict[str, JITFunction] = {"layernorm": gpt2_layernorm}
 
 _ATTENTION: tuple[tuple[int, int], ...] = ((64, 12),)
 """Tokens and heads of each attention image one layer launches, the key loop's length fixed by the tokens."""
+
+_DECODE_KEYS: tuple[int, ...] = tuple(range(_BLOCK_TOKENS, 1024 + 1, _BLOCK_TOKENS))
+"""Cache lengths a decode image is built for, one per token block up to GPT-2's context, a step using the shortest
+that holds its cache and masking the keys past its length."""
 
 _COPIES: tuple[tuple[int, int], ...] = (
     (2 * _MODEL // _TILE * _BLOCK_TOKENS, _ROW_BYTES),
@@ -108,6 +112,12 @@ def main() -> int:
         (written / entry["constants"]).write_bytes(constants)
         manifest[name] = entry
         print(f"wrote {written / name}  {len(image)} bytes  key_blocks={entry['key_blocks']} heads={heads}")
+    for keys in _DECODE_KEYS:
+        image, entry = _compile_decode(keys=keys, heads=12)
+        name = f"decode_attention_{keys}.bin"
+        (written / name).write_bytes(image)
+        manifest[name] = entry
+    print(f"wrote {len(_DECODE_KEYS)} decode attention images, {_DECODE_KEYS[0]} to {_DECODE_KEYS[-1]} keys")
     for rows, stride in _COPIES:
         name = f"copy_{rows}x{stride}.bin"
         image = compile_copy(rows=rows, stride=stride)
@@ -255,6 +265,39 @@ def _compile_attention(*, tokens: int, heads: int) -> tuple[bytes, bytes, dict[s
     entry = {"kind": "attention", "tokens": tokens, "heads": heads, "key_blocks": launch.key_blocks,
              "constants": f"attention_{tokens}_constants.bin"}
     return image, constants.tobytes(), entry
+
+
+def _compile_decode(*, keys: int, heads: int) -> tuple[bytes, dict[str, int | float | list | str]]:
+    """Compiles GPT-2's decode attention over one cache length and returns its image and manifest entry.
+
+    Args:
+        keys: Keys the cache holds, a whole number of token blocks, which fixes the key loop's length.
+        heads: Heads the fused QKV tensor and the cache carry.
+
+    Returns:
+        The image bytes, and the manifest entry recording what a host packs the constants block from, its mask
+        tiles being the host's to write for each step's length.
+
+    Raises:
+        ProgramError: If the kernel does not plan as one masked attention launch.
+    """
+    declared = {parameter.name: parameter.default for parameter in gpt2_decode_attention.params
+                if parameter.is_constexpr}
+    matmuls = read_program(gpt2_decode_attention, signature=signature_of(gpt2_decode_attention, operands={}),
+                           constexprs=declared | {"N": keys, "LENGTH": keys})
+    planned = plan(matmuls, strides={})
+    launch = planned.launches[0]
+    if len(planned.launches) != 1 or not isinstance(launch, FlashLaunch) or launch.mask is None:
+        message = (
+            f"Unable to compile GPT-2's decode attention over {keys} keys into one image. It must plan as one masked "
+            f"attention launch, but got {len(planned.launches)} launches."
+        )
+        raise ProgramError(message)
+    model_tiles = _MODEL // _TILE
+    image = compile_resident_attention(launch, heads=heads, fused_tiles=3 * model_tiles, cache_tiles=2 * model_tiles)
+    entry = {"kind": "decode_attention", "keys": keys, "heads": heads, "entering": launch.entering,
+             "stated": list(launch.constants)}
+    return image, entry
 
 
 if __name__ == "__main__":

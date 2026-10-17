@@ -1,18 +1,14 @@
-"""Provides the layouts that say where a tensor's elements live, and what each one costs.
+"""Provides the register maps and the VMEM allocator that say where an image's values live.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from bf16 import (_MAX_DESCRIPTOR_ROWS, _NUM_LANES, _ROW_BYTES, _TILE, _TILE_VREGS,
+from bf16 import (_MAX_DESCRIPTOR_ROWS, _TILE, _TILE_VREGS,
                   _VMEM_ENTRIES_PER_LANE)
 from isa_model import PROFILE
 from asm import AGU_SHIFT_W
-
-
-TOKEN = "token"
-FEATURE_TILE = "feature_tile"
 
 
 class LayoutError(ValueError):
@@ -21,162 +17,6 @@ class LayoutError(ValueError):
     Raised rather than repaired, because an inserted relayout is a launch and a launch costs about 1.2 ms of fixed time
     however little it moves.
     """
-
-
-@dataclass(frozen=True)
-class Tiled:
-    """Describes a DMEM layout, being where element `(*index, feature)` of a tensor lives.
-
-        lane = feature mod NUM_LANES
-        row  = sum(index[i] * strides[i]) + (feature div NUM_LANES) * tile_stride
-
-    Attributes:
-        shape: The logical shape, whose last axis is features. A stacked per-head operand is rank three, so the
-            rank is not fixed at two.
-        strides: Row stride per leading axis, one shorter than `shape`.
-        tile_stride: Rows between one feature tile and the next.
-        replicated: Determines whether one row stands for every entry of the leading axis, which is what a bias
-            is.
-    """
-
-    shape: tuple[int, ...]
-    strides: tuple[int, ...]
-    tile_stride: int
-    replicated: bool = False
-
-    def __post_init__(self) -> None:
-        if len(self.shape) < 2:
-            message = (
-                f"Unable to lay out a rank-{len(self.shape)} tensor. The last axis "
-                f"is features and there must be at least one axis before it."
-            )
-            raise LayoutError(message)
-        if len(self.strides) != len(self.shape) - 1:
-            message = (
-                f"Unable to lay out shape {self.shape} with {len(self.strides)} "
-                f"strides. One per leading axis is {len(self.shape) - 1}."
-            )
-            raise LayoutError(message)
-        if self.shape[-1] % _NUM_LANES:
-            message = (
-                f"Unable to lay out {self.shape[-1]} features. A row is "
-                f"{_NUM_LANES} lanes and a partial row has no encoding."
-            )
-            raise LayoutError(message)
-
-    def __str__(self) -> str:
-        tag = ", replicated" if self.replicated else ""
-        return (f"Tiled(shape={self.shape}, strides={self.strides}, "
-                f"tile_stride={self.tile_stride}{tag})")
-
-
-    @staticmethod
-    def packed(rows: int, features: int) -> "Tiled":
-        """Returns the layout `pack_activations` writes, being `row = feature_tile * rows + token`."""
-        return Tiled((rows, features), (1,), rows)
-
-    @staticmethod
-    def weights(depth: int, columns: int) -> "Tiled":
-        """Returns the layout `pack_weights` writes, being `row = column_tile * depth + k`."""
-        return Tiled((depth, columns), (1,), depth)
-
-    @staticmethod
-    def row_major(rows: int, features: int) -> "Tiled":
-        """Returns the host's own order, which reaches the device only through a transpose."""
-        return Tiled((rows, features), (features // _NUM_LANES,), 1)
-
-    @staticmethod
-    def token_major(rows: int, features: int) -> "Tiled":
-        """Returns the layout the packed softmax stages, being `row = token * stride + tile`.
-
-        The transpose of `packed`, so an access walking feature tiles reads consecutive rows.
-        """
-        return Tiled((rows, features), (rows_per_token(features // _NUM_LANES),), 1)
-
-    @staticmethod
-    def broadcast(rows: int, features: int) -> "Tiled":
-        """Returns the layout of one row standing for `rows` of them, which is what a bias is."""
-        return Tiled((rows, features), (0,), 1, replicated=True)
-
-    @staticmethod
-    def stacked(count: int, rows: int, features: int, *, stride: int) -> "Tiled":
-        """Returns `count` packed operands end to end, each starting `stride` rows past the last."""
-        return Tiled((count, rows, features), (stride, 1), rows)
-
-
-    @property
-    def feature_tiles(self) -> int:
-        """Returns the feature tiles one entry spans."""
-        return self.shape[-1] // _NUM_LANES
-
-    @property
-    def token_stride(self) -> int:
-        """Returns the rows one step along the token axis moves."""
-        return self.strides[-1]
-
-    @property
-    def leading_stride(self) -> int:
-        """Returns the rows between consecutive entries of the outermost axis."""
-        return self.strides[0]
-
-    def extent_rows(self) -> int:
-        """Returns the rows one entry of the outermost axis occupies."""
-        return self.feature_tiles * self.tile_stride
-
-    def rows_between_sublanes(self, axis: str) -> int:
-        """Returns the rows between consecutive sublanes of a VREG walking `axis`.
-
-        One means the access is readable as it lies, a `vld` reading NUM_SUBLANES consecutive rows and nothing else.
-        """
-        if axis == TOKEN:
-            return self.token_stride
-        if axis == FEATURE_TILE:
-            return self.tile_stride
-        message = f"Unable to walk axis {axis!r}; it is {TOKEN!r} or {FEATURE_TILE!r}."
-        raise LayoutError(message)
-
-    def descriptor_stride_bytes(self) -> int:
-        """Returns the DMA row stride in bytes, walking the token axis."""
-        return self.token_stride * _ROW_BYTES
-
-    def advance_after(self, inner_walk_rows: int) -> int:
-        """Returns the rows to move after the inner loops, on top of what they already walked.
-
-        Args:
-            inner_walk_rows: Rows the enclosed loops advance on their own.
-
-        Returns:
-            The residual advance, which may be zero or negative.
-        """
-        return self.leading_stride - inner_walk_rows
-
-    def composes_with(self, other: "Tiled") -> bool:
-        """Determines whether a consumer in `other` reads this layout without a relayout."""
-        return (self.token_stride == other.token_stride
-                and self.tile_stride == other.tile_stride)
-
-    def require_composes(self, other: "Tiled", *, producer: str, consumer: str) -> None:
-        """Raises unless `other` reads this layout as it lies.
-
-        Raises:
-            LayoutError: Naming both layouts and the cheapest fix. A relayout is a
-                launch here, so this never inserts one.
-        """
-        if self.composes_with(other):
-            return
-        if self.token_stride == other.token_stride:
-            fix = (f"change one tile_stride: {self.tile_stride} vs "
-                   f"{other.tile_stride}. A DMA descriptor names its own "
-                   f"destination row, so restriding on the way in is free.")
-        else:
-            fix = (f"the token strides differ ({self.token_stride} vs "
-                   f"{other.token_stride}), so this needs a scatter -- a launch.")
-        message = (
-            f"Unable to feed {producer} into {consumer} as it lies. "
-            f"{producer} is {self}, {consumer} wants {other}. Cheapest fix: {fix}"
-        )
-        raise LayoutError(message)
-
 
 
 @dataclass(frozen=True)

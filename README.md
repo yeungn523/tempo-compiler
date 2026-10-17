@@ -104,6 +104,8 @@ so each one runs from the repository root with no `PYTHONPATH` export.
 | `tools/gen_isa_doc.py`            | Regenerates or checks every artifact derived from the ISA source            |
 | `tools/run_on_board.py`           | Compiles one kernel or several and runs them over a single SSH session      |
 | `tools/build_gpt2_images.py`      | Compiles every image a GPT-2 small layer launches                           |
+| `tools/export_gpt2_weights.py`    | Downloads GPT-2 small and writes its weights and tokenizer for the board    |
+| `tools/prepare_board.sh`          | Exports the weights, builds the images and deploys it all to a board        |
 
 ### Compiling and Checking a Kernel
 
@@ -181,13 +183,15 @@ plus a tolerance.
 ### Deploying to the Board
 
 ```sh
-python3 tools/build_gpt2_images.py
-tools/deploy_board.sh <netid> 187
+tools/prepare_board.sh <netid> 187
 ```
 
-The first line compiles the GEMM and add images the layer drivers in `gpt2_kernels.py` launch, which the board cannot
-do itself because it carries neither Triton nor the compiler. Rerun it after any change to the emitter or to
-`gpt2_triton.py`.
+A board erases its home directory whenever no session holds it, so run this after every login with a session held
+open on the board. It exports GPT-2's weights and tokenizer, builds every compiled image and deploys them with the
+package, and a rerun downloads nothing.
+
+The board cannot compile the images itself, because it carries neither Triton nor the compiler, so rerun the script
+after any change to the emitter or to `gpt2_triton.py`.
 
 The deploy's first argument is your own login on the board and the second is the last octet of the board's address.
 Every file is copied and then verified by md5, because a `tar | ssh` deploy once reported success while writing zero

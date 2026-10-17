@@ -1,16 +1,8 @@
-"""Provides the board address map that translates kernel pointers into control-plane COPY addresses.
-
-The authoritative map ships beside a bitstream as platform.json, and the constants here are the fallback.
-"""
+"""Provides the board address map that translates kernel pointers into control-plane COPY addresses."""
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
-
-_PLATFORM_JSON_NAME: str = "platform.json"
-"""Name of the address-map file the Vivado build emits beside a bitstream."""
 
 
 @dataclass(frozen=True)
@@ -167,44 +159,6 @@ uninitialised DRAM 2 GiB away.
 
 _ADDRESS_SPACE: DeviceAddressSpace | None = ZCU104_ADDRESS_SPACE
 """Process-wide map used by allocation and COPY, defaulting to the board these packages ship for."""
-
-
-def address_space_from_platform_json(path: str | Path) -> DeviceAddressSpace:
-    """Builds the address space from the platform.json a bitstream build emitted.
-
-    Raises:
-        ValueError: When the file omits any of the four required aperture facts.
-    """
-    facts = json.loads(Path(path).read_text())
-    missing = {"copy_base", "copy_size", "kernel_base", "kernel_size"} - facts.keys()
-    if missing:
-        message = f"Unable to read the address space from {path}. The file is missing {sorted(missing)}."
-        raise ValueError(message)
-    return DeviceAddressSpace(
-        copy_base=int(facts["copy_base"]),
-        copy_size=int(facts["copy_size"]),
-        kernel_base=int(facts["kernel_base"]),
-        kernel_size=int(facts["kernel_size"]),
-        kernel_alias_copy_base=(
-            None if facts.get("kernel_alias_copy_base") is None else int(facts["kernel_alias_copy_base"])
-        ),
-    )
-
-
-def load_packaged_address_space(search_dir: str | Path) -> DeviceAddressSpace | None:
-    """Loads the map packaged with a bitstream directory.
-
-    Returns:
-        The packaged address space, or None when the directory carries no platform.json, since a package built
-        before that file existed runs on the built-in constants.
-    """
-    candidate = Path(search_dir) / _PLATFORM_JSON_NAME
-    try:
-        present = candidate.is_file()
-    except OSError:
-        # Degrades to the built-in constants rather than aborting a launch on an unreadable package directory.
-        return None
-    return address_space_from_platform_json(candidate) if present else None
 
 
 def minitpuConfigureAddressSpace(address_space: DeviceAddressSpace) -> None:

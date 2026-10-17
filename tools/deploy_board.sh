@@ -28,33 +28,27 @@ remote_of() {
 
 mapfile -t FILES < <(cd "$HERE" && ls board_package/*.py board_package/minitpu_runtime/**/*.py 2>/dev/null)
 FILES+=("board_package/minitpu/minitpu_zcu104.bit.bin")
-# The Makefile IS the documented interface -- `make reproduce` is how the README
-# says to reproduce every headline claim -- so shipping the sources while leaving
-# the entry point to whatever copy is on the board defeats the point.
+# The Makefile is how the board is driven, so it ships under the same gate as the
+# sources rather than leaving the board on whatever copy it last received.
 FILES+=("board_package/Makefile" "board_package/README.md")
 
-# The board-runnable tools go over the SAME md5 gate. They used to be pushed by
-# hand, which left the board carrying whatever copy was pushed last: a check of
-# seven of them found three stale, one of them the tool whose numbers were being
-# quoted. A measurement tool that disagrees with the repository is the stale-copy
-# failure this script exists to prevent, so it is not a separate class of file.
-BOARD_TOOLS=(bench_throughput check_batch_invariance demo_bank_conflicts
-             demo_layout_cost demo_memory_cost pilot_launch_cost trace_boundary)
-for t in "${BOARD_TOOLS[@]}"; do
-  [ -f "$HERE/tools/$t.py" ] && FILES+=("tools/$t.py")
-done
-
-# The scripts that PROGRAM the board were not shipped either -- `sudo make
-# minitpu` ran whatever copy happened to be there. They and the platform files
-# the runtime reads go over the gate too, and they keep their subdirectory.
+# The scripts that program the board, and the overlay and module they load, go
+# over the gate too and keep their subdirectory, so `sudo make minitpu` never runs
+# a stale copy.
 while IFS= read -r f; do FILES+=("$f"); done < <(
-  cd "$HERE" && ls board_package/minitpu/scripts/* board_package/minitpu/platform.json \
-                   board_package/minitpu/overlay.dtso board_package/minitpu/u-dma-buf.ko 2>/dev/null)
+  cd "$HERE" && ls board_package/minitpu/scripts/* board_package/minitpu/overlay.dtso \
+                   board_package/minitpu/u-dma-buf.ko 2>/dev/null)
 
 # The compiled images the layer drivers launch. The board carries no
 # compiler, so tools/build_gpt2_images.py writes them here and they travel as data.
 while IFS= read -r f; do FILES+=("$f"); done < <(
   cd "$HERE" && ls board_package/images/* 2>/dev/null)
+
+# GPT-2's weights and tokenizer, which tools/export_gpt2_weights.py writes here
+# on a host. A board that never ran the export carries none.
+for f in board_package/gpt2_weights.npz board_package/gpt2_vocab.json board_package/gpt2_merges.txt; do
+  [ -f "$HERE/$f" ] && FILES+=("$f")
+done
 
 # scp creates no directories, and a board erases the home directory once no
 # session holds it, so every directory a copy lands in is made first.

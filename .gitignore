@@ -231,8 +231,10 @@ CLAUDE.md
 tools/check_codegen.py
 tools/golden/
 
-# GPT-2 weights, exported on a host and copied to the board
+# GPT-2 weights and tokenizer, exported on a host and copied to the board
 board_package/gpt2_weights.npz
+board_package/gpt2_vocab.json
+board_package/gpt2_merges.txt
 
 # Personal notes
 TODO.txt

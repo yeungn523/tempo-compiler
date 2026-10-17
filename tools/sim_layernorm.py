@@ -18,6 +18,7 @@ sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent))
 sys.path.insert(0, str(_HERE.parent / "board_package"))
 sys.path.insert(0, str(_HERE.parent / "board_package" / "minitpu_runtime"))
+sys.path.insert(0, str(_HERE.parent / "board_package" / "tests"))
 
 from bf16 import (  # noqa: E402
     _BLOCK_TOKENS,
@@ -31,8 +32,8 @@ from bf16 import (  # noqa: E402
     pack_activations,
 )
 from build_gpt2_images import _compile_rows  # noqa: E402
+from compiler_tests.hand_images import layernorm_rows  # noqa: E402
 from gpt2_kernels import layernorm_reference  # noqa: E402
-from kernels import build_layernorm_rows  # noqa: E402
 from sim_gemm import _run_image  # noqa: E402
 
 _TOLERANCE: float = 0.01
@@ -61,7 +62,7 @@ def simulate(*, build_dir: str | None = None, max_cycles: int = _MAX_CYCLES) -> 
     broadcast = [np.full(_VREG_ELEMENTS, scalar, dtype=np.float32) for scalar in entry["scalars"]]
     compiled = _normalised(image=image, values=values, build_dir=build_dir, max_cycles=max_cycles,
                            constants=as_bf16_words(values=np.concatenate([gamma, beta, *broadcast])))
-    hand = _normalised(image=build_layernorm_rows(rows=_BLOCK_TOKENS, packed=True).image.to_bytes(pad_to=4),
+    hand = _normalised(image=layernorm_rows(),
                        values=values, constants=layernorm_constants(gamma=gamma, beta=beta), build_dir=build_dir,
                        max_cycles=max_cycles)
     expected = layernorm_reference(rows=values, gamma=gamma, beta=beta)

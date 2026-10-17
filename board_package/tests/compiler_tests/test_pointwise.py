@@ -21,7 +21,7 @@ import triton.language as tl  # noqa: E402
 
 import build_gpt2_images  # noqa: E402
 import gpt2_triton  # noqa: E402
-import kernels  # noqa: E402
+from compiler_tests import hand_images  # noqa: E402
 from compiler import ProgramError, plan_pointwise, read_pointwise, signature_of  # noqa: E402
 from emit import POINTWISE_LEFT, POINTWISE_RIGHT, VectorOp  # noqa: E402
 
@@ -79,12 +79,12 @@ class PointwiseImageTest(unittest.TestCase):
     """Holds every pointwise image a GPT-2 layer launches to the hand-written builder it replaces."""
 
     def test_every_gpt2_pointwise_image_matches_the_hand_written_builder(self) -> None:
-        """Asserts each compiled add assembles to the bytes `build_elementwise_add` does for the same width."""
+        """Asserts each compiled add assembles to the bytes the hand-written builder did for the same width."""
         for kind, features in build_gpt2_images._POINTWISE:
             with self.subTest(kind=kind, features=features):
                 image, entry = build_gpt2_images._compile_pointwise(kind=kind, features=features)
-                hand = kernels.build_elementwise_add(entry["chunks"], broadcast_right=entry["broadcast_right"])
-                self.assertEqual(image, bytes(hand.image.to_bytes(pad_to=4)))
+                self.assertEqual(image, hand_images.elementwise_add(entry["chunks"],
+                                                                    broadcast_right=entry["broadcast_right"]))
 
 
 def read(kernel, *, features: int = 768):

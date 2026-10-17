@@ -49,17 +49,14 @@ from bf16 import (  # noqa: E402,F401  (re-exported, the operand tests importing
     from_bf16_words,
     gelu_lut_reference,
     pack_activations,
+    decode_mask_tiles,
+    pack_attention_constants,
     pack_bias,
     pack_weights,
 )
-from kernels import (  # noqa: E402
-    build_matrix_transpose,
-    build_softmax_rows,
-    single_halt,
-)
+from asm import AsmBuilder, AsmKernel  # noqa: E402
 from runtime import (  # noqa: E402
     MemcpyKind,
-    MinitpuKernel,
     minitpuFree,
     minitpuGetAddressSpace,
     minitpuHostAlloc,
@@ -99,13 +96,6 @@ every launch in the process stages through `_stage_image`, which a program mixin
 would not, and the cache would then belong in the runtime instead."""
 
 
-_KERNEL_CACHE: dict[tuple, tuple] = {}
-"""Assembled kernels and their serialised images, keyed by the arguments that built them, serialising alone
-having measured 36.8 ms of a 47.4 ms fully resident launch. The key is the arguments rather than the kernel:
-`id` is reused once CPython collects the object, which handed a dead kernel's image to a later one, and a frozen
-dataclass cannot be memoised on."""
-
-
 _IMAGE_DIRECTORY: pathlib.Path = HERE / "images"
 """Directory holding the compiled images and the manifest describing them, which a host writes through
 `tools/build_gpt2_images.py`."""
@@ -120,6 +110,9 @@ _COMPILED_IMAGES: dict[tuple, tuple[bytes, dict]] = {}
 
 _ATTENTION_CONSTANTS: dict[str, int] = {}
 """DMEM address of each attention image's constants block, keyed by its file, each uploaded once."""
+
+_DECODE_CONSTANTS: dict[int, int] = {}
+"""DMEM address of each decode image's constants block, keyed by the cache length it walks, rewritten each step."""
 
 
 class ResidentWeights:
@@ -238,6 +231,11 @@ class DeviceTensorSlice:
         self.features = features
 
     @property
+    def blocks(self) -> int:
+        """Returns the token blocks the slice covers, being its parent's."""
+        return self._d_parent.blocks
+
+    @property
     def shape(self) -> tuple[int, int]:
         return (self.tokens, self.features)
 
@@ -318,6 +316,36 @@ class KVCache:
         return d_fused.features // 3 // _TILE * _BLOCK_TOKENS * _ROW_BYTES
 
 
+def load_gpt2_weights(path: pathlib.Path | None = None) -> tuple[list[dict], dict]:
+    """Reads the weights `tools/export_gpt2_weights.py` wrote, as float32 arrays.
+
+    Args:
+        path: The exported weights file, or None for the one beside this package.
+
+    Returns:
+        One dict per layer, keyed as `transformer_block` reads its parameters, and the shared weights, keyed
+        `wte`, `wpe`, `ln_f.g` and `ln_f.b`.
+
+    Raises:
+        FileNotFoundError: If the weights have not been exported.
+    """
+    path = HERE / "gpt2_weights.npz" if path is None else path
+    if not path.exists():
+        message = (
+            f"Unable to read GPT-2's weights from {path}. Run tools/export_gpt2_weights.py on a host, which writes "
+            f"them there, and deploy the package again."
+        )
+        raise FileNotFoundError(message)
+    exported = np.load(path)
+    weights = {name: from_bf16_words(words=exported[name]) for name in exported.files}
+    layers: list[dict] = []
+    while f"h.{len(layers)}.ln_1.g" in weights:
+        prefix = f"h.{len(layers)}."
+        layers.append({name[len(prefix):]: value for name, value in weights.items() if name.startswith(prefix)})
+    shared = {name: value for name, value in weights.items() if not name.startswith("h.")}
+    return layers, shared
+
+
 def layernorm_reference(
     rows: NDArray[np.float32], gamma: NDArray[np.float32], beta: NDArray[np.float32]
 ) -> NDArray[np.float32]:
@@ -370,7 +398,7 @@ def upload_weights(h_weights: NDArray[np.float32]) -> ResidentWeights:
         A handle `full_gemm` accepts in place of the array.
     """
     words = pack_weights(weights=_on_bf16_grid(values=h_weights.astype(np.float32)))
-    minitpuSetDevice(single_halt.uio_name)
+    minitpuSetDevice(_UIO_NAME)
     host = minitpuHostAlloc(words.nbytes)
     host.view.view("<u2")[: words.size] = words
     # One block of slack for the kernel's last prefetch, which reads one block past
@@ -394,7 +422,7 @@ def upload_bias(h_bias: NDArray[np.float32]) -> ResidentWeights:
             f"whole {_NUM_LANES}-lane tiles."
         )
     words = pack_bias(_on_bf16_grid(values=h_bias.astype(np.float32)))
-    minitpuSetDevice(single_halt.uio_name)
+    minitpuSetDevice(_UIO_NAME)
     host = minitpuHostAlloc(words.nbytes)
     host.view.view("<u2")[:words.size] = words
     address = minitpuMalloc(words.nbytes)
@@ -521,66 +549,6 @@ def layernorm_resident(d_rows: DeviceTensor, d_constants: int, *,
             d_image, len(image_bytes),
             args=[d_rows.operand(block), d_constants, d_out.operand(block)])
     return d_out
-
-
-def transpose_2d(h_matrix: NDArray[np.float32]) -> NDArray[np.float32]:
-    """Transposes a whole [rows, columns] array on the device.
-
-    Notes:
-        A tile of a row-major array is 16 rows at stride `columns / NUM_LANES` rather than 16 consecutive
-        ones, which is the only descriptor stride other than one in this package. Tile (i, j) becomes tile
-        (j, i) by pointer arithmetic: one launch per source tile column walks that column at the load stride
-        and lands its tiles consecutively in the destination row they belong to.
-
-    Args:
-        h_matrix: [rows, columns] host array, both a whole number of `_TILE`.
-
-    Returns:
-        Its [columns, rows] transpose.
-
-    Raises:
-        ValueError: If either dimension is not a whole number of tiles.
-    """
-    rows, columns = h_matrix.shape
-    if rows % _TILE or columns % _TILE:
-        message = (
-            f"Unable to transpose a [{rows},{columns}] array. The staging tile is "
-            f"{_TILE}x{_TILE}, so both dimensions must be a whole number of {_TILE}."
-        )
-        raise ValueError(message)
-    down, across = rows // _TILE, columns // _TILE
-
-    kernel, image_bytes = _kernel_and_image(
-        ("transpose2d", down, across, columns // _NUM_LANES, rows // _NUM_LANES),
-        lambda: build_matrix_transpose(down=down, across=across,
-                                       load_stride=columns // _NUM_LANES,
-                                       store_stride=rows // _NUM_LANES))
-    minitpuSetDevice(kernel.uio_name)
-    minitpuHostReset()
-    d_owned: list[int] = []
-    try:
-        d_image = _stage_image(image_bytes)
-        words = as_bf16_words(values=_on_bf16_grid(values=h_matrix)).reshape(-1)
-        h_in = minitpuHostAlloc(words.nbytes)
-        h_in.view.view("<u2")[: words.size] = words
-        d_in = minitpuMalloc(words.nbytes)
-        d_owned.append(d_in)
-        minitpuMemcpy(d_in, h_in, words.nbytes, MemcpyKind.HostToDevice)
-        h_out = minitpuHostAlloc(words.nbytes)
-        d_out = minitpuMalloc(words.nbytes)
-        d_owned.append(d_out)
-
-        # One launch for the whole matrix, the tile-column walk being the kernel's outer loop rather than the
-        # host's, which at GPT-2's width was 48 launches of a 32-row transpose.
-        minitpuLaunchKernel(d_image, len(image_bytes),
-                            args=[d_in, 0, d_out])
-        minitpuMemcpy(h_out, d_out, words.nbytes, MemcpyKind.DeviceToHost)
-        return from_bf16_words(
-            words=h_out.view.view("<u2")[: words.size]).reshape(columns, rows)
-    finally:
-        for address in d_owned:
-            minitpuFree(address)
-        minitpuHostReset()
 
 
 def add_resident(d_left: DeviceTensor, d_right: DeviceTensor, *,
@@ -812,78 +780,6 @@ def full_gemm(
     return result
 
 
-def softmax_rows(scores: NDArray[np.float32]) -> NDArray[np.float32]:
-    """Applies a row-wise softmax on the device.
-
-    Notes:
-        One row is one VREG, so the row width is fixed at `_VREG_ELEMENTS`, and the rows are launched
-        in chunks of whatever one DMA descriptor covers.
-
-    Args:
-        scores: One row per reduction, each `_VREG_ELEMENTS` wide.
-
-    Returns:
-        The float32 softmax of each row.
-
-    Raises:
-        ValueError: If the rows are not the width one VREG reduces over.
-    """
-    rows, width = scores.shape
-    if width != _VREG_ELEMENTS:
-        message = (
-            f"Unable to softmax rows of {width}. vredsum and vredmax reduce over a whole VREG, so a "
-            f"row must be exactly {_VREG_ELEMENTS} wide."
-        )
-        raise ValueError(message)
-    chunk = _MAX_DESCRIPTOR_ROWS // _TILE_VREGS
-    whole, tail = divmod(rows, chunk)
-
-    minitpuSetDevice(single_halt.uio_name)
-    minitpuHostReset()
-    d_owned: list[int] = []
-    h_result = np.empty_like(scores, dtype=np.float32)
-    try:
-        span = rows * width
-        h_scores = minitpuHostAlloc(span * _ELEMENT_BYTES)
-        d_scores = minitpuMalloc(span * _ELEMENT_BYTES)
-        d_owned.append(d_scores)
-        h_out = minitpuHostAlloc(span * _ELEMENT_BYTES)
-        d_out = minitpuMalloc(span * _ELEMENT_BYTES)
-        d_owned.append(d_out)
-
-        words = as_bf16_words(values=scores).reshape(-1)
-        h_scores.view.view("<u2")[: words.size] = words
-        minitpuMemcpy(d_scores, h_scores, words.nbytes, MemcpyKind.HostToDevice)
-
-        # One launch streams every whole chunk, the kernel advancing its own pointers and its inner loop naming
-        # its AGU level so the chunk loop does not steal the row index. A ragged tail needs an image of its own,
-        # the inner trip count being baked in, which is one more launch rather than one each.
-        stride = chunk * width * _ELEMENT_BYTES
-        if whole:
-            _, image_bytes = _kernel_and_image(
-                ("softmax", chunk, whole),
-                lambda: build_softmax_rows(chunk, chunks=whole))
-            d_image = _stage_image(image_bytes)
-            minitpuLaunchKernel(d_image, len(image_bytes),
-                                args=[d_scores, 0, d_out])
-        if tail:
-            _, image_bytes = _kernel_and_image(
-                ("softmax", tail, 1), lambda: build_softmax_rows(tail, chunks=1))
-            d_image = _stage_image(image_bytes)
-            minitpuLaunchKernel(d_image, len(image_bytes),
-                                args=[d_scores + whole * stride, 0,
-                                      d_out + whole * stride])
-
-        minitpuMemcpy(h_out, d_out, words.nbytes, MemcpyKind.DeviceToHost)
-        h_result[:] = from_bf16_words(
-            words=h_out.view.view("<u2")[: words.size]).reshape(scores.shape)
-    finally:
-        for address in d_owned:
-            minitpuFree(address)
-        minitpuHostReset()
-    return h_result
-
-
 def transformer_block(hidden: NDArray[np.float32], weights: dict, *, heads: int = 12,
                       cache: KVCache | None = None) -> NDArray[np.float32]:
     """Runs one GPT-2 transformer block on the device, keeping every intermediate resident in DMEM.
@@ -1001,81 +897,37 @@ def attention(d_fused: DeviceTensor, *, heads: int = 12) -> DeviceTensorSlice:
     return DeviceTensorSlice(d_fused, 0, d_fused.features // 3)
 
 
-def decode_attention(
-    query: NDArray[np.float32], keys: NDArray[np.float32], values: NDArray[np.float32],
-    *, scale: float | None = None
-) -> NDArray[np.float32]:
-    """Runs one decode step's attention for EVERY head on the device, in three launches.
+def decode_attention(d_fused: DeviceTensor, cache: KVCache, *, heads: int = 12) -> DeviceTensorSlice:
+    """Attends every head of a decode step's new token over the layer's KV cache, in one launch.
 
     Notes:
-        A decode step has one query row per head, so all heads share one launch rather than paying a launch
-        each: head h's transposed keys sit at block (h, h) of a block-diagonal operand, everything off the
-        diagonal is zero, and no head sees another's keys. That wastes eleven twelfths of the multiplies, which
-        is the right trade while the device is idle for most of a token and the launch is what costs. Contexts
-        shorter than a full VREG need their unused score columns pushed to zero probability, since each head's
-        score row is one whole VREG the softmax reduces over.
+        The step uses the image built for the shortest whole number of token blocks holding the cache, and masks
+        the keys past the cache's length with tiles written here, so one image serves every length in its block.
 
     Args:
-        query: [heads, head] one query row per head, unscaled.
-        keys: [heads, context, head] cached keys.
-        values: [heads, context, head] cached values.
-        scale: What to multiply the queries by. Defaults to 1/sqrt(head_dim); pass
-            1.0 when the projection already carries it.
+        d_fused: [tokens, 3 * model] fused QKV projection of the step, the new token in its first row, resident.
+        cache: The layer's KV cache, already holding the new token's keys and values.
+        heads: Attention heads.
 
     Returns:
-        The [heads, head] attention output, one row per head.
+        The [tokens, model] attention output, a view of the fused tensor whose first row is the new token's.
 
     Raises:
-        ValueError: If the context does not fit the VREG a score row reduces over.
+        ValueError: If the cache is empty or its padded length outruns its capacity or every decode image.
     """
-    heads, head = query.shape
-    context = keys.shape[1]
-    if not 0 < context <= _VREG_ELEMENTS:
+    keys = -(-cache.length // _BLOCK_TOKENS) * _BLOCK_TOKENS
+    if cache.length < 1 or keys > cache.tensor.tokens:
         message = (
-            f"Unable to attend over a context of {context}. A score row is one VREG, which "
-            f"`vredmax` and `vredsum` reduce over, so it holds at most {_VREG_ELEMENTS} keys."
+            f"Unable to attend over a cache holding {cache.length} of {cache.tensor.tokens} tokens. A decode step "
+            f"reads at least one key and a whole number of token blocks of the cache's room."
         )
         raise ValueError(message)
-
-    width = heads * head                       # the model width, for GPT-2 exactly 768
-    span = heads * _VREG_ELEMENTS
-
-    if scale is None:
-        scale = 1.0 / math.sqrt(head)
-    scaled = (query * scale).astype(np.float32)
-
-    # Scores are [1, width] against a block-diagonal transpose of K, each head landing in its own column band.
-    # One transpose covers every head: the stacked caches come back transposed, and each head's block is a
-    # column range of that.
-    h_stacked = _pad_rows_to_tile(
-        np.ascontiguousarray(keys.reshape(heads * context, head)))
-    h_keys_t = transpose_2d(h_stacked)
-    key_blocks = np.zeros((width, span), dtype=np.float32)
-    for h in range(heads):
-        block = h_keys_t[:, h * context:(h + 1) * context]
-        key_blocks[h * head:(h + 1) * head,
-                   h * _VREG_ELEMENTS:h * _VREG_ELEMENTS + context] = block
-    scores = full_gemm(
-        activations=_pad_tokens_for_launch(scaled.reshape(1, width)),
-        weights=_on_bf16_grid(values=key_blocks))[0].reshape(heads, _VREG_ELEMENTS)
-
-    if context < _VREG_ELEMENTS:
-        # Unused columns must not win probability mass. Large and negative rather than -inf: the
-        # kernel subtracts the row maximum before the exponential, and inf - inf is a NaN.
-        scores[:, context:] = -1.0e30
-
-    probabilities = softmax_rows(scores=_on_bf16_grid(values=scores))
-
-    # Values: [1, heads * VREG] @ blockdiag(V) -> [1, width], concatenated head outputs.
-    value_blocks = np.zeros((span, width), dtype=np.float32)
-    for h in range(heads):
-        value_blocks[h * _VREG_ELEMENTS:h * _VREG_ELEMENTS + context,
-                     h * head:(h + 1) * head] = values[h]
-    gathered = full_gemm(
-        activations=_pad_tokens_for_launch(
-            _on_bf16_grid(values=probabilities.reshape(1, span))),
-        weights=_on_bf16_grid(values=value_blocks))
-    return gathered[0].reshape(heads, head)
+    image_bytes, entry = _compiled_image(kind="decode_attention", keys=keys, heads=heads)
+    d_constants = _decode_constants(entry, length=cache.length)
+    minitpuSetDevice(_UIO_NAME)
+    d_image = _stage_image(image_bytes)
+    minitpuLaunchKernel(d_image, len(image_bytes), args=[d_constants, cache.tensor.operand(0), d_fused.operand(0)])
+    return DeviceTensorSlice(d_fused, 0, d_fused.features // 3)
 
 
 def attention_reference(
@@ -1104,7 +956,7 @@ def attention_reference(
     return (weights.astype(np.float64) @ _on_bf16_grid(values=value).astype(np.float64)).astype(np.float32)
 
 
-def check_kernel_launch(kernel: MinitpuKernel) -> None:
+def check_kernel_launch(image_bytes: bytes) -> None:
     """Verifies the LAUNCH path by staging a resident kernel image and starting it from the host.
 
     Notes:
@@ -1114,16 +966,15 @@ def check_kernel_launch(kernel: MinitpuKernel) -> None:
         than in a workload result. Repeating the launch requires the command processor to return to idle.
 
     Args:
-        kernel: The assembled program whose image is staged and started.
+        image_bytes: The assembled image staged and started.
 
     Raises:
         RuntimeError: If the loader flags an error and the command processor abandons the launch.
         TimeoutError: If a command fails to retire, which is how a core that never halts presents.
     """
-    image_bytes = _image_of(kernel)
     address_space = minitpuGetAddressSpace()
 
-    minitpuSetDevice(kernel.uio_name)
+    minitpuSetDevice(_UIO_NAME)
     minitpuHostReset()
     try:
         staging = minitpuHostAlloc(len(image_bytes))
@@ -1211,7 +1062,7 @@ def check_halt() -> str:
         RuntimeError: If the loader flags an error and the command processor abandons the launch.
         TimeoutError: If a command fails to retire, which is how a core that never halts presents.
     """
-    check_kernel_launch(kernel=single_halt)
+    check_kernel_launch(image_bytes=AsmKernel(name="halt", bundles=(AsmBuilder().halt(),)).to_bytes(pad_to=4))
     return f"staged and launched {_LAUNCH_REPEATS} times"
 
 
@@ -1317,34 +1168,45 @@ def check_elementwise_add(*, tokens: int = 32, features: int = 768) -> str:
     return f"[{tokens},{features}] + [{tokens},{features}] in {elapsed * 1e3:.0f} ms, and + bias row, exact"
 
 
-def check_decode_attention(*, heads: int = 12, head: int = 64, context: int = 48) -> str:
-    """Runs one decode step's attention for every head on the device.
+def check_decode_attention(*, context: int = 48, model: int = _MODEL_WIDTH, heads: int = 12) -> str:
+    """Prefills a KV cache, appends a decode step's token and attends it over the cache on the device.
 
     Returns:
         The detail the report line carries.
 
     Raises:
-        AssertionError: If the device disagrees with the host model.
+        AssertionError: If the device disagrees with the host reference.
     """
     rng = np.random.default_rng(19)
-    query = _on_bf16_grid(values=rng.standard_normal((heads, head)).astype(np.float32))
-    keys = _on_bf16_grid(values=rng.standard_normal((heads, context, head)).astype(np.float32))
-    values = _on_bf16_grid(values=rng.standard_normal((heads, context, head)).astype(np.float32))
+    tokens = -(-context // _BLOCK_TOKENS) * _BLOCK_TOKENS
+    h_prefill = _on_bf16_grid(values=rng.standard_normal((tokens, 3 * model)).astype(np.float32))
+    h_step = _on_bf16_grid(values=rng.standard_normal((_BLOCK_TOKENS, 3 * model)).astype(np.float32))
+    d_prefill, d_step = upload_activations(h_prefill), upload_activations(h_step)
+    cache = KVCache(capacity=tokens + _BLOCK_TOKENS, model=model)
+    try:
+        cache.extend(d_prefill, tokens=context)
+        cache.append(d_step)
+        started = time.time()
+        actual = download_activations(decode_attention(d_step, cache, heads=heads))[0]
+        elapsed = time.time() - started
+    finally:
+        cache.free()
+        d_prefill.free()
+        d_step.free()
 
-    started = time.time()
-    actual = decode_attention(query=query, keys=keys, values=values)
-    elapsed = time.time() - started
+    head = model // heads
+    keys = np.concatenate([h_prefill[:context, model:2 * model], h_step[:1, model:2 * model]], axis=0)
+    values = np.concatenate([h_prefill[:context, 2 * model:], h_step[:1, 2 * model:]], axis=0)
+    expected = np.empty(model, dtype=np.float64)
+    for index in range(heads):
+        columns = slice(index * head, (index + 1) * head)
+        scores = keys[:, columns].astype(np.float64) @ h_step[0, columns].astype(np.float64)
+        weights = np.exp(scores - scores.max())
+        expected[columns] = (weights / weights.sum()) @ values[:, columns].astype(np.float64)
 
-    expected = np.empty((heads, head), dtype=np.float32)
-    for h in range(heads):
-        scores = (query[h].astype(np.float64) @ keys[h].astype(np.float64).T) / math.sqrt(head)
-        scores = scores - scores.max()
-        weights = np.exp(scores)
-        expected[h] = (weights / weights.sum()) @ values[h].astype(np.float64)
-
-    error = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
+    error = float(np.linalg.norm(actual - expected) / np.linalg.norm(expected))
     assert error < 0.05, f"decode attention relative error {error:.4%} is too large"
-    return (f"{heads} heads x 1 query over {context} keys, 3 launches in {elapsed:.1f} s, "
+    return (f"{heads} heads x 1 query over {cache.length} cached keys, compiled, 1 launch in {elapsed:.2f} s, "
             f"relative error {error:.2%}")
 
 
@@ -1439,40 +1301,6 @@ def check_transformer_block(*, tokens: int = 64) -> str:
             f"relative error {error:.2%}")
 
 
-def _image_of(kernel) -> bytes:
-    """Serialises a kernel, without caching.
-
-    Notes:
-        Only the launch-path checks reach this, and they run once. Every hot path goes through
-        `_kernel_and_image`, which keys on the arguments that built the kernel rather than on the object.
-
-    Args:
-        kernel: An assembled kernel.
-
-    Returns:
-        Its padded byte image.
-    """
-    return bytes(kernel.image.to_bytes(pad_to=4))
-
-
-def _kernel_and_image(key: tuple, build) -> tuple:
-    """Returns an assembled kernel and its serialised image, building each once.
-
-    Args:
-        key: The build arguments, which identify the kernel.
-        build: Builds it when the key is new.
-
-    Returns:
-        The (kernel, image bytes) pair.
-    """
-    cached = _KERNEL_CACHE.get(key)
-    if cached is None:
-        kernel = build()
-        cached = (kernel, bytes(kernel.image.to_bytes(pad_to=4)))
-        _KERNEL_CACHE[key] = cached
-    return cached
-
-
 def _compiled_gemm(*, depth: int, columns: int, activate: bool) -> bytes:
     """Returns the compiled image that runs one GEMM shape with the contraction summed on the device.
 
@@ -1564,6 +1392,30 @@ def _launch_copy(*, rows: int, stride: int, source: int, destination: int) -> No
     minitpuLaunchKernel(d_image, len(image_bytes), args=[source, 0, destination])
 
 
+def _decode_constants(entry: dict, *, length: int) -> int:
+    """Writes a decode step's constants block, masking every key past the cache's length, and returns its address.
+
+    Args:
+        entry: The decode image's manifest entry, which states the cache length it walks and its constants.
+        length: Keys the cache holds.
+
+    Returns:
+        The device address the image binds as its constants argument.
+    """
+    keys = entry["keys"]
+    h_words = pack_attention_constants(initial_maximum=entry["entering"], constants=tuple(entry["stated"]),
+                                       masks=decode_mask_tiles(keys=keys, length=length)).reshape(-1)
+    d_address = _DECODE_CONSTANTS.get(keys)
+    if d_address is None:
+        d_address = minitpuMalloc(h_words.nbytes)
+        _DECODE_CONSTANTS[keys] = d_address
+    h_staging = minitpuHostAlloc(h_words.nbytes)
+    h_staging.view.view("<u2")[: h_words.size] = h_words
+    minitpuMemcpy(d_address, h_staging, h_words.nbytes, MemcpyKind.HostToDevice)
+    minitpuHostReset()
+    return d_address
+
+
 def _stage_image(image_bytes: bytes) -> int:
     """Makes a kernel image resident in DMEM, once, and returns its address.
 
@@ -1614,7 +1466,7 @@ def _allocate_tensor(tokens: int, features: int) -> DeviceTensor:
 
     # Allocating and zeroing both need a bound device, and a caller may reach this
     # before any launch has bound one.
-    minitpuSetDevice(single_halt.uio_name)
+    minitpuSetDevice(_UIO_NAME)
     tensor = DeviceTensor(base=0, tokens=tokens, features=features)
     tensor.base = minitpuMalloc(tensor.nbytes)
     host = minitpuHostAlloc(_ZERO_TILE_BYTES)
@@ -1622,33 +1474,6 @@ def _allocate_tensor(tokens: int, features: int) -> DeviceTensor:
     for block in range(tensor.blocks):
         minitpuMemcpy(tensor.d_drain(block), host, _ZERO_TILE_BYTES, MemcpyKind.HostToDevice)
     return tensor
-
-
-def _pad_rows_to_tile(h_rows: NDArray[np.float32]) -> NDArray[np.float32]:
-    """Zero-extends the row axis to a whole number of transpose tiles.
-
-    Notes:
-        The staging tile is square, so a transpose needs both dimensions to be a whole number of `_TILE`.
-        Padding with zeros is exact, the caller dropping the padded columns before they reach a score.
-    """
-    rows = h_rows.shape[0]
-    remainder = rows % _TILE
-    if remainder == 0:
-        return h_rows
-    extended = np.zeros((rows + _TILE - remainder, h_rows.shape[1]), dtype=np.float32)
-    extended[:rows] = h_rows
-    return extended
-
-
-def _pad_tokens_for_launch(rows: NDArray[np.float32]) -> NDArray[np.float32]:
-    """Zero-extends the token axis to the whole number of rows one launch covers."""
-    tokens = rows.shape[0]
-    remainder = tokens % _BLOCK_TOKENS
-    if remainder == 0:
-        return rows
-    extended = np.zeros((tokens + _BLOCK_TOKENS - remainder, rows.shape[1]), dtype=np.float32)
-    extended[:tokens] = rows
-    return extended
 
 
 def _block_weights(model: int, seed: int) -> dict:

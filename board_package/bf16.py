@@ -43,12 +43,6 @@ _CORRUPTION_WORD: int = 0xDEAD_BEEF
 _LAUNCH_REPEATS: int = 3
 """The number of back-to-back launches of one image the repeat check issues."""
 
-_INTERLEAVE_ROUNDS: int = 4
-"""The number of alternating copy and launch rounds the command interleave check issues."""
-
-_INTERLEAVE_PAYLOAD_BYTES: int = 9216
-"""The byte size of the payload each interleave round moves."""
-
 _TILE: int = 16
 """The edge length of one MXU tile."""
 
@@ -106,12 +100,6 @@ _ZERO_TILE_WORDS: int = _TILE * _TILE
 
 _ZERO_TILE_BYTES: int = _ZERO_TILE_WORDS * _ELEMENT_BYTES
 """The byte size of that zeroed tile."""
-
-_ROW_SCORES: int = 256
-"""The first VMEM row of the attention scores the softmax reads."""
-
-_ROW_SOFTMAX_OUT: int = 1024
-"""The first VMEM row of the softmax result."""
 
 _VREG_ELEMENTS: int = _NUM_LANES * _NUM_SUBLANES
 """The number of values one vector register holds."""
@@ -493,6 +481,21 @@ def pack_attention(query: NDArray[np.float32], key: NDArray[np.float32], value: 
                                       for tile in range(head // _TILE)], axis=0))
         blocks.append(_by_tile(value[rows]))
     return as_bf16_words(values=staged), as_bf16_words(values=np.concatenate(blocks, axis=0))
+
+
+def decode_mask_tiles(*, keys: int, length: int) -> NDArray[np.float32]:
+    """Returns the mask tiles a decode step adds to its scores, keeping the first `length` of `keys` cached keys.
+
+    Args:
+        keys: Keys the decode image walks, a whole number of tiles.
+        length: Keys the cache holds.
+
+    Returns:
+        The tiles, shaped [1, key blocks, queries, keys], every query row reading the same keys.
+    """
+    masked = np.where(np.arange(keys) < length, np.float32(0.0), np.float32(-1.0e30)).astype(np.float32)
+    return np.ascontiguousarray(np.broadcast_to(masked.reshape(1, keys // _TILE, 1, _TILE),
+                                                (1, keys // _TILE, _TILE, _TILE)))
 
 
 def pack_attention_constants(*, initial_maximum: float, constants: tuple[float, ...],

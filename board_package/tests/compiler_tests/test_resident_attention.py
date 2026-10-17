@@ -19,7 +19,7 @@ import numpy as np  # noqa: E402
 
 import asm  # noqa: E402
 import emit  # noqa: E402
-from bf16 import _TILE, as_bf16_words, pack_attention_constants  # noqa: E402
+from bf16 import _TILE, as_bf16_words, decode_mask_tiles, pack_attention_constants  # noqa: E402
 import gpt2_triton  # noqa: E402
 from compiler import ProgramError, compile_resident_attention, plan, read_program, signature_of  # noqa: E402
 from compiler_tests.test_compile import planned_attention  # noqa: E402
@@ -73,6 +73,13 @@ class DecodeAttentionTest(unittest.TestCase):
         kept = launch.mask_scores == 0
         self.assertTrue(kept[:, :48].all())
         self.assertFalse(kept[:, 48:].any())
+
+    def test_the_board_writes_the_mask_the_kernel_states(self) -> None:
+        """Asserts the tiles a board writes for a step equal the ones the compiler derives from the kernel's select."""
+        for length in (1, 33, 48, 64):
+            with self.subTest(length=length):
+                np.testing.assert_array_equal(decode_mask_tiles(keys=64, length=length),
+                                              planned_decode(keys=64, length=length).mask_tiles)
 
     def test_the_decode_image_fits_and_reads_the_cache_as_its_own_argument(self) -> None:
         """Asserts the image compiles against a cache of a key and a value per feature, and refuses another."""

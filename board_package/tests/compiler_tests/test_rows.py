@@ -23,9 +23,9 @@ import triton.language as tl  # noqa: E402
 
 import build_gpt2_images  # noqa: E402
 import gpt2_triton  # noqa: E402
-import kernels  # noqa: E402
 from asm import AsmKernel  # noqa: E402
 from compiler import ProgramError, plan_rows, read_rows, signature_of  # noqa: E402
+from compiler_tests import hand_images  # noqa: E402
 from compiler_tests.test_emit import _e_opcode  # noqa: E402
 from emit import RowLoad, RowStore, VectorOp, row_stream  # noqa: E402
 
@@ -103,7 +103,8 @@ class RowImageTest(unittest.TestCase):
         launch = plan_rows(read(gpt2_triton.gpt2_layernorm))
         compiled = row_stream(features=launch.features, rows=launch.rows, scalars=len(launch.scalars),
                               prologue=launch.prologue, body=launch.body)
-        hand = kernels.build_layernorm_rows(rows=32, packed=True).image.bundles
+        image = hand_images.layernorm_rows()
+        hand = [int.from_bytes(image[at:at + 16], "little") for at in range(0, len(image), 16)]
         compiled_opcodes = collections.Counter(_e_opcode(word) for word in compiled if _e_opcode(word))
         hand_opcodes = collections.Counter(_e_opcode(word) for word in hand if _e_opcode(word))
         vadd = _e_opcode(next(word for word in row_stream(

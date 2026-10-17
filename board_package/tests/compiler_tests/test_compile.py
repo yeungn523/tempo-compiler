@@ -22,7 +22,6 @@ import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
 import build_gpt2_images  # noqa: E402
-import kernels  # noqa: E402
 import sample_triton  # noqa: E402
 from bf16 import _BLOCK_DEPTH, _BLOCK_TOKENS, _TILE  # noqa: E402
 from compiler import ProgramError, compile_launch, plan, read_program, signature_of  # noqa: E402
@@ -31,6 +30,7 @@ import emit  # noqa: E402
 from compiler.dataflow import (CARRIED, CONSTANT, STREAMED, TRANSIENT, Trip,  # noqa: E402
                                Value, attention_trip)
 from compiler.ir import FlashLaunch, FusedLaunch, Operation  # noqa: E402
+from compiler_tests import hand_images  # noqa: E402
 from compiler_tests.test_layout import renaming_onto  # noqa: E402
 from layout import flash_register_map, register_map  # noqa: E402
 
@@ -525,12 +525,12 @@ class PipelineTest(unittest.TestCase):
                          (staging.blocks, staging.partials, staging.output_tiles, staging.rows, _TILE))
 
     def test_every_gpt2_image_matches_the_hand_written_builder(self) -> None:
-        """Asserts each GEMM a GPT-2 layer launches compiles to the stream `build_looped_gemm` assembles for it."""
+        """Asserts each GEMM a GPT-2 layer launches compiles to the stream the hand-written builder assembled."""
         for depth, columns, activate in build_gpt2_images._SHAPES:
             with self.subTest(depth=depth, columns=columns, activate=activate):
                 image, entry = build_gpt2_images._compile_gemm(depth=depth, columns=columns, activate=activate)
-                hand = kernels.build_looped_gemm(entry["column_tiles"], entry["groups"], activate=activate,
-                                                 loop_blocks=entry["loop_blocks"]).image.assemble(pad_to=4)
+                hand = hand_images.looped_gemm(entry["column_tiles"], entry["groups"], activate=activate,
+                                               loop_blocks=entry["loop_blocks"])
                 derived = tuple(int.from_bytes(image[at:at + 16], "little") for at in range(0, len(image), 16))
                 self.assertIsNotNone(renaming_onto(derived, hand))
                 self.assertEqual(entry["column_tiles"], columns // _TILE)

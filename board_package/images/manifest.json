@@ -81,5 +81,15 @@
     "heads": 12,
     "key_blocks": 4,
     "constants": "attention_64_constants.bin"
+  },
+  "copy_3072x32.bin": {
+    "kind": "copy",
+    "rows": 3072,
+    "stride": 32
+  },
+  "copy_96x1024.bin": {
+    "kind": "copy",
+    "rows": 96,
+    "stride": 1024
   }
 }

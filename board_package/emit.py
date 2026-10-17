@@ -149,10 +149,22 @@ _RESIDENT_CONSTANTS: int = 0
 """Scalar register, and launch argument, holding a resident attention image's constants block."""
 
 _RESIDENT_KEYS: int = 1
-"""Scalar register walking the current head's keys and values through the fused tensor."""
+"""Scalar register walking the current head's keys and values through the fused tensor or the KV cache."""
+
+_RESIDENT_CACHE: int = 1
+"""Launch argument holding a decode image's KV cache."""
 
 _RESIDENT_QUERIES: int = 2
 """Scalar register, and launch argument, holding the current head's queries, which its output overwrites."""
+
+_COPY_SOURCE: int = 0
+"""Scalar register, and launch argument, holding a strided copy's source."""
+
+_COPY_DESTINATION: int = 2
+"""Scalar register, and launch argument, holding a strided copy's destination."""
+
+_ROW_COPY: int = 0
+"""First VMEM row a strided copy passes its rows through."""
 
 _RESIDENT_KEY_LEVEL: int = 3
 """Loop level a resident attention image's key loop runs at, inside the token block, head and query half loops."""
@@ -1226,15 +1238,16 @@ def flash_attention(*, key_blocks: int, queries: int = _TILE, head: int = _VREG_
     return bundles, staging
 
 def resident_attention_stream(*, key_blocks: int, head: int, body: tuple[Step, ...], epilogue: tuple[Step, ...],
-                              constants: int, heads: int, fused_tiles: int,
+                              constants: int, heads: int, fused_tiles: int, cache_tiles: int | None = None,
                               turnaround: int = _VMEM_TURNAROUND) -> tuple[int, ...]:
-    """Returns the image attending every head of every token block where the fused QKV tensor lies, as its words.
+    """Returns the image attending every head where the fused QKV tensor lies, as its bundle words.
 
     Notes:
         The launch binds the constants block as argument 0 and the fused tensor's first token block as argument 2.
         Each query block's output overwrites its queries, and each key tile is transposed in registers on its way
         to the array. The key loop walks key token blocks and unrolls their two halves, which keeps every pointer
-        an affine walk that steps back to where its loop began.
+        an affine walk that steps back to where its loop began. A decode image attends one query block, the new
+        token in its first row, over a KV cache bound as argument 1.
 
     Args:
         key_blocks: Blocks of `_TILE` keys the sequence holds, which is also its query blocks.
@@ -1244,27 +1257,35 @@ def resident_attention_stream(*, key_blocks: int, head: int, body: tuple[Step, .
         constants: Tiles of stated numbers the kernel reads, staged ahead of the mask tiles.
         heads: Heads the fused tensor carries.
         fused_tiles: Feature tiles one token of the fused tensor holds, being three times the model's.
+        cache_tiles: Feature tiles one token of the KV cache holds, its keys and then its values, or None for an
+            image whose keys and values are the fused tensor's own.
 
     Returns:
         The bundle words in placement order.
 
     Raises:
-        ValueError: If the sequence is not a whole number of token blocks.
+        ValueError: If the keys are not a whole number of token blocks, or the cache holds other than a key and a
+            value per model feature.
     """
     halves = _BLOCK_TOKENS // _TILE
-    if key_blocks < halves or key_blocks % halves:
+    model_tiles = fused_tiles // 3
+    if key_blocks < halves or key_blocks % halves or cache_tiles not in (None, 2 * model_tiles):
         message = (
-            f"Unable to attend over {key_blocks} key blocks. The image walks whole token blocks of {halves} key "
-            f"blocks each, so the sequence must be a positive number of them."
+            f"Unable to attend over {key_blocks} key blocks from a cache of {cache_tiles} tiles. The image walks "
+            f"whole token blocks of {halves} key blocks each, and a cache holds {2 * model_tiles} tiles, a key and "
+            f"a value per model feature."
         )
         raise ValueError(message)
-    token_blocks = key_blocks // halves
+    key_token_blocks = key_blocks // halves
+    query_halves = 1 if cache_tiles is not None else halves
+    query_token_blocks = 1 if cache_tiles is not None else key_token_blocks
     registers = flash_register_map(queries=_TILE, head=head)
     tiles = registers.output_tiles
     rows = _flash_vmem_map(head=head, constants=constants, masks=key_blocks)
     tile_bytes = _BLOCK_TOKENS * _ROW_BYTES
     block_bytes = _ZERO_TILE_BYTES + fused_tiles * tile_bytes
-    model_bytes = fused_tiles // 3 * tile_bytes
+    key_block_bytes = block_bytes if cache_tiles is None else _ZERO_TILE_BYTES + cache_tiles * tile_bytes
+    model_bytes = model_tiles * tile_bytes
     half_bytes = _TILE * _ROW_BYTES
     head_bytes = tiles * tile_bytes
     constant_bytes = (2 + constants + key_blocks) * half_bytes
@@ -1284,12 +1305,14 @@ def resident_attention_stream(*, key_blocks: int, head: int, body: tuple[Step, .
     put(offset=0, s=builder.smovi(rd=_STRIDE_REGISTER, value=_ROW_BYTES))
     put(offset=1, s=builder.smov_arg(rd=_RESIDENT_CONSTANTS, arg=_RESIDENT_CONSTANTS))
     put(offset=2, s=builder.smov_arg(rd=_RESIDENT_QUERIES, arg=_RESIDENT_QUERIES))
-    put(offset=3, s=builder.smov_arg(rd=_RESIDENT_KEYS, arg=_RESIDENT_QUERIES))
-    slot = advance(3 + _SCALAR_GAP, _RESIDENT_KEYS, model_bytes)
+    # Reaches the keys past the fused tensor's queries, or at the start of a cache bound on its own.
+    put(offset=3, s=builder.smov_arg(rd=_RESIDENT_KEYS,
+                                     arg=_RESIDENT_QUERIES if cache_tiles is None else _RESIDENT_CACHE))
+    slot = advance(3 + _SCALAR_GAP, _RESIDENT_KEYS, model_bytes if cache_tiles is None else 0)
 
-    put(offset=slot, f=builder.lbegin(token_blocks))
+    put(offset=slot, f=builder.lbegin(query_token_blocks))
     put(offset=slot + 1, f=builder.lbegin(heads))
-    put(offset=slot + 2, f=builder.lbegin(halves))
+    put(offset=slot + 2, f=builder.lbegin(query_halves))
     slot += 3
     slot = _emit_tile_copies(put, builder, slot, store=False, register=_RESIDENT_CONSTANTS,
                              first_row=rows["initial"], runs=constant_bytes // half_bytes, rows_each=_TILE,
@@ -1301,7 +1324,7 @@ def resident_attention_stream(*, key_blocks: int, head: int, body: tuple[Step, .
     slot = advance(slot, _RESIDENT_QUERIES, -walk)
     slot = _emit_flash_entry(put, builder, slot, registers=registers, rows=rows)
 
-    put(offset=slot, f=builder.lbegin(token_blocks))
+    put(offset=slot, f=builder.lbegin(key_token_blocks))
     slot += 1
     for half in range(halves):
         slot = _emit_tile_copies(put, builder, slot, store=False, register=_RESIDENT_KEYS, first_row=rows["incoming"],
@@ -1311,7 +1334,8 @@ def resident_attention_stream(*, key_blocks: int, head: int, body: tuple[Step, .
         slot = _emit_tile_copies(put, builder, slot, store=False, register=_RESIDENT_KEYS, first_row=rows["value"],
                                  runs=tiles, rows_each=_TILE, step=tile_bytes)
         crossed = model_bytes + walk
-        following = half_bytes - crossed if half < halves - 1 else block_bytes - (halves - 1) * half_bytes - crossed
+        following = (half_bytes - crossed if half < halves - 1
+                     else key_block_bytes - (halves - 1) * half_bytes - crossed)
         slot = advance(slot, _RESIDENT_KEYS, following)
         slot = _emit_key_transposes(put, builder, slot, registers=registers, rows=rows, tiles=tiles)
         slot += turnaround
@@ -1322,7 +1346,7 @@ def resident_attention_stream(*, key_blocks: int, head: int, body: tuple[Step, .
     slot += _POINTER_LATENCY
     put(offset=slot, f=builder.loop_end())
     slot += 1
-    slot = advance(slot, _RESIDENT_KEYS, -token_blocks * block_bytes)
+    slot = advance(slot, _RESIDENT_KEYS, -key_token_blocks * key_block_bytes)
 
     slot = emit_steps(put, builder, slot, body=epilogue, registers=registers, rows=rows, turnaround=turnaround,
                       key_level=_RESIDENT_KEY_LEVEL)
@@ -1336,9 +1360,9 @@ def resident_attention_stream(*, key_blocks: int, head: int, body: tuple[Step, .
     slot += 1
 
     # Moves on to the next head, rewinding the query halves and the constants every head shares.
-    slot = advance(slot, _RESIDENT_QUERIES, head_bytes - halves * half_bytes)
+    slot = advance(slot, _RESIDENT_QUERIES, head_bytes - query_halves * half_bytes)
     slot = advance(slot, _RESIDENT_KEYS, head_bytes)
-    slot = advance(slot, _RESIDENT_CONSTANTS, -halves * constant_bytes)
+    slot = advance(slot, _RESIDENT_CONSTANTS, -query_halves * constant_bytes)
     slot += _POINTER_LATENCY
     put(offset=slot, f=builder.loop_end())
     slot += 1
@@ -1346,10 +1370,60 @@ def resident_attention_stream(*, key_blocks: int, head: int, body: tuple[Step, .
     # Moves on to the next token block, its queries one block on and its constants past this block's halves.
     slot = advance(slot, _RESIDENT_QUERIES, block_bytes - heads * head_bytes)
     slot = advance(slot, _RESIDENT_KEYS, -heads * head_bytes)
-    slot = advance(slot, _RESIDENT_CONSTANTS, halves * constant_bytes)
+    slot = advance(slot, _RESIDENT_CONSTANTS, query_halves * constant_bytes)
     slot += _POINTER_LATENCY
     put(offset=slot, f=builder.loop_end())
     slot += 1
+    put(offset=slot, f=builder.halt())
+    return _flatten(bundles)
+
+
+def strided_copy_stream(*, rows: int, stride: int) -> tuple[int, ...]:
+    """Returns the image copying rows spaced `stride` bytes apart from argument 0 to argument 2, as its words.
+
+    Args:
+        rows: Rows to copy, each 32 bytes.
+        stride: Bytes between one row and the next at both ends, being one row for a contiguous run.
+
+    Returns:
+        The bundle words in placement order.
+
+    Raises:
+        ValueError: If the copy moves no rows or the stride is not a whole number of rows.
+    """
+    if rows < 1 or stride < _ROW_BYTES or stride % _ROW_BYTES:
+        message = (
+            f"Unable to copy {rows} rows {stride} bytes apart. A copy moves at least one row, at a stride of a whole "
+            f"number of {_ROW_BYTES}-byte rows."
+        )
+        raise ValueError(message)
+    builder = asm_module.AsmBuilder()
+    bundles: dict[int, dict[str, int]] = {}
+
+    def put(*, offset: int, **slots: int) -> None:
+        """Merges slot words into one bundle, so co-issue reads at the call site."""
+        _merge(bundles=bundles, offset=offset, slots=slots)
+
+    put(offset=0, s=builder.smovi(rd=_STRIDE_REGISTER, value=stride))
+    put(offset=1, s=builder.smov_arg(rd=_COPY_SOURCE, arg=_COPY_SOURCE))
+    put(offset=2, s=builder.smov_arg(rd=_COPY_DESTINATION, arg=_COPY_DESTINATION))
+    slot = 2 + _SCALAR_GAP
+    copied = 0
+    while copied < rows:
+        span = min(rows - copied, _MAX_DESCRIPTOR_ROWS)
+        put(offset=slot, d=builder.dma_load(slot=0, vmem_address=_ROW_COPY, rows=span, base_sreg=_COPY_SOURCE,
+                                            stride_sreg=_STRIDE_REGISTER))
+        put(offset=slot + 1, f=builder.flush_slot(mask=1))
+        put(offset=slot + 2, d=builder.dma_store(slot=0, vmem_address=_ROW_COPY, rows=span,
+                                                 base_sreg=_COPY_DESTINATION, stride_sreg=_STRIDE_REGISTER))
+        put(offset=slot + 3, f=builder.flush_slot(mask=1))
+        slot += 4
+        copied += span
+        if copied < rows:
+            slot = _emit_split_advance(put=put, builder=builder, at=slot, register=_COPY_SOURCE,
+                                       delta=span * stride, gap=_SCALAR_GAP)
+            slot = _emit_split_advance(put=put, builder=builder, at=slot, register=_COPY_DESTINATION,
+                                       delta=span * stride, gap=_SCALAR_GAP)
     put(offset=slot, f=builder.halt())
     return _flatten(bundles)
 

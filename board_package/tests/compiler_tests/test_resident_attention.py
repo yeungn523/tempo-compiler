@@ -1,4 +1,4 @@
-"""Contains tests for the attention image attending a whole sequence where the fused QKV tensor lies."""
+"""Contains tests for the attention images and the copy filling their KV cache."""
 
 from __future__ import annotations
 
@@ -20,7 +20,8 @@ import numpy as np  # noqa: E402
 import asm  # noqa: E402
 import emit  # noqa: E402
 from bf16 import _TILE, as_bf16_words, pack_attention_constants  # noqa: E402
-from compiler import ProgramError, compile_resident_attention  # noqa: E402
+import gpt2_triton  # noqa: E402
+from compiler import ProgramError, compile_resident_attention, plan, read_program, signature_of  # noqa: E402
 from compiler_tests.test_compile import planned_attention  # noqa: E402
 from compiler_tests.test_emit import _e_opcode  # noqa: E402
 from compiler_tests.test_mask import causal_attention  # noqa: E402
@@ -62,6 +63,44 @@ class ResidentAttentionImageTest(unittest.TestCase):
                                            fused_tiles=_FUSED_TILES)
 
 
+class DecodeAttentionTest(unittest.TestCase):
+    """Covers the decode image, which attends one query block over a KV cache bound on its own."""
+
+    def test_a_decode_kernel_plans_one_query_block_masked_past_its_length(self) -> None:
+        """Asserts the folded query loop reads as one block, and every query row keeps exactly the first keys."""
+        launch = planned_decode(keys=64, length=48)
+        self.assertEqual((launch.row_blocks, launch.key_blocks), (1, 4))
+        kept = launch.mask_scores == 0
+        self.assertTrue(kept[:, :48].all())
+        self.assertFalse(kept[:, 48:].any())
+
+    def test_the_decode_image_fits_and_reads_the_cache_as_its_own_argument(self) -> None:
+        """Asserts the image compiles against a cache of a key and a value per feature, and refuses another."""
+        launch = planned_decode(keys=64, length=48)
+        image = compile_resident_attention(launch, heads=12, fused_tiles=_FUSED_TILES,
+                                           cache_tiles=2 * _FUSED_TILES // 3)
+        self.assertLessEqual(len(image), asm.IRAM_DEPTH * asm.BUNDLE_BYTES)
+        with self.assertRaises(ValueError):
+            compile_resident_attention(launch, heads=12, fused_tiles=_FUSED_TILES, cache_tiles=_FUSED_TILES)
+
+
+class CopyImageTest(unittest.TestCase):
+    """Covers the strided copy that fills the KV cache."""
+
+    def test_a_copy_moves_its_rows_in_descriptors_of_at_most_128(self) -> None:
+        """Asserts a token block's keys and values take 24 load and store pairs, and one token's take one."""
+        for rows, stride, descriptors in ((3072, 32, 2 * 24), (96, 1024, 2)):
+            with self.subTest(rows=rows, stride=stride):
+                words = emit.strided_copy_stream(rows=rows, stride=stride)
+                self.assertEqual(sum((word >> (asm.BUNDLE_BITS - 1)) & 1 for word in words), descriptors)
+
+    def test_a_copy_the_machine_cannot_make_is_refused(self) -> None:
+        """Asserts an empty copy and a stride of part of a row each raise."""
+        for rows, stride in ((0, 32), (96, 48)):
+            with self.subTest(rows=rows, stride=stride), self.assertRaises(ValueError):
+                emit.strided_copy_stream(rows=rows, stride=stride)
+
+
 class AttentionConstantsTest(unittest.TestCase):
     """Covers the constants block a host stages for each query block."""
 
@@ -75,6 +114,15 @@ class AttentionConstantsTest(unittest.TestCase):
         np.testing.assert_array_equal(blocks[:, 0], np.broadcast_to(initial, blocks[:, 0].shape))
         self.assertFalse(blocks[:, 1].any())
         np.testing.assert_array_equal(blocks[:, 2:], as_bf16_words(values=launch.mask_tiles))
+
+
+def planned_decode(*, keys: int, length: int):
+    """Returns the launch GPT-2's decode attention kernel plans to over a cache of the given keys and length."""
+    kernel = gpt2_triton.gpt2_decode_attention
+    declared = {parameter.name: parameter.default for parameter in kernel.params if parameter.is_constexpr}
+    matmuls = read_program(kernel, signature=signature_of(kernel, operands={}),
+                           constexprs=declared | {"N": keys, "LENGTH": length})
+    return plan(matmuls, strides={}).launches[0]
 
 
 def steps(body) -> tuple[int, ...]:

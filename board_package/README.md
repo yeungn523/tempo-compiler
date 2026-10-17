@@ -71,7 +71,7 @@ scratch buffers. These costs are measured separately in `SESSION_CHECKLIST.md`.
 
 ## What the board checks prove
 
-`make kernels` runs seven checks. Each compares the device against a host
+`make kernels` runs eight checks. Each compares the device against a host
 reference that rounds where the device rounds, so the residual is the arithmetic
 the machine actually does, not a tolerance covering an unmodelled effect. Every
 GEMM, add and LayerNorm a check launches, and the transformer block's attention,
@@ -89,6 +89,7 @@ its 1 % bar.
 | Elementwise add | `[32,768] + [32,768]` | exact |
 | Decode attention, all heads | 12 heads × 1 query, 48 keys | 0.67 % |
 | LayerNorm | 32 × 768, resident | 0.54 % in RTL simulation, not yet run on the board |
+| KV cache | 64 prefill tokens + 1 decode token, 1536 features | not yet run on the board |
 | **Transformer block** | 64 × 768, 12 causal heads, resident | not yet run with compiled attention |
 
 The GEMM check runs **two** operand sets. The structured one is exactly

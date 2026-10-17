@@ -209,16 +209,16 @@ def attention_extents(matmuls: tuple, *, produces: int, consumes: int) -> dict[s
     scores, attended = matmuls[produces], matmuls[consumes]
     queries, head = scores.rows, attended.columns
     walked = {loop.axis: loop for loop in scores.tile_loops}
-    if "m" not in walked or "n" not in walked:
+    if "n" not in walked:
         stated = ", ".join(sorted(axis for axis in walked if axis)) or "neither axis"
         message = (
             f"Unable to read the extents matmul {produces} covers, whose loops state {stated}. An attention "
-            f"image walks the keys itself and a host issues it per query block, so both have to be loops this "
-            f"reader can name."
+            f"image walks the keys itself, so they have to be a loop this reader can name."
         )
         raise ProgramError(message)
-    return {"row_blocks": -(-walked["m"].bound // queries), "key_blocks": walked["n"].trips,
-            "queries": queries, "head": head}
+    # Reads a query loop canonicalization folded, being one block of queries, as one block.
+    row_blocks = -(-walked["m"].bound // queries) if "m" in walked else 1
+    return {"row_blocks": row_blocks, "key_blocks": walked["n"].trips, "queries": queries, "head": head}
 
 
 def pointwise_body(pointwise: Pointwise) -> tuple[VectorOp, ...]:

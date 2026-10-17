@@ -1478,6 +1478,9 @@ def _score_mask(*, graph: _Graph) -> tuple[ScoreMask, int] | None:
     select = selects[0]
     loops = graph.enclosing_loops(select)
     comparison = graph.defining(select.get_operand(0))
+    # Reads through the broadcast spreading a comparison made over one row or column across the score tile.
+    while comparison is not None and comparison.get_name() in _RESHAPES:
+        comparison = graph.defining(comparison.get_operand(0))
     if not loops or comparison is None or comparison.get_name() != "arith.cmpi":
         message = (
             "Unable to read a select outside a loop or chosen by other than one arith.cmpi. A mask is one comparison "

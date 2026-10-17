@@ -209,3 +209,38 @@ def gpt2_attention(
             running_max = block_max
         normalised = accumulator / running_sum[:, None]
         tl.store(output_pointer + offs_m[:, None] * stride_m + offs_d[None, :], normalised.to(tl.bfloat16))
+
+
+@triton.jit
+def gpt2_decode_attention(
+    query_pointer: "*bf16",
+    key_pointer: "*bf16",
+    value_pointer: "*bf16",
+    output_pointer: "*bf16",
+    stride_m: tl.constexpr = _HEAD,
+    N: tl.constexpr = _TOKENS,
+    LENGTH: tl.constexpr = _TOKENS,
+    D: tl.constexpr = _HEAD,
+    BLOCK_M: tl.constexpr = 16,
+    BLOCK_N: tl.constexpr = 16,
+):
+    """Attends one head of a block of new tokens' queries over the first LENGTH of N cached keys."""
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, D)
+    query = tl.load(query_pointer + offs_m[:, None] * stride_m + offs_d[None, :])
+    running_max = tl.zeros((BLOCK_M,), dtype=tl.float32) - float("inf")
+    running_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_M, D), dtype=tl.float32)
+    for start in range(0, N, BLOCK_N):
+        offs_n = start + tl.arange(0, BLOCK_N)
+        key = tl.load(key_pointer + offs_n[:, None] * stride_m + offs_d[None, :])
+        value = tl.load(value_pointer + offs_n[:, None] * stride_m + offs_d[None, :])
+        scores = tl.where(offs_n[None, :] < LENGTH, tl.dot(query, tl.trans(key)), _MASKED)
+        block_max = tl.maximum(running_max, tl.max(scores, 1))
+        probabilities = tl.exp(scores - block_max[:, None])
+        alpha = tl.exp(running_max - block_max)
+        running_sum = running_sum * alpha + tl.sum(probabilities, 1)
+        accumulator = accumulator * alpha[:, None] + tl.dot(probabilities.to(tl.bfloat16), value)
+        running_max = block_max
+    normalised = accumulator / running_sum[:, None]
+    tl.store(output_pointer + offs_m[:, None] * stride_m + offs_d[None, :], normalised.to(tl.bfloat16))

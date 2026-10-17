@@ -8,7 +8,7 @@ from numpy.typing import NDArray
 from asm import IRAM_DEPTH, AsmKernel
 from bf16 import _BLOCK_DEPTH, _TILE
 from emit import (Staging, flash_attention_stream, fused_ffn_stream, looped_gemm_stream, pointwise_stream,
-                  resident_attention_stream, row_stream)
+                  resident_attention_stream, row_stream, strided_copy_stream)
 
 from .ir import FlashLaunch, FusedLaunch, Launch, MatMul, PointwiseLaunch, ProgramError, RowLaunch
 
@@ -87,13 +87,16 @@ def compile_launch(launch: Launch | FusedLaunch | FlashLaunch) -> tuple[bytes, S
     return _assemble(name="looped_gemm", bundles=bundles, remedy=remedy), staging
 
 
-def compile_resident_attention(launch: FlashLaunch, *, heads: int, fused_tiles: int) -> bytes:
-    """Returns the image attending every head of every token block where the fused QKV tensor lies.
+def compile_resident_attention(launch: FlashLaunch, *, heads: int, fused_tiles: int,
+                               cache_tiles: int | None = None) -> bytes:
+    """Returns the image attending every head where the fused QKV tensor lies.
 
     Args:
         launch: The masked attention launch the planner produced, whose steps the image runs.
         heads: Heads the fused tensor carries.
         fused_tiles: Feature tiles one token of the fused tensor holds.
+        cache_tiles: Feature tiles one token of the KV cache holds, for a decode image attending one query block
+            over it, or None for an image attending the fused tensor's every token.
 
     Returns:
         The image bytes padded to the loader's boundary.
@@ -109,10 +112,27 @@ def compile_resident_attention(launch: FlashLaunch, *, heads: int, fused_tiles: 
         raise ProgramError(message)
     bundles = resident_attention_stream(key_blocks=launch.key_blocks, head=launch.head, body=launch.body,
                                         epilogue=launch.epilogue, constants=len(launch.constants), heads=heads,
-                                        fused_tiles=fused_tiles)
+                                        fused_tiles=fused_tiles, cache_tiles=cache_tiles)
     # Pins the hand placement, whose gaps carry the VMEM and staging array dependencies the hazard model cannot see.
     return _assemble(name="resident_attention", bundles=bundles, placements=("",),
                      remedy="narrow the head the block accumulates")
+
+
+def compile_copy(*, rows: int, stride: int) -> bytes:
+    """Returns the image copying rows spaced `stride` bytes apart from its first argument to its third.
+
+    Args:
+        rows: Rows to copy, each 32 bytes.
+        stride: Bytes between one row and the next at both ends.
+
+    Returns:
+        The image bytes padded to the loader's boundary.
+
+    Raises:
+        ProgramError: If the compiled bundles exceed the IRAM depth limit.
+    """
+    return _assemble(name="copy", bundles=strided_copy_stream(rows=rows, stride=stride), placements=("",),
+                     remedy="copy fewer rows per launch")
 
 
 def compile_pointwise(launch: PointwiseLaunch) -> bytes:

@@ -246,6 +246,78 @@ class DeviceTensorSlice:
         return self._d_parent.operand(block) + self._offset
 
 
+class KVCache:
+    """One layer's keys and values for every token attended so far, resident in the layout decode attention reads.
+
+    Notes:
+        The cache is a [capacity, 2 * model] tensor holding each token's keys and then its values, in the block
+        layout the QKV projection drains, so filling it is a copy and never a repack.
+
+    Args:
+        capacity: Tokens the cache can hold, a whole number of token blocks.
+        model: The model width, which each token's keys and values each span.
+
+    Attributes:
+        tensor: The resident keys and values.
+        length: Tokens the cache holds.
+    """
+
+    def __init__(self, capacity: int, model: int = _MODEL_WIDTH) -> None:
+        self.tensor = _allocate_tensor(capacity, 2 * model)
+        self.length = 0
+
+    def extend(self, d_fused: DeviceTensor, *, tokens: int | None = None) -> None:
+        """Copies a prefill's keys and values into the cache, after the tokens it already holds.
+
+        Args:
+            d_fused: [tokens, 3 * model] fused QKV projection, resident.
+            tokens: Tokens of it that are real, the rest padding its last block, or None for every one.
+
+        Raises:
+            ValueError: If the cache holds part of a token block, or has no room for the prefill.
+        """
+        tokens = d_fused.tokens if tokens is None else tokens
+        if self.length % _BLOCK_TOKENS or self.length + d_fused.tokens > self.tensor.tokens:
+            message = (
+                f"Unable to extend a cache holding {self.length} of {self.tensor.tokens} tokens by {d_fused.tokens}. "
+                f"A prefill fills whole token blocks, so the cache must hold whole blocks and have room for them."
+            )
+            raise ValueError(message)
+        rows = self.tensor.features // _TILE * _BLOCK_TOKENS
+        first = self.length // _BLOCK_TOKENS
+        for block in range(d_fused.blocks):
+            _launch_copy(rows=rows, stride=_ROW_BYTES, source=d_fused.operand(block) + self._keys_offset(d_fused),
+                         destination=self.tensor.operand(first + block))
+        self.length += tokens
+
+    def append(self, d_fused: DeviceTensor) -> None:
+        """Copies a decode step's new token, the first row of its fused QKV projection, into the next slot.
+
+        Args:
+            d_fused: [tokens, 3 * model] fused QKV projection of the decode step, resident.
+
+        Raises:
+            ValueError: If the cache is full.
+        """
+        if self.length >= self.tensor.tokens:
+            message = f"Unable to append to a cache holding all {self.tensor.tokens} tokens it has room for."
+            raise ValueError(message)
+        block, row = divmod(self.length, _BLOCK_TOKENS)
+        _launch_copy(rows=self.tensor.features // _TILE, stride=_BLOCK_TOKENS * _ROW_BYTES,
+                     source=d_fused.operand(0) + self._keys_offset(d_fused),
+                     destination=self.tensor.operand(block) + row * _ROW_BYTES)
+        self.length += 1
+
+    def free(self) -> None:
+        """Returns the cache's tensor to the pool."""
+        self.tensor.free()
+
+    @staticmethod
+    def _keys_offset(d_fused: DeviceTensor) -> int:
+        """Returns the bytes a token block's keys lie past its queries, being one model width of tiles."""
+        return d_fused.features // 3 // _TILE * _BLOCK_TOKENS * _ROW_BYTES
+
+
 def layernorm_reference(
     rows: NDArray[np.float32], gamma: NDArray[np.float32], beta: NDArray[np.float32]
 ) -> NDArray[np.float32]:
@@ -812,7 +884,8 @@ def softmax_rows(scores: NDArray[np.float32]) -> NDArray[np.float32]:
     return h_result
 
 
-def transformer_block(hidden: NDArray[np.float32], weights: dict, *, heads: int = 12) -> NDArray[np.float32]:
+def transformer_block(hidden: NDArray[np.float32], weights: dict, *, heads: int = 12,
+                      cache: KVCache | None = None) -> NDArray[np.float32]:
     """Runs one GPT-2 transformer block on the device, keeping every intermediate resident in DMEM.
 
     Notes:
@@ -827,6 +900,7 @@ def transformer_block(hidden: NDArray[np.float32], weights: dict, *, heads: int 
             ``attn.qkv.w``, ``attn.qkv.b``, ``attn.proj.w``, ``attn.proj.b``, ``ln_2.g``,
             ``ln_2.b``, ``mlp.fc.w``, ``mlp.fc.b``, ``mlp.proj.w``, ``mlp.proj.b``.
         heads: Attention heads the model width splits into.
+        cache: The layer's KV cache, which the block's keys and values are copied into, or None for no cache.
 
     Returns:
         The [tokens, model] block output.
@@ -855,6 +929,8 @@ def transformer_block(hidden: NDArray[np.float32], weights: dict, *, heads: int 
         d_normed = kept(layernorm_resident(d_hidden, d_constants[0]))
         d_fused = kept(add_bias_resident(kept(gemm_resident(d_normed, d_weights["attn.qkv.w"])),
                                          d_biases["attn.qkv.b"]))
+        if cache is not None:
+            cache.extend(d_fused)
         d_attended = attention(d_fused, heads=heads)
         d_projected = kept(add_bias_resident(kept(gemm_resident(d_attended, d_weights["attn.proj.w"])),
                                              d_biases["attn.proj.b"]))
@@ -1299,6 +1375,34 @@ def check_layernorm(*, tokens: int = 32) -> str:
     return f"[{tokens},{_MODEL_WIDTH}] rows compiled, relative error {error:.2%}"
 
 
+def check_kv_cache(*, tokens: int = 64, model: int = _MODEL_WIDTH) -> str:
+    """Fills a KV cache from a prefill's fused projection and one decode step's, and reads it back.
+
+    Returns:
+        The detail the report line carries.
+
+    Raises:
+        AssertionError: If the cache holds other than each token's keys and values, exactly.
+    """
+    rng = np.random.default_rng(31)
+    h_prefill = _on_bf16_grid(values=rng.standard_normal((tokens, 3 * model)).astype(np.float32))
+    h_step = _on_bf16_grid(values=rng.standard_normal((_BLOCK_TOKENS, 3 * model)).astype(np.float32))
+    d_prefill, d_step = upload_activations(h_prefill), upload_activations(h_step)
+    cache = KVCache(capacity=tokens + _BLOCK_TOKENS, model=model)
+    try:
+        cache.extend(d_prefill)
+        cache.append(d_step)
+        held = download_activations(cache.tensor)[:cache.length]
+    finally:
+        cache.free()
+        d_prefill.free()
+        d_step.free()
+    expected = np.concatenate([h_prefill[:, model:], h_step[:1, model:]], axis=0)
+    assert np.array_equal(held, expected), (
+        f"the cache differs from the tokens' keys and values by up to {np.abs(held - expected).max():.3e}")
+    return f"{tokens} prefill tokens and one decode token, [{cache.length},{2 * model}] keys and values, exact"
+
+
 def check_transformer_block(*, tokens: int = 64) -> str:
     """Runs one GPT-2 transformer block on the device and verifies it against the host reference.
 
@@ -1452,6 +1556,14 @@ def _attention_constants(entry: dict) -> int:
     return d_address
 
 
+def _launch_copy(*, rows: int, stride: int, source: int, destination: int) -> None:
+    """Copies rows spaced `stride` bytes apart from one DMEM address to another through the compiled copy image."""
+    image_bytes, _ = _compiled_image(kind="copy", rows=rows, stride=stride)
+    minitpuSetDevice(_UIO_NAME)
+    d_image = _stage_image(image_bytes)
+    minitpuLaunchKernel(d_image, len(image_bytes), args=[source, 0, destination])
+
+
 def _stage_image(image_bytes: bytes) -> int:
     """Makes a kernel image resident in DMEM, once, and returns its address.
 
@@ -1576,6 +1688,7 @@ def main() -> int:
         run_check(name="Elementwise add on device", check=check_elementwise_add),
         run_check(name="Decode attention, all heads", check=check_decode_attention),
         run_check(name="LayerNorm", check=check_layernorm),
+        run_check(name="KV cache", check=check_kv_cache),
         run_check(name="Transformer block", check=check_transformer_block),
     ]
     print(f"\n{sum(outcomes)} of {len(outcomes)} checks passed")

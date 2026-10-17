@@ -17,10 +17,10 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE / "board_package"))
 
-from bf16 import _BLOCK_TOKENS, _TILE, pack_attention_constants  # noqa: E402
-from compiler import (ProgramError, compile_launch, compile_pointwise, compile_resident_attention,  # noqa: E402
-                      compile_rows, plan, plan_pointwise, plan_rows, read_pointwise, read_program, read_rows,
-                      signature_of)
+from bf16 import _BLOCK_TOKENS, _ROW_BYTES, _TILE, pack_attention_constants  # noqa: E402
+from compiler import (ProgramError, compile_copy, compile_launch, compile_pointwise,  # noqa: E402
+                      compile_resident_attention, compile_rows, plan, plan_pointwise, plan_rows, read_pointwise,
+                      read_program, read_rows, signature_of)
 from compiler.ir import FlashLaunch, Launch  # noqa: E402
 from gpt2_triton import (gpt2_add, gpt2_add_bias, gpt2_attention, gpt2_layernorm, gpt2_matmul,  # noqa: E402
                          gpt2_matmul_gelu)
@@ -57,12 +57,19 @@ _ROW_KERNELS: dict[str, JITFunction] = {"layernorm": gpt2_layernorm}
 _ATTENTION: tuple[tuple[int, int], ...] = ((64, 12),)
 """Tokens and heads of each attention image one layer launches, the key loop's length fixed by the tokens."""
 
+_COPIES: tuple[tuple[int, int], ...] = (
+    (2 * _MODEL // _TILE * _BLOCK_TOKENS, _ROW_BYTES),
+    (2 * _MODEL // _TILE, _BLOCK_TOKENS * _ROW_BYTES),
+)
+"""Rows and stride of each copy filling the KV cache, being a token block's keys and values after a prefill and
+one token's after a decode step."""
+
 _MANIFEST: str = "manifest.json"
 """Name the manifest is written under, beside the images it describes."""
 
 
 def main() -> int:
-    """Compiles every shape in `_SHAPES`, `_POINTWISE`, `_ROWS` and `_ATTENTION` and writes the images and manifest.
+    """Compiles every shape the tables above list and writes the images and the manifest.
 
     Returns:
         Zero once every image is written.
@@ -101,6 +108,12 @@ def main() -> int:
         (written / entry["constants"]).write_bytes(constants)
         manifest[name] = entry
         print(f"wrote {written / name}  {len(image)} bytes  key_blocks={entry['key_blocks']} heads={heads}")
+    for rows, stride in _COPIES:
+        name = f"copy_{rows}x{stride}.bin"
+        image = compile_copy(rows=rows, stride=stride)
+        (written / name).write_bytes(image)
+        manifest[name] = {"kind": "copy", "rows": rows, "stride": stride}
+        print(f"wrote {written / name}  {len(image)} bytes")
     (written / _MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"wrote {written / _MANIFEST}")
     return 0

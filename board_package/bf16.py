@@ -116,22 +116,6 @@ _ROW_SOFTMAX_OUT: int = 1024
 _VREG_ELEMENTS: int = _NUM_LANES * _NUM_SUBLANES
 """The number of values one vector register holds."""
 
-_ATTENTION_ROWS_PER_TOKEN: int = (_ROW_SOFTMAX_OUT - _ROW_SCORES) // _BLOCK_TOKENS
-"""VMEM rows the score staging affords each token of a block."""
-
-if _ATTENTION_ROWS_PER_TOKEN < 1:
-    _STAGING_MESSAGE = (
-        f"Unable to stage {_BLOCK_TOKENS} tokens of scores in {_ROW_SOFTMAX_OUT - _ROW_SCORES} rows. Move "
-        f"`_ROW_SOFTMAX_OUT`."
-    )
-    raise ValueError(_STAGING_MESSAGE)
-
-_ATTENTION_TOKEN_ROWS: int = 1 << (_ATTENTION_ROWS_PER_TOKEN.bit_length() - 1)
-"""VMEM rows one token's scores own, rounded down to the power of two the AGU reaches by shifting."""
-
-MAX_ATTENTION_ROWS: int = _ATTENTION_TOKEN_ROWS * _TILE // _VREG_ELEMENTS * _VREG_ELEMENTS
-"""Rows one attention launch covers, which the score staging bounds rather than the VREG a reduction spans."""
-
 _MAX_DESCRIPTOR_ROWS: int = 128
 """The largest number of rows one DMA descriptor moves, which is the chunk every staged region is sized in."""
 
@@ -493,15 +477,13 @@ def pack_attention(query: NDArray[np.float32], key: NDArray[np.float32], value: 
         )
         raise ValueError(message)
 
-    # One launch stages the queries of its own block, so each block carries the two tiles it enters the loop
-    # from and a host reaches the next by advancing one block's worth of rows.
-    initial = np.full((_TILE, _NUM_LANES), initial_maximum, dtype=np.float32)
-    cleared = np.zeros((_TILE, _NUM_LANES), dtype=np.float32)
-    stated = [np.full((_TILE, _NUM_LANES), number, dtype=np.float32) for number in constants]
-    masked = [() if masks is None else tuple(masks[block]) for block in range(queries // _TILE)]
+    # One launch stages the queries of its own block, so each block carries the tiles it enters the loop from and
+    # a host reaches the next by advancing one block's worth of rows.
+    entered = _attention_constants(blocks=queries // _TILE, initial_maximum=initial_maximum, constants=constants,
+                                   masks=masks)
     staged = np.concatenate([piece for block in range(queries // _TILE)
-                             for piece in (_by_tile(query[block * _TILE: (block + 1) * _TILE]),
-                                           initial, cleared, *stated, *masked[block])], axis=0)
+                             for piece in (_by_tile(query[block * _TILE: (block + 1) * _TILE]), entered[block])],
+                            axis=0)
 
     blocks: list[NDArray[np.float32]] = []
     for block in range(key.shape[0] // _TILE):
@@ -511,6 +493,24 @@ def pack_attention(query: NDArray[np.float32], key: NDArray[np.float32], value: 
                                       for tile in range(head // _TILE)], axis=0))
         blocks.append(_by_tile(value[rows]))
     return as_bf16_words(values=staged), as_bf16_words(values=np.concatenate(blocks, axis=0))
+
+
+def pack_attention_constants(*, initial_maximum: float, constants: tuple[float, ...],
+                             masks: NDArray[np.float32]) -> NDArray[np.uint16]:
+    """Lays out the constants block a resident attention image stages for each query block.
+
+    Args:
+        initial_maximum: Value the running maximum enters below, which every score clears.
+        constants: Numbers the kernel states, a tile of each.
+        masks: The tile added to the scores of each pair of a query block and a key block, shaped [query blocks,
+            key blocks, queries, keys].
+
+    Returns:
+        The words of every query block's initial maximum, zeros, stated numbers and mask tiles, block after block.
+    """
+    entered = _attention_constants(blocks=masks.shape[0], initial_maximum=initial_maximum, constants=constants,
+                                   masks=masks)
+    return as_bf16_words(values=np.concatenate(entered, axis=0))
 
 
 def fused_ffn_reference(activations: NDArray[np.float32], up_weight: NDArray[np.float32],
@@ -722,6 +722,16 @@ def _require_norm_operands(*, width: int, **operands: NDArray[np.float32]) -> No
                 f"{width} features."
             )
             raise ValueError(message)
+
+
+def _attention_constants(*, blocks: int, initial_maximum: float, constants: tuple[float, ...],
+                         masks: NDArray[np.float32] | None) -> list[NDArray[np.float32]]:
+    """Returns the tiles each query block enters its key loop from, in the order it stages them."""
+    initial = np.full((_TILE, _NUM_LANES), initial_maximum, dtype=np.float32)
+    cleared = np.zeros((_TILE, _NUM_LANES), dtype=np.float32)
+    stated = [np.full((_TILE, _NUM_LANES), number, dtype=np.float32) for number in constants]
+    return [np.concatenate([initial, cleared, *stated, *(() if masks is None else masks[block])], axis=0)
+            for block in range(blocks)]
 
 
 def _by_tile(matrix: NDArray[np.float32]) -> NDArray[np.float32]:

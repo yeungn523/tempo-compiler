@@ -71,26 +71,25 @@ scratch buffers. These costs are measured separately in `SESSION_CHECKLIST.md`.
 
 ## What the board checks prove
 
-`make kernels` runs eight checks. Each compares the device against a host
+`make kernels` runs seven checks. Each compares the device against a host
 reference that rounds where the device rounds, so the residual is the arithmetic
 the machine actually does, not a tolerance covering an unmodelled effect. Every
-GEMM, add and LayerNorm a check launches is a compiled image from `images/`, each
-GEMM summing the whole contraction in the device's BF16 accumulators.
+GEMM, add and LayerNorm a check launches, and the transformer block's attention,
+is a compiled image from `images/`, each GEMM summing the whole contraction in
+the device's BF16 accumulators.
 
 Summing on the device roughly doubles a deep product's error against summing
 per-group partials on the host, which is why Full GEMM sits at 0.86 % against
-its 1 % bar. Attention's block-diagonal products are unchanged by it, each
-head's rows lying inside one group and the rest adding exact zeros.
+its 1 % bar.
 
 | Check | Shape | Result |
 | --- | --- | --- |
 | Halt, COPY round trip | — | control-path smoke tests |
 | Full GEMM | `[32,768] @ [768,3072]` | 0.86 % |
 | Elementwise add | `[32,768] + [32,768]` | exact |
-| Prefill attention, all heads | 12 heads × 20 causal queries | 0.54 % |
 | Decode attention, all heads | 12 heads × 1 query, 48 keys | 0.67 % |
 | LayerNorm | 32 × 768, resident | 0.54 % in RTL simulation, not yet run on the board |
-| **Transformer block** | 64 × 768, 12 heads, resident | **1.27 %** |
+| **Transformer block** | 64 × 768, 12 causal heads, resident | not yet run with compiled attention |
 
 The GEMM check runs **two** operand sets. The structured one is exactly
 representable and pins the kernel bit for bit; the varying one differs along
@@ -104,8 +103,9 @@ observe a token, contraction-block or output-column confusion.
 ## What runs where
 
 The PL runs all eighteen operations in each transformer layer: LayerNorm,
-projections, attention reshaping and transpose, softmax, GELU, biases, and
-residuals. Activations remain in DMEM from the body's entry upload through its
+projections, attention, GELU, biases, and residuals. The block's attention is one
+compiled launch covering every head and token block, reading Q, K and V where the
+QKV projection drained them. Activations remain in DMEM from the body's entry upload through its
 exit download. Projection biases are stored as one row and broadcast by
 stride-zero VMEM reads rather than materialised for each token shape.
 
@@ -113,12 +113,9 @@ The PS performs embedding, final LayerNorm, the tied language head, sampling, an
 all launch orchestration. First-use setup transfers still occur; only a warm pass
 is down to the two activation transfers.
 
-Two costs are worth knowing because they are temporary, not inherent:
-
-- Attention pads its 64-deep contraction to 192, because the looped GEMM
-  accumulates a whole number of `_LOOP_BLOCKS × _BLOCK_DEPTH` before draining.
-  Exact — the extra terms are zero — but it moves three times the bytes it needs.
-- The attention row limit is 320 padded rows, set by its current VMEM region map.
+The compiled attention image fixes its sequence length when it is built, so the
+transformer block runs only at the lengths `tools/build_gpt2_images.py` lists,
+currently 64 tokens.
 
 ## Files
 

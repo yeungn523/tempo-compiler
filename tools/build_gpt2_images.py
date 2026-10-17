@@ -17,11 +17,13 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE / "board_package"))
 
-from bf16 import _BLOCK_TOKENS  # noqa: E402
-from compiler import (ProgramError, compile_launch, compile_pointwise, compile_rows, plan,  # noqa: E402
-                      plan_pointwise, plan_rows, read_pointwise, read_program, read_rows, signature_of)
-from compiler.ir import Launch  # noqa: E402
-from gpt2_triton import gpt2_add, gpt2_add_bias, gpt2_layernorm, gpt2_matmul, gpt2_matmul_gelu  # noqa: E402
+from bf16 import _BLOCK_TOKENS, _TILE, pack_attention_constants  # noqa: E402
+from compiler import (ProgramError, compile_launch, compile_pointwise, compile_resident_attention,  # noqa: E402
+                      compile_rows, plan, plan_pointwise, plan_rows, read_pointwise, read_program, read_rows,
+                      signature_of)
+from compiler.ir import FlashLaunch, Launch  # noqa: E402
+from gpt2_triton import (gpt2_add, gpt2_add_bias, gpt2_attention, gpt2_layernorm, gpt2_matmul,  # noqa: E402
+                         gpt2_matmul_gelu)
 from triton.runtime import JITFunction  # noqa: E402
 
 _MODEL: int = 768
@@ -52,12 +54,15 @@ _ROWS: tuple[tuple[str, int], ...] = (("layernorm", _MODEL),)
 _ROW_KERNELS: dict[str, JITFunction] = {"layernorm": gpt2_layernorm}
 """Kernel each row kind is compiled from."""
 
+_ATTENTION: tuple[tuple[int, int], ...] = ((64, 12),)
+"""Tokens and heads of each attention image one layer launches, the key loop's length fixed by the tokens."""
+
 _MANIFEST: str = "manifest.json"
 """Name the manifest is written under, beside the images it describes."""
 
 
 def main() -> int:
-    """Compiles every shape in `_SHAPES`, `_POINTWISE` and `_ROWS` and writes the images and the manifest.
+    """Compiles every shape in `_SHAPES`, `_POINTWISE`, `_ROWS` and `_ATTENTION` and writes the images and manifest.
 
     Returns:
         Zero once every image is written.
@@ -89,6 +94,13 @@ def main() -> int:
         (written / name).write_bytes(image)
         manifest[name] = entry
         print(f"wrote {written / name}  {len(image)} bytes  rows={entry['rows']} scalars={entry['scalars']}")
+    for tokens, heads in _ATTENTION:
+        image, constants, entry = _compile_attention(tokens=tokens, heads=heads)
+        name = f"attention_{tokens}.bin"
+        (written / name).write_bytes(image)
+        (written / entry["constants"]).write_bytes(constants)
+        manifest[name] = entry
+        print(f"wrote {written / name}  {len(image)} bytes  key_blocks={entry['key_blocks']} heads={heads}")
     (written / _MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"wrote {written / _MANIFEST}")
     return 0
@@ -197,6 +209,39 @@ def _compile_rows(*, kind: str, features: int) -> tuple[bytes, dict[str, int | f
     launch = plan_rows(rows)
     entry = {"kind": kind, "features": features, "rows": list(rows.rows), "scalars": list(launch.scalars)}
     return compile_rows(launch), entry
+
+
+def _compile_attention(*, tokens: int, heads: int) -> tuple[bytes, bytes, dict[str, int | str]]:
+    """Compiles GPT-2's causal attention over one sequence length and returns its image, constants and entry.
+
+    Args:
+        tokens: Tokens the sequence holds, which fixes the key loop's length and the mask tiles.
+        heads: Heads the fused QKV tensor carries, which the one launch walks.
+
+    Returns:
+        The image bytes, the constants block a host uploads beside it, and the manifest entry naming that block's
+        file.
+
+    Raises:
+        ProgramError: If the kernel does not plan as one masked attention launch.
+    """
+    declared = {parameter.name: parameter.default for parameter in gpt2_attention.params if parameter.is_constexpr}
+    matmuls = read_program(gpt2_attention, signature=signature_of(gpt2_attention, operands={}),
+                           constexprs=declared | {"M": tokens})
+    planned = plan(matmuls, strides={})
+    launch = planned.launches[0]
+    if len(planned.launches) != 1 or not isinstance(launch, FlashLaunch) or launch.mask is None:
+        message = (
+            f"Unable to compile GPT-2's attention over {tokens} tokens into one image. It must plan as one masked "
+            f"attention launch, but got {len(planned.launches)} launches."
+        )
+        raise ProgramError(message)
+    image = compile_resident_attention(launch, heads=heads, fused_tiles=3 * _MODEL // _TILE)
+    constants = pack_attention_constants(initial_maximum=launch.entering, constants=launch.constants,
+                                         masks=launch.mask_tiles)
+    entry = {"kind": "attention", "tokens": tokens, "heads": heads, "key_blocks": launch.key_blocks,
+             "constants": f"attention_{tokens}_constants.bin"}
+    return image, constants.tobytes(), entry
 
 
 if __name__ == "__main__":

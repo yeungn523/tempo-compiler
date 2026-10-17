@@ -8,7 +8,7 @@ from numpy.typing import NDArray
 from asm import IRAM_DEPTH, AsmKernel
 from bf16 import _BLOCK_DEPTH, _TILE
 from emit import (Staging, flash_attention_stream, fused_ffn_stream, looped_gemm_stream, pointwise_stream,
-                  row_stream)
+                  resident_attention_stream, row_stream)
 
 from .ir import FlashLaunch, FusedLaunch, Launch, MatMul, PointwiseLaunch, ProgramError, RowLaunch
 
@@ -85,6 +85,34 @@ def compile_launch(launch: Launch | FusedLaunch | FlashLaunch) -> tuple[bytes, S
         f"narrow the tile width, where a BLOCK_N of {launch.block_n} unrolls {launch.output_tiles} output tiles"
     )
     return _assemble(name="looped_gemm", bundles=bundles, remedy=remedy), staging
+
+
+def compile_resident_attention(launch: FlashLaunch, *, heads: int, fused_tiles: int) -> bytes:
+    """Returns the image attending every head of every token block where the fused QKV tensor lies.
+
+    Args:
+        launch: The masked attention launch the planner produced, whose steps the image runs.
+        heads: Heads the fused tensor carries.
+        fused_tiles: Feature tiles one token of the fused tensor holds.
+
+    Returns:
+        The image bytes padded to the loader's boundary.
+
+    Raises:
+        ProgramError: If the launch carries no steps or no mask, or the image exceeds the IRAM depth limit.
+    """
+    if not launch.body or launch.mask is None:
+        message = (
+            "Unable to compile a resident attention image from a launch carrying no steps or no mask. The image "
+            "stages one mask tile per key block, so it runs a kernel selecting its scores by position."
+        )
+        raise ProgramError(message)
+    bundles = resident_attention_stream(key_blocks=launch.key_blocks, head=launch.head, body=launch.body,
+                                        epilogue=launch.epilogue, constants=len(launch.constants), heads=heads,
+                                        fused_tiles=fused_tiles)
+    # Pins the hand placement, whose gaps carry the VMEM and staging array dependencies the hazard model cannot see.
+    return _assemble(name="resident_attention", bundles=bundles, placements=("",),
+                     remedy="narrow the head the block accumulates")
 
 
 def compile_pointwise(launch: PointwiseLaunch) -> bytes:

@@ -143,7 +143,22 @@ _BLOCK_SHIFT: int = _BLOCK_TOKENS.bit_length() - 1
 """Shift the AGU walks the input and the output by per iteration, each covering a token block of rows."""
 
 _KEY_LOOP_LEVEL: int = 1
-"""Loop level an attention block's key loop runs at, inside the loop walking its query blocks."""
+"""Loop level an attention block's key loop runs at, inside the one loop walking its query blocks or its heads."""
+
+_RESIDENT_CONSTANTS: int = 0
+"""Scalar register, and launch argument, holding a resident attention image's constants block."""
+
+_RESIDENT_KEYS: int = 1
+"""Scalar register walking the current head's keys and values through the fused tensor."""
+
+_RESIDENT_QUERIES: int = 2
+"""Scalar register, and launch argument, holding the current head's queries, which its output overwrites."""
+
+_RESIDENT_KEY_LEVEL: int = 3
+"""Loop level a resident attention image's key loop runs at, inside the token block, head and query half loops."""
+
+_TOKEN_BLOCK_SHIFT: int = _BLOCK_TOKENS.bit_length() - 1
+"""Shift a walked load advances by per key token block, being the rows of two mask tiles."""
 
 _POINTWISE_POINTERS: tuple[int, int, int] = (0, 1, 2)
 """Scalar registers holding a pointwise image's left, right and output pointers, each bound from the launch argument
@@ -1009,7 +1024,8 @@ def check_steps(body: tuple[Step, ...]) -> None:
 
 
 def emit_steps(put: Callable[..., None], builder: asm_module.AsmBuilder, slot: int, *, body: tuple[Step, ...],
-               registers: FlashRegisterMap, rows: dict[str, int], turnaround: int) -> int:
+               registers: FlashRegisterMap, rows: dict[str, int], turnaround: int,
+               key_level: int = _KEY_LOOP_LEVEL, walk_shift: int = _TILE_SHIFT) -> int:
     """Places every step of one body, resolving its regions through the register map.
 
     Args:
@@ -1020,6 +1036,8 @@ def emit_steps(put: Callable[..., None], builder: asm_module.AsmBuilder, slot: i
         registers: Where the block's tiles live.
         rows: First VMEM row of each staged region, keyed by what it stages.
         turnaround: Bundles an access waits after the one whose VMEM rows it reads.
+        key_level: Loop level the key loop runs at, which a walked load reads its counter from.
+        walk_shift: Shift a walked load applies to that counter, being the rows one trip advances it by.
 
     Returns:
         The next free bundle index.
@@ -1038,8 +1056,8 @@ def emit_steps(put: Callable[..., None], builder: asm_module.AsmBuilder, slot: i
             for vreg in range(_TILE_VREGS):
                 put(offset=slot, x=builder.vld(region(step.into) + vreg,
                                                _tile_row(rows[step.region], step.tile, vreg),
-                                               agu=step.walked, shift=_TILE_SHIFT if step.walked else 0,
-                                               level=_KEY_LOOP_LEVEL if step.walked else 0))
+                                               agu=step.walked, shift=walk_shift if step.walked else 0,
+                                               level=key_level if step.walked else 0))
                 slot += 1
         elif isinstance(step, Store):
             for vreg in range(_TILE_VREGS):
@@ -1127,7 +1145,6 @@ def flash_attention(*, key_blocks: int, queries: int = _TILE, head: int = _VREG_
     rows = _flash_vmem_map(head=head, constants=constants, masks=key_blocks if masked else 0)
     staged_rows = head + (2 + constants + (key_blocks if masked else 0)) * _TILE
     tiles = registers.output_tiles
-    maximum, total = _tile_registers(registers.row_max), _tile_registers(registers.row_sum)
     builder = asm_module.AsmBuilder()
     bundles: dict[int, dict[str, int]] = {}
 
@@ -1164,22 +1181,7 @@ def flash_attention(*, key_blocks: int, queries: int = _TILE, head: int = _VREG_
             slot += _SCALAR_GAP
     walked_rows = staged - span
 
-    # Enters the maximum below every score, so the first rescale multiplies by zero.
-    for vreg in range(_TILE_VREGS):
-        put(offset=slot, x=builder.vld(maximum[vreg], rows["initial"] + _NUM_SUBLANES * vreg))
-        slot += 1
-        put(offset=slot, x=builder.vld(total[vreg], rows["zero"] + _NUM_SUBLANES * vreg))
-        slot += 1
-        if registers.spilled:
-            put(offset=slot, x=builder.vld(registers.scratch + vreg, rows["zero"] + _NUM_SUBLANES * vreg))
-            slot += 1
-    for tile in range(tiles):
-        for vreg in range(_TILE_VREGS):
-            cleared = (builder.vld(registers.accumulator + tile * _TILE_VREGS + vreg,
-                                   rows["zero"] + _NUM_SUBLANES * vreg) if tile < registers.resident
-                       else builder.vst(registers.scratch + vreg, _tile_row(rows["output"], tile, vreg)))
-            put(offset=slot, x=cleared)
-            slot += 1
+    slot = _emit_flash_entry(put, builder, slot, registers=registers, rows=rows)
 
     put(offset=slot, f=builder.lbegin(key_blocks))
     slot += 1
@@ -1222,6 +1224,135 @@ def flash_attention(*, key_blocks: int, queries: int = _TILE, head: int = _VREG_
     staging = Staging(rows=queries, columns=head, output_tiles=tiles, blocks=row_blocks, partials=1,
                       drain_rows=row_blocks * head, zero_tile_words=0)
     return bundles, staging
+
+def resident_attention_stream(*, key_blocks: int, head: int, body: tuple[Step, ...], epilogue: tuple[Step, ...],
+                              constants: int, heads: int, fused_tiles: int,
+                              turnaround: int = _VMEM_TURNAROUND) -> tuple[int, ...]:
+    """Returns the image attending every head of every token block where the fused QKV tensor lies, as its words.
+
+    Notes:
+        The launch binds the constants block as argument 0 and the fused tensor's first token block as argument 2.
+        Each query block's output overwrites its queries, and each key tile is transposed in registers on its way
+        to the array. The key loop walks key token blocks and unrolls their two halves, which keeps every pointer
+        an affine walk that steps back to where its loop began.
+
+    Args:
+        key_blocks: Blocks of `_TILE` keys the sequence holds, which is also its query blocks.
+        head: Width of the head, a whole number of tiles.
+        body: The steps one key block runs.
+        epilogue: The steps a query block runs once its keys are done.
+        constants: Tiles of stated numbers the kernel reads, staged ahead of the mask tiles.
+        heads: Heads the fused tensor carries.
+        fused_tiles: Feature tiles one token of the fused tensor holds, being three times the model's.
+
+    Returns:
+        The bundle words in placement order.
+
+    Raises:
+        ValueError: If the sequence is not a whole number of token blocks.
+    """
+    halves = _BLOCK_TOKENS // _TILE
+    if key_blocks < halves or key_blocks % halves:
+        message = (
+            f"Unable to attend over {key_blocks} key blocks. The image walks whole token blocks of {halves} key "
+            f"blocks each, so the sequence must be a positive number of them."
+        )
+        raise ValueError(message)
+    token_blocks = key_blocks // halves
+    registers = flash_register_map(queries=_TILE, head=head)
+    tiles = registers.output_tiles
+    rows = _flash_vmem_map(head=head, constants=constants, masks=key_blocks)
+    tile_bytes = _BLOCK_TOKENS * _ROW_BYTES
+    block_bytes = _ZERO_TILE_BYTES + fused_tiles * tile_bytes
+    model_bytes = fused_tiles // 3 * tile_bytes
+    half_bytes = _TILE * _ROW_BYTES
+    head_bytes = tiles * tile_bytes
+    constant_bytes = (2 + constants + key_blocks) * half_bytes
+    walk = (tiles - 1) * tile_bytes
+    builder = asm_module.AsmBuilder()
+    bundles: dict[int, dict[str, int]] = {}
+
+    def put(*, offset: int, **slots: int) -> None:
+        """Merges slot words into one bundle, so co-issue reads at the call site."""
+        _merge(bundles=bundles, offset=offset, slots=slots)
+
+    def advance(at: int, register: int, delta: int) -> int:
+        """Moves one pointer by a displacement, returning the next free index."""
+        return _emit_split_advance(put=put, builder=builder, at=at, register=register, delta=delta,
+                                   gap=_SCALAR_GAP)
+
+    put(offset=0, s=builder.smovi(rd=_STRIDE_REGISTER, value=_ROW_BYTES))
+    put(offset=1, s=builder.smov_arg(rd=_RESIDENT_CONSTANTS, arg=_RESIDENT_CONSTANTS))
+    put(offset=2, s=builder.smov_arg(rd=_RESIDENT_QUERIES, arg=_RESIDENT_QUERIES))
+    put(offset=3, s=builder.smov_arg(rd=_RESIDENT_KEYS, arg=_RESIDENT_QUERIES))
+    slot = advance(3 + _SCALAR_GAP, _RESIDENT_KEYS, model_bytes)
+
+    put(offset=slot, f=builder.lbegin(token_blocks))
+    put(offset=slot + 1, f=builder.lbegin(heads))
+    put(offset=slot + 2, f=builder.lbegin(halves))
+    slot += 3
+    slot = _emit_tile_copies(put, builder, slot, store=False, register=_RESIDENT_CONSTANTS,
+                             first_row=rows["initial"], runs=constant_bytes // half_bytes, rows_each=_TILE,
+                             step=half_bytes)
+    # Steps past the last run, onto the next query half's constants.
+    slot = advance(slot, _RESIDENT_CONSTANTS, half_bytes)
+    slot = _emit_tile_copies(put, builder, slot, store=False, register=_RESIDENT_QUERIES, first_row=rows["query"],
+                             runs=tiles, rows_each=_TILE, step=tile_bytes)
+    slot = advance(slot, _RESIDENT_QUERIES, -walk)
+    slot = _emit_flash_entry(put, builder, slot, registers=registers, rows=rows)
+
+    put(offset=slot, f=builder.lbegin(token_blocks))
+    slot += 1
+    for half in range(halves):
+        slot = _emit_tile_copies(put, builder, slot, store=False, register=_RESIDENT_KEYS, first_row=rows["incoming"],
+                                 runs=tiles, rows_each=_TILE, step=tile_bytes)
+        # Crosses from the head's keys to its values, which lie one model width of tiles further on.
+        slot = advance(slot, _RESIDENT_KEYS, model_bytes - walk)
+        slot = _emit_tile_copies(put, builder, slot, store=False, register=_RESIDENT_KEYS, first_row=rows["value"],
+                                 runs=tiles, rows_each=_TILE, step=tile_bytes)
+        crossed = model_bytes + walk
+        following = half_bytes - crossed if half < halves - 1 else block_bytes - (halves - 1) * half_bytes - crossed
+        slot = advance(slot, _RESIDENT_KEYS, following)
+        slot = _emit_key_transposes(put, builder, slot, registers=registers, rows=rows, tiles=tiles)
+        slot += turnaround
+        # Reads this half's mask tiles, the key loop's counter stepping one token block of them per trip.
+        halved = {**rows, "mask": rows["mask"] + half * _TILE}
+        slot = emit_steps(put, builder, slot, body=body, registers=registers, rows=halved, turnaround=turnaround,
+                          key_level=_RESIDENT_KEY_LEVEL, walk_shift=_TOKEN_BLOCK_SHIFT)
+    slot += _POINTER_LATENCY
+    put(offset=slot, f=builder.loop_end())
+    slot += 1
+    slot = advance(slot, _RESIDENT_KEYS, -token_blocks * block_bytes)
+
+    slot = emit_steps(put, builder, slot, body=epilogue, registers=registers, rows=rows, turnaround=turnaround,
+                      key_level=_RESIDENT_KEY_LEVEL)
+    slot += turnaround
+    slot = _emit_tile_copies(put, builder, slot, store=True, register=_RESIDENT_QUERIES, first_row=rows["output"],
+                             runs=tiles, rows_each=_TILE, step=tile_bytes)
+    # Moves on to the next query half, whose queries lie a half further down the same tiles.
+    slot = advance(slot, _RESIDENT_QUERIES, half_bytes - walk)
+    slot += _POINTER_LATENCY
+    put(offset=slot, f=builder.loop_end())
+    slot += 1
+
+    # Moves on to the next head, rewinding the query halves and the constants every head shares.
+    slot = advance(slot, _RESIDENT_QUERIES, head_bytes - halves * half_bytes)
+    slot = advance(slot, _RESIDENT_KEYS, head_bytes)
+    slot = advance(slot, _RESIDENT_CONSTANTS, -halves * constant_bytes)
+    slot += _POINTER_LATENCY
+    put(offset=slot, f=builder.loop_end())
+    slot += 1
+
+    # Moves on to the next token block, its queries one block on and its constants past this block's halves.
+    slot = advance(slot, _RESIDENT_QUERIES, block_bytes - heads * head_bytes)
+    slot = advance(slot, _RESIDENT_KEYS, -heads * head_bytes)
+    slot = advance(slot, _RESIDENT_CONSTANTS, halves * constant_bytes)
+    slot += _POINTER_LATENCY
+    put(offset=slot, f=builder.loop_end())
+    slot += 1
+    put(offset=slot, f=builder.halt())
+    return _flatten(bundles)
+
 
 def flash_attention_stream(*, key_blocks: int, queries: int = _TILE, head: int = _VREG_ELEMENTS,
                            turnaround: int = _VMEM_TURNAROUND, body: tuple[Step, ...],
@@ -1485,6 +1616,99 @@ def _emit_vector_body(*, put: Callable[..., None], builder: asm_module.AsmBuilde
         writeback = RTL_PARAMS["WB_W_ALU"] if operation.kind in _ALU_KINDS else RTL_PARAMS["WB_W_SFU"]
         landed[operation.into] = at + writeback + 1
     return landed[body[-1].into]
+
+
+def _emit_key_transposes(put: Callable[..., None], builder: asm_module.AsmBuilder, slot: int, *,
+                         registers: FlashRegisterMap, rows: dict[str, int], tiles: int) -> int:
+    """Transposes each incoming key tile into the stationary tile the score product reads, returning the next index.
+
+    Args:
+        put: Merges slot words into the bundle at one offset.
+        builder: Encodes each slot word.
+        slot: The bundle index the first load occupies.
+        registers: Where the block's tiles live, whose shared span holds nothing between key blocks.
+        rows: First VMEM row of each staged region, keyed by what it stages.
+        tiles: Tiles the head covers.
+
+    Returns:
+        The next free bundle index, the last store issued.
+    """
+    source, destination = _tile_registers(registers.scores), _tile_registers(registers.staged)
+    for tile in range(tiles):
+        for vreg, register in enumerate(source):
+            put(offset=slot, x=builder.vld(register, _tile_row(rows["incoming"], tile, vreg)))
+            slot += 1
+        slot = _emit_transpose(put, builder, slot, source=source, destination=destination)
+        for vreg, register in enumerate(destination):
+            put(offset=slot, x=builder.vst(register, _tile_row(rows["key"], tile, vreg)))
+            slot += 1
+    return slot
+
+
+def _emit_flash_entry(put: Callable[..., None], builder: asm_module.AsmBuilder, slot: int, *,
+                      registers: FlashRegisterMap, rows: dict[str, int]) -> int:
+    """Enters one query block's running statistics and clears its accumulator, returning the next free index.
+
+    Args:
+        put: Merges slot words into the bundle at one offset.
+        builder: Encodes each slot word.
+        slot: The bundle index the first load occupies.
+        registers: Where the block's tiles live.
+        rows: First VMEM row of each staged region, keyed by what it stages.
+
+    Returns:
+        The next free bundle index.
+    """
+    maximum, total = _tile_registers(registers.row_max), _tile_registers(registers.row_sum)
+    # Enters the maximum below every score, so the first rescale multiplies by zero.
+    for vreg in range(_TILE_VREGS):
+        put(offset=slot, x=builder.vld(maximum[vreg], rows["initial"] + _NUM_SUBLANES * vreg))
+        slot += 1
+        put(offset=slot, x=builder.vld(total[vreg], rows["zero"] + _NUM_SUBLANES * vreg))
+        slot += 1
+        if registers.spilled:
+            put(offset=slot, x=builder.vld(registers.scratch + vreg, rows["zero"] + _NUM_SUBLANES * vreg))
+            slot += 1
+    for tile in range(registers.output_tiles):
+        for vreg in range(_TILE_VREGS):
+            cleared = (builder.vld(registers.accumulator + tile * _TILE_VREGS + vreg,
+                                   rows["zero"] + _NUM_SUBLANES * vreg) if tile < registers.resident
+                       else builder.vst(registers.scratch + vreg, _tile_row(rows["output"], tile, vreg)))
+            put(offset=slot, x=cleared)
+            slot += 1
+    return slot
+
+
+def _emit_tile_copies(put: Callable[..., None], builder: asm_module.AsmBuilder, slot: int, *, store: bool,
+                      register: int, first_row: int, runs: int, rows_each: int, step: int) -> int:
+    """Copies runs of contiguous rows between VMEM and DMEM, each run's DMEM address `step` bytes past the last.
+
+    Args:
+        put: Merges slot words into the bundle at one offset.
+        builder: Encodes each slot word.
+        slot: The bundle index the first descriptor occupies.
+        store: Determines whether the runs move from VMEM to DMEM, rather than from DMEM to VMEM.
+        register: Scalar register holding the first run's DMEM address, which the copies leave on the last run's.
+        first_row: VMEM row the first run occupies, the rest following it.
+        runs: Runs to copy.
+        rows_each: Rows one run covers.
+        step: Bytes between one run's DMEM address and the next.
+
+    Returns:
+        The next free bundle index, every copy having landed.
+    """
+    copy = builder.dma_store if store else builder.dma_load
+    for run in range(runs):
+        put(offset=slot, d=copy(run % 2, first_row + run * rows_each, rows_each, register, _STRIDE_REGISTER))
+        slot += 1
+        # Waits on the pair of slots a descriptor alternates between, which is what one flush mask covers.
+        if run % 2 or run == runs - 1:
+            put(offset=slot, f=builder.flush_slot(mask=3 if run % 2 else 1))
+            slot += 1
+        if run < runs - 1:
+            slot = _emit_split_advance(put=put, builder=builder, at=slot, register=register, delta=step,
+                                       gap=_SCALAR_GAP)
+    return slot
 
 
 def _innermost_staging(*, nest: tuple[LoopLevel, ...], operands: tuple[StagedOperand, ...],
@@ -2354,7 +2578,8 @@ def _flash_vmem_map(*, head: int, constants: int = 0, masks: int = 0) -> dict[st
         The first row of each region, keyed by what it stages.
     """
     spans = (("query", head), ("initial", _TILE), ("zero", _TILE), ("constant", constants * _TILE),
-             ("mask", masks * _TILE), ("key", head), ("value", head), ("output", head), ("scratch", _TILE * 2))
+             ("mask", masks * _TILE), ("key", head), ("value", head), ("output", head), ("scratch", _TILE * 2),
+             ("incoming", head))
     rows, cursor = {}, _ROW_FLASH_BASE
     for name, span in spans:
         rows[name] = cursor

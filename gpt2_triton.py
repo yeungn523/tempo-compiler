@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Provides the kernels GPT-2 small's layers compile from, being its GEMMs, its LayerNorms and the adds between them.
+"""Provides the kernels GPT-2 small's layers compile from, being its GEMMs, LayerNorms, attention and adds.
 
 A host issues each compiled image once per block of BLOCK_M token rows, the image walking every output column itself.
 """
@@ -20,6 +20,12 @@ _ROOT_TWO: tl.constexpr = tl.constexpr(1.4142135623730951)
 
 _EPSILON: tl.constexpr = tl.constexpr(1e-5)
 """Variance floor GPT-2's LayerNorm adds before taking the reciprocal square root."""
+
+_HEAD: int = 64
+"""Width of one of GPT-2 small's attention heads."""
+
+_MASKED: tl.constexpr = tl.constexpr(-1.0e30)
+"""Score a key after its query takes, which no score reaches, so its probability is exactly zero."""
 
 
 @triton.jit
@@ -168,3 +174,38 @@ def gpt2_layernorm(
             beta = tl.load(beta_pointer + offs_n).to(tl.float32)
             normalised = centered * scale[:, None] * gamma[None, :] + beta[None, :]
             tl.store(output_pointer + offsets, normalised.to(tl.bfloat16))
+
+
+@triton.jit
+def gpt2_attention(
+    query_pointer: "*bf16",
+    key_pointer: "*bf16",
+    value_pointer: "*bf16",
+    output_pointer: "*bf16",
+    stride_m: tl.constexpr = _HEAD,
+    M: tl.constexpr = _TOKENS,
+    D: tl.constexpr = _HEAD,
+    BLOCK_M: tl.constexpr = 16,
+    BLOCK_N: tl.constexpr = 16,
+):
+    """Attends one head causally with the online softmax, its 1/sqrt(head) already folded into the queries."""
+    offs_d = tl.arange(0, D)
+    for block in range(0, M, BLOCK_M):
+        offs_m = block + tl.arange(0, BLOCK_M)
+        query = tl.load(query_pointer + offs_m[:, None] * stride_m + offs_d[None, :])
+        running_max = tl.zeros((BLOCK_M,), dtype=tl.float32) - float("inf")
+        running_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        accumulator = tl.zeros((BLOCK_M, D), dtype=tl.float32)
+        for start in range(0, M, BLOCK_N):
+            offs_n = start + tl.arange(0, BLOCK_N)
+            key = tl.load(key_pointer + offs_n[:, None] * stride_m + offs_d[None, :])
+            value = tl.load(value_pointer + offs_n[:, None] * stride_m + offs_d[None, :])
+            scores = tl.where(offs_m[:, None] >= offs_n[None, :], tl.dot(query, tl.trans(key)), _MASKED)
+            block_max = tl.maximum(running_max, tl.max(scores, 1))
+            probabilities = tl.exp(scores - block_max[:, None])
+            alpha = tl.exp(running_max - block_max)
+            running_sum = running_sum * alpha + tl.sum(probabilities, 1)
+            accumulator = accumulator * alpha[:, None] + tl.dot(probabilities.to(tl.bfloat16), value)
+            running_max = block_max
+        normalised = accumulator / running_sum[:, None]
+        tl.store(output_pointer + offs_m[:, None] * stride_m + offs_d[None, :], normalised.to(tl.bfloat16))

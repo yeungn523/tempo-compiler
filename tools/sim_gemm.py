@@ -140,7 +140,7 @@ def _issued(*, order: str, tokens: int, columns: int) -> list[tuple[int, int]]:
 
 
 def _run_image(*, image: bytes, activations: bytes, weights: bytes, drain_bytes: int,
-               build_dir: str | None, max_cycles: int | None, what: str) -> bytes:
+               build_dir: str | None, max_cycles: int | None, what: str, drain: bytes | None = None) -> bytes:
     """Runs one image against the RTL with the operands a launch reads, returning the bytes it drained.
 
     Args:
@@ -152,6 +152,7 @@ def _run_image(*, image: bytes, activations: bytes, weights: bytes, drain_bytes:
         max_cycles: Cycles one round may take before the testbench reports it timed out, or None for the bound the
             testbench carries.
         what: The product being run, for the message a failed round carries.
+        drain: What the drain buffer holds before the launch, or None for zeros.
 
     Returns:
         The drained bytes.
@@ -164,7 +165,7 @@ def _run_image(*, image: bytes, activations: bytes, weights: bytes, drain_bytes:
         (stage / "kernel.bin").write_bytes(image)
         (stage / "arg0.bin").write_bytes(activations)
         (stage / "arg1.bin").write_bytes(weights)
-        (stage / "arg2.bin").write_bytes(bytes(drain_bytes))
+        (stage / "arg2.bin").write_bytes(bytes(drain_bytes) if drain is None else drain)
 
         environment = dict(os.environ)
         if build_dir is not None:

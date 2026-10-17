@@ -74,5 +74,12 @@
       0.0013020833333333333,
       9.99999974e-06
     ]
+  },
+  "attention_64.bin": {
+    "kind": "attention",
+    "tokens": 64,
+    "heads": 12,
+    "key_blocks": 4,
+    "constants": "attention_64_constants.bin"
   }
 }

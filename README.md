@@ -93,16 +93,17 @@ ___
 Every tool extends `sys.path` to reach `compiler/`, `board_package/`, and `board_package/minitpu_runtime/` on its own,
 so each one runs from the repository root with no `PYTHONPATH` export.
 
-| Entry point                  | Purpose                                                                     |
-|------------------------------|-----------------------------------------------------------------------------|
-| `kernel_entry_point.py`      | Reads any Triton kernel into the compiler and emits its image               |
-| `sample_triton.py`           | Holds a GEMM kernel per loop order and a whole feed-forward layer           |
-| `tools/sim_gemm.py`          | Runs an emitted GEMM image against the RTL and reports its error            |
-| `tools/sim_ffn.py`           | Runs the fused feed-forward image against the RTL and reports its error     |
-| `tools/sim_layernorm.py`     | Runs the compiled LayerNorm against the RTL beside the hand-written builder |
-| `tools/gen_isa_doc.py`       | Regenerates or checks every artifact derived from the ISA source            |
-| `tools/run_on_board.py`      | Compiles one kernel or several and runs them over a single SSH session      |
-| `tools/build_gpt2_images.py` | Compiles every GEMM, add and LayerNorm image a GPT-2 small layer launches   |
+| Entry point                       | Purpose                                                                     |
+|-----------------------------------|-----------------------------------------------------------------------------|
+| `kernel_entry_point.py`           | Reads any Triton kernel into the compiler and emits its image               |
+| `sample_triton.py`                | Holds a GEMM kernel per loop order and a whole feed-forward layer           |
+| `tools/sim_gemm.py`               | Runs an emitted GEMM image against the RTL and reports its error            |
+| `tools/sim_ffn.py`                | Runs the fused feed-forward image against the RTL and reports its error     |
+| `tools/sim_layernorm.py`          | Runs the compiled LayerNorm against the RTL beside the hand-written builder |
+| `tools/sim_resident_attention.py` | Runs the compiled attention over every head of a sequence against the RTL   |
+| `tools/gen_isa_doc.py`            | Regenerates or checks every artifact derived from the ISA source            |
+| `tools/run_on_board.py`           | Compiles one kernel or several and runs them over a single SSH session      |
+| `tools/build_gpt2_images.py`      | Compiles every image a GPT-2 small layer launches                           |
 
 ### Compiling and Checking a Kernel
 

@@ -305,21 +305,18 @@ def build_elementwise_add(chunks: int, *, broadcast_right: bool = False) -> Mini
         bundles[pc] = {"s": minitpu.smov_arg(2, 2)}; pc += 1      # sreg2 = out
         pc += 1                                                   # scalar writeback
 
-        out_row = _ROW_TX_IN if broadcast_right else _ROW_ADD_OUT
+        out_row = _ROW_ADD_OUT
         if broadcast_right:
-            # Stages one bias row per feature tile. The 3072-wide FFN bias is 192 VMEM rows, so it takes two
-            # descriptors, because the descriptor ABI tops out at 128. It is staged once per launch, not once per token
-            # block.
-            bias_rows = chunks * _MAX_DESCRIPTOR_ROWS // _BLOCK_TOKENS
-            first = min(bias_rows, _MAX_DESCRIPTOR_ROWS)
-            bundles[pc] = {"d": minitpu.dma_load(
-                1, _ROW_ADD_RIGHT, first, 1, 3)}; pc += 1
-            bundles[pc] = {"f": minitpu.flush_slot(2)}; pc += 1
-            if bias_rows > first:
-                pc = _advance(bundles, pc, 1, first * _ROW_BYTES)
-                bundles[pc] = {"d": minitpu.dma_load(
-                    1, _ROW_ADD_RIGHT + first, bias_rows - first, 1, 3)}; pc += 1
+            # Stages the replicated bias, `_NUM_SUBLANES` rows per feature tile, a descriptor at a time.
+            bias_rows = chunks * _MAX_DESCRIPTOR_ROWS // _BLOCK_TOKENS * _NUM_SUBLANES
+            staged = 0
+            while staged < bias_rows:
+                rows = min(bias_rows - staged, _MAX_DESCRIPTOR_ROWS)
+                bundles[pc] = {"d": minitpu.dma_load(1, _ROW_ADD_BIAS + staged, rows, 1, 3)}; pc += 1
                 bundles[pc] = {"f": minitpu.flush_slot(2)}; pc += 1
+                staged += rows
+                if staged < bias_rows:
+                    pc = _advance(bundles, pc, 1, rows * _ROW_BYTES)
 
         bundles[pc] = {"f": minitpu.lbegin(chunks)}; pc += 1
         bundles[pc] = {"d": minitpu.dma_load(0, _ROW_ADD_LEFT, _MAX_DESCRIPTOR_ROWS, 0, 3)}
@@ -365,9 +362,8 @@ def build_elementwise_add(chunks: int, *, broadcast_right: bool = False) -> Mini
         for index in range(pc):
             minitpu.bundle(**bundles.get(index, {}))
 
-    # Packs, because the hand placement pads with empty bundles that carry no wait. Dropping them shrinks the image and
-    # leaves the schedule as it was.
-    return minitpu.asm(elementwise_add, placement="pack")
+    # Keeps the hand placement, whose gaps carry the VMEM dependencies the hazard model cannot see.
+    return minitpu.asm(elementwise_add)
 
 
 #: Names the widest addend an S-slot immediate carries. `sequencer_scalar_agu` sign-extends SADDI's 16-bit field, so a

@@ -90,7 +90,7 @@ head's rows lying inside one group and the rest adding exact zeros.
 | Prefill attention, all heads | 12 heads × 20 causal queries | 0.54 % |
 | Decode attention, all heads | 12 heads × 1 query, 48 keys | 0.67 % |
 | LayerNorm | 8 × 768 | 0.42 % |
-| **Transformer block** | 64 × 768, 12 heads, resident | **— (re-measure)** |
+| **Transformer block** | 64 × 768, 12 heads, resident | **1.27 %** |
 
 The GEMM check runs **two** operand sets. The structured one is exactly
 representable and pins the kernel bit for bit; the varying one differs along

@@ -1426,34 +1426,39 @@ def check_full_gemm(*, tokens: int = 32, depth: int = 768, columns: int = 3072) 
 
 
 def check_elementwise_add(*, tokens: int = 32, features: int = 768) -> str:
-    """Adds two DMEM tensors on the device and compares against the host.
+    """Adds two DMEM tensors, and one tensor and a broadcast bias row, on the device and compares against the host.
 
     Returns:
         The detail the report line carries.
 
     Raises:
-        AssertionError: If the device's sum is not the host's, exactly.
+        AssertionError: If either device sum is not the host's, exactly.
     """
     rng = np.random.default_rng(53)
     h_left = _on_bf16_grid(values=rng.standard_normal((tokens, features)).astype(np.float32))
     h_right = _on_bf16_grid(values=rng.standard_normal((tokens, features)).astype(np.float32))
-    d_left, d_right = upload_activations(h_left), upload_activations(h_right)
+    h_bias = _on_bf16_grid(values=rng.standard_normal(features).astype(np.float32))
+    d_left, d_right, d_bias = upload_activations(h_left), upload_activations(h_right), upload_bias(h_bias)
     try:
         started = time.time()
         d_sum = add_resident(d_left, d_right)
         elapsed = time.time() - started
+        d_biased = add_bias_resident(d_left, d_bias)
         try:
-            actual = download_activations(d_sum)
+            actual, biased = download_activations(d_sum), download_activations(d_biased)
         finally:
             d_sum.free()
+            d_biased.free()
     finally:
         d_left.free()
         d_right.free()
+        d_bias.free()
 
-    expected = _on_bf16_grid(values=h_left + h_right)
-    assert np.array_equal(actual, expected), (
-        f"device sum differs from the host by up to {np.abs(actual - expected).max():.3e}")
-    return f"[{tokens},{features}] + [{tokens},{features}] in {elapsed * 1e3:.0f} ms, exact"
+    for name, device, expected in (("sum", actual, h_left + h_right), ("bias sum", biased, h_left + h_bias)):
+        expected = _on_bf16_grid(values=expected)
+        assert np.array_equal(device, expected), (
+            f"device {name} differs from the host by up to {np.abs(device - expected).max():.3e}")
+    return f"[{tokens},{features}] + [{tokens},{features}] in {elapsed * 1e3:.0f} ms, and + bias row, exact"
 
 
 def check_prefill_attention(*, tokens: int = 20, heads: int = 12, model: int = 768) -> str:

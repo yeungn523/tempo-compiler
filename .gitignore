@@ -233,3 +233,6 @@ tools/golden/
 
 # GPT-2 weights, exported on a host and copied to the board
 board_package/gpt2_weights.npz
+
+# Personal notes
+TODO.txt

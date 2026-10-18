@@ -36,5 +36,5 @@ C++ is formatted by `.clang-format` and linted by `.clang-tidy`, both in this di
 | `tools/minitpu-tblgen/`       | The TableGen driver whose `-gen-minitpu-sched` writes the scheduling facts from `codegen/minitpuisa.td` |
 | `tools/minitpu-translate/`    | `--import-minitpu-image` reads a `.bin` into minitpuisa, `--export-minitpu-image` writes it back |
 | `test/`                       | lit/FileCheck tests, one pass per file, including a byte-for-byte round trip of every board image |
-| `test/Inputs/`                | Every GPT-2 small kernel's tt module, written by `tools/dumps/dump_gpt2_ttir.py`          |
-| `test/Inputs/schedule/`       | The streams `asm.py` scheduled for every GPT-2 image, written by `tools/dumps/dump_schedule_streams.py` |
+| `test/Inputs/`                | Every GPT-2 small kernel's tt module, written by `tools/fixtures/export_gpt2_ttir.py`          |
+| `test/Inputs/schedule/`       | The streams `asm.py` scheduled for every GPT-2 image, written by `tools/fixtures/record_schedule_streams.py` |

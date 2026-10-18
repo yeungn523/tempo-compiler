@@ -1,6 +1,6 @@
 // Every GPT-2 image's emitted stream packs to the bytes codegen/asm.py's pack() makes of it, and layernorm_768, the
 // image built packed, reaches its board image through the packer and the scheduler together. Regenerate the streams
-// with tools/dumps/dump_schedule_streams.py.
+// with tools/fixtures/record_schedule_streams.py.
 
 // RUN: minitpu-translate --import-minitpu-image %S/../Inputs/schedule/add_768.emitted.bin | minitpu-opt -minitpuisa-pack | minitpu-translate --export-minitpu-image -o %t.add_768.bin && cmp %t.add_768.bin %S/../Inputs/schedule/add_768.packed.bin
 // RUN: minitpu-translate --import-minitpu-image %S/../Inputs/schedule/add_bias_2304.emitted.bin | minitpu-opt -minitpuisa-pack | minitpu-translate --export-minitpu-image -o %t.add_bias_2304.bin && cmp %t.add_bias_2304.bin %S/../Inputs/schedule/add_bias_2304.packed.bin

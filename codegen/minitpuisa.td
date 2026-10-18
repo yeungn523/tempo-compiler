@@ -363,7 +363,7 @@ class AsmConstant<string constant_name, string value_name>
  *
  * @param group_name Names the capacity, which the published table renders with its underscores replaced by spaces.
  */
-class Resource<string group_name>
+class HardwareResource<string group_name>
 {
     /// Stores the capacity's name.
     string group = group_name;
@@ -381,7 +381,7 @@ class Resource<string group_name>
     string note = "";
 }
 
-def MatrixOutputFifo : Resource<"mxu_output_fifo">
+def MatrixOutputFifo : HardwareResource<"mxu_output_fifo">
 {
     let rtl_parameter = "MXU_OUTPUT_FIFO_DEPTH";
     let values = [ResourceValue<"depth", 32>,
@@ -393,7 +393,7 @@ def MatrixOutputFifo : Resource<"mxu_output_fifo">
     let note = "One per lane (mxu.sv gen_lane_output). A vmatpush streams NUM_SUBLANES activation rows and so produces that many entries; a vmatpop consumes the same across its masked beats. Overflow drops results silently -- vpu_fifo.sv has no replay path.";
 }
 
-def LoopBuffer : Resource<"loop_buffer">
+def LoopBuffer : HardwareResource<"loop_buffer">
 {
     let rtl_parameter = "LB_CAP";
     let values = [ResourceValue<"capacity_bundles", 24>];
@@ -401,7 +401,7 @@ def LoopBuffer : Resource<"loop_buffer">
     let note = "A body longer than this refetches from IRAM instead of replaying, which bounds replay rather than speed.";
 }
 
-def InstructionMemory : Resource<"iram">
+def InstructionMemory : HardwareResource<"iram">
 {
     let rtl_parameter = "IRAM_DEPTH";
     let values = [ResourceValue<"depth_bundles", 4096>];
@@ -409,7 +409,7 @@ def InstructionMemory : Resource<"iram">
     let note = "Bundles the loader places, being 2**IRAM_ADDR_WIDTH. A longer image is loaded up to this and its tail never runs, so the drain it ends on leaves the buffer untouched.";
 }
 
-def DelayField : Resource<"delay_field">
+def DelayField : HardwareResource<"delay_field">
 {
     let rtl_parameter = "DELAY_W";
     let values = [ResourceValue<"width_bits", 6>];
@@ -417,14 +417,14 @@ def DelayField : Resource<"delay_field">
     let note = "One bundle spaces at most 2**width-1 cycles, while a vmatpush result is 82 away, so every push-to-pop gap needs a filler bundle.";
 }
 
-def VectorMemory : Resource<"vmem">
+def VectorMemory : HardwareResource<"vmem">
 {
     let values = [ResourceValue<"rows_per_slot", 8192>,
                   ResourceValue<"slot_count", 2>];
     let note = "Rows one lane holds in one software-owned slot, and the slots `vmemswap` alternates between. Compute and DMA address opposite slots, so a staged region reaching past rows_per_slot wraps inside its own slot rather than faulting and returns whatever the wrap lands on. These are the compute-addressed VMEM slots, which are not the dma_slots a flush mask selects between. No localparam name is quoted here because this tree carries no RTL to hold one against.";
 }
 
-def DmaSlots : Resource<"dma_slots">
+def DmaSlots : HardwareResource<"dma_slots">
 {
     let rtl_parameter = "DMA_SLOT_COUNT";
     let values = [ResourceValue<"count", 2>];
@@ -445,7 +445,7 @@ class EmissionOrder
     list<MatrixCommand> matrix_commands = [];
 
     /// Stores the hardware capacities, in publication order.
-    list<Resource> resources = [];
+    list<HardwareResource> resources = [];
 }
 
 def IsaOrder : EmissionOrder

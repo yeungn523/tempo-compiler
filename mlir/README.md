@@ -28,6 +28,8 @@ C++ is formatted by `.clang-format` and linted by `.clang-tidy`, both in this di
 | Path                          | Holds                                                                               |
 |-------------------------------|-------------------------------------------------------------------------------------|
 | `third_party/triton/`         | Triton's tt dialect, compiled from `TRITON_SOURCE_DIR` without the rest of Triton    |
+| `include/minitpu/minitpu/`    | The minitpu dialect: machine operations over virtual registers (`!minitpu.vreg`), VMEM buffers and `scf.for` loops, and its passes |
+| `lib/minitpu/`                | The dialect's verifiers, the VMEM and register allocators (`allocate.cpp`), and the lowering into minitpuisa (`to_isa.cpp`) |
 | `include/minitpu/minitpuisa/` | The minitpuisa dialect: one op per instruction, its slots and opcodes read from `codegen/minitpuisa.td`, and the bundle bit layout (`encoding.h`) |
 | `lib/minitpuisa/`             | The dialect's verifiers, the image import and export (`image.cpp`), and the `-minitpuisa-pack` and `-minitpuisa-schedule` passes over the traffic model they share (`traffic.h`) |
 | `tools/minitpu-opt/`          | The `mlir-opt`-style driver every lit test runs                                     |

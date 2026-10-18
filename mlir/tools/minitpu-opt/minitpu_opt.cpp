@@ -14,6 +14,8 @@
 #include <mlir/Tools/mlir-opt/MlirOptMain.h>
 #include <mlir/Transforms/Passes.h>
 #include <triton/Dialect/Triton/IR/Dialect.h>
+#include "minitpu/minitpu/minitpu.h"
+#include "minitpu/minitpu/passes.h"
 #include "minitpu/minitpuisa/minitpuisa.h"
 #include "minitpu/minitpuisa/passes.h"
 
@@ -22,6 +24,7 @@ int main(int argc, char** argv)
 {
     mlir::registerTransformsPasses();
     mlir::minitpu::isa::registerMiniTPUISAPasses();
+    mlir::minitpu::registerMiniTPUPasses();
 
     mlir::DialectRegistry registry;
     registry.insert<
@@ -31,6 +34,7 @@ int main(int argc, char** argv)
         mlir::scf::SCFDialect,
         mlir::cf::ControlFlowDialect,
         mlir::ub::UBDialect,
+        mlir::minitpu::MinitpuDialect,
         mlir::minitpu::isa::ISADialect>();
 
     return mlir::asMainReturnCode(mlir::MlirOptMain(argc, argv, "MiniTPU optimizer driver\n", registry));

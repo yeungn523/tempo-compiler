@@ -44,3 +44,17 @@ minitpuisa.program @push_then_pop {
   minitpuisa.bundle { minitpuisa.vmatpop v8 }
   minitpuisa.bundle { minitpuisa.halt }
 }
+
+// -----
+
+// A write to a register a matrix command still streams waits until the command has read it: vmatload reads v4..v7
+// over its 18-cycle occupancy, so a vld into v4, whose write lands 6 cycles after issue, issues no earlier than 13.
+
+// CHECK-LABEL: minitpuisa.program @write_under_a_stream
+minitpuisa.program @write_under_a_stream {
+  // CHECK: minitpuisa.bundle delay 12 {
+  // CHECK-NEXT: minitpuisa.vmatload v4
+  minitpuisa.bundle { minitpuisa.vmatload v4 }
+  minitpuisa.bundle { minitpuisa.vld v4, row 0 }
+  minitpuisa.bundle { minitpuisa.halt }
+}

@@ -148,6 +148,7 @@ namespace
         {
             std::array<int64_t, kVectorRegisterCount> vector_ready {};
             std::array<int64_t, kScalarRegisterCount> scalar_ready {};
+            std::array<int64_t, kVectorRegisterCount> streamed_until {};
             llvm::DenseSet<int64_t> write_port;
             std::deque<int64_t> results_ready;
             int64_t matrix_free = 0;
@@ -174,6 +175,12 @@ namespace
                     }
                     if (traffic.claims_port_a) issue = std::max(issue, port_a_free);
                     if (traffic.accesses_vmem) issue = std::max(issue, vmem_free);
+                    // Holds a write until a matrix command streaming the register has read it, since the command
+                    // reads its operands over its whole occupancy and nothing interlocks a write landing first.
+                    for (const WriteReservation& write : traffic.vector_writes)
+                    {
+                        issue = std::max(issue, streamed_until[write.vector_register] - write.first + 1);
+                    }
                     const auto port_taken = [&](const int64_t at) {
                         for (const WriteReservation& write : traffic.vector_writes)
                         {
@@ -205,7 +212,14 @@ namespace
                     if (traffic.matrix != nullptr)
                     {
                         matrix_free = issue + traffic.matrix->occupancy_cycles + 1;
-                        if (traffic.matrix->holds_read_port_a) port_a_free = matrix_free;
+                        if (traffic.matrix->holds_read_port_a)
+                        {
+                            port_a_free = matrix_free;
+                            for (const uint32_t vector : traffic.vector_reads)
+                            {
+                                streamed_until[vector] = issue + traffic.matrix->occupancy_cycles;
+                            }
+                        }
                         if (traffic.pushes_results)
                         {
                             results_ready.push_back(issue + traffic.matrix->result_latency_cycles);

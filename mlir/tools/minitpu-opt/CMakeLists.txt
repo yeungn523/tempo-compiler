@@ -1,6 +1,7 @@
 add_llvm_executable(minitpu-opt minitpu_opt.cpp)
 llvm_update_compile_flags(minitpu-opt)
 target_link_libraries(minitpu-opt PRIVATE
+  MinitpuDialect
   MinitpuIsa
   MinitpuTritonIR
   MLIRArithDialect

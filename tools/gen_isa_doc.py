@@ -221,7 +221,7 @@ def _matrix(records: dict[str, Any]) -> dict[str, Any]:
 def _resources(records: dict[str, Any]) -> dict[str, Any]:
     """Returns each capacity's values, RTL parameter, assembler constants and note."""
     resources = {}
-    for record in _ordered(records, "Resource", "resources"):
+    for record in _ordered(records, "HardwareResource", "resources"):
         spec = {value["name"]: value["value"] for value in _referenced(records, record["values"])}
         if record["rtl_parameter"]:
             spec["rtl_param"] = record["rtl_parameter"]

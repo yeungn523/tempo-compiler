@@ -1,4 +1,4 @@
-# MINITPU on the ZCU104
+# NPU Board Package
 
 Everything needed to program the PL, run GPT-2 small's layers on it, and check the
 answers against a host reference. The board carries neither Triton nor the
@@ -7,30 +7,30 @@ compiler, so every image it launches is compiled on a host and arrives in
 
 ```sh
 make check           # the package is complete (bitstream, overlay, host tests)
-sudo make minitpu    # set the clock, program the PL, create the runtime devices
+sudo make program    # set the clock, program the PL, create the runtime devices
 make kernels         # the board checks
 ```
 
 A board erases the home directory whenever no session holds it, so after every
-login run `tools/prepare_board.sh <netid> <octet>` on the host with a session held
+login run `tools/prepare_board.sh <account> <board-id>` on the host with a session held
 open on the board. It exports GPT-2's weights and tokenizer, builds every image
 and deploys them with this package.
 
-**Run `sudo make minitpu` from THIS package, not a copy already on the board.**
-The clock is set by this Makefile's `minitpu` target and a board that programs
+**Run `sudo make program` from THIS package, not a copy already on the board.**
+The clock is set by this Makefile's `program` target and a board that programs
 the PL without it runs the fabric at 99.999 MHz — where every check still
 passes and every time is about 1.8x too slow. `tools/deploy_board.sh` ships the
 Makefile under its md5 gate for exactly that reason.
 
-`sudo make minitpu` is needed after boot or whenever the PL is replaced. It
+`sudo make program` is needed after boot or whenever the PL is replaced. It
 loads `minitpu/minitpu_zcu104.bit.bin`, applies `minitpu/overlay.dtso`, and
-exposes the MINITPU as a UIO device plus a contiguous DMA buffer, falling back
+exposes the NPU as a UIO device plus a contiguous DMA buffer, falling back
 to the bundled kernel-matched `minitpu/u-dma-buf.ko` when no in-tree module
 fits. Everything after that runs as a normal user.
 
 ## What the board checks prove
 
-`make kernels` runs eight checks. Each compares the device against a host
+`make kernels` runs ten checks. Each compares the device against a host
 reference that rounds where the device rounds, so the residual is the arithmetic
 the machine actually does, not a tolerance covering an unmodelled effect. Every
 GEMM, add, LayerNorm, attention and cache copy a check launches is a compiled
@@ -52,6 +52,8 @@ its 1 % bar.
 | LayerNorm | 32 × 768, resident | 0.49 % |
 | KV cache | 64 prefill tokens + 1 decode token, 1536 features | exact |
 | **Transformer block** | 64 × 768, 12 causal heads, resident | **1.28 %** |
+| GPT-2 prefill | "The capital of France is", 12 layers of real weights, each against its reference | not yet run on the board |
+| GPT-2 decode | One greedy token decoded through 12 layers, each layer and both tokens against the reference | not yet run on the board |
 
 The GEMM check runs **two** operand sets. The structured one is exactly
 representable and pins the kernel bit for bit; the varying one differs along
@@ -71,8 +73,10 @@ QKV projection drained them. Activations remain in DMEM from the body's entry up
 exit download. Projection biases are stored as one row and broadcast by
 stride-zero VMEM reads rather than materialised for each token shape.
 
-The PS performs all launch orchestration. The embedding, the final LayerNorm, the
-tied language head and the generation loop are not yet in this package.
+The PS performs all launch orchestration, the embedding, the final LayerNorm and the
+tied language head. `prefill` runs a prompt through every layer and fills one KV
+cache per layer, and `decode_step` runs each new token through every layer over
+those caches. The generation loop is not yet in this package.
 
 The compiled attention image fixes its sequence length when it is built, so the
 transformer block runs only at the lengths `tools/build_gpt2_images.py` lists,

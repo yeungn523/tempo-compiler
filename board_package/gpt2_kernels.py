@@ -111,6 +111,15 @@ _COMPILED_IMAGES: dict[tuple, tuple[bytes, dict]] = {}
 _ATTENTION_CONSTANTS: dict[str, int] = {}
 """DMEM address of each attention image's constants block, keyed by its file, each uploaded once."""
 
+_MAX_CONTEXT: int = 1024
+"""Tokens GPT-2 small attends over at most, being the positions its position embedding covers."""
+
+_END_OF_TEXT: int = 50256
+"""Token a prompt is padded with, being GPT-2's end-of-text token."""
+
+_PROMPT: tuple[int, ...] = (464, 3139, 286, 4881, 318)
+"""Tokens of "The capital of France is", which the prefill check runs through every layer."""
+
 _DECODE_CONSTANTS: dict[int, int] = {}
 """DMEM address of each decode image's constants block, keyed by the cache length it walks, rewritten each step."""
 
@@ -781,14 +790,8 @@ def full_gemm(
 
 
 def transformer_block(hidden: NDArray[np.float32], weights: dict, *, heads: int = 12,
-                      cache: KVCache | None = None) -> NDArray[np.float32]:
-    """Runs one GPT-2 transformer block on the device, keeping every intermediate resident in DMEM.
-
-    Notes:
-        Both LayerNorms, all four projections, every bias and residual add and the attention run as launches
-        that read the previous launch's output where it lies, so the block crosses the host boundary once on
-        entry and once on exit. Every launch runs a compiled image. Attention is causal, and its
-        1/sqrt(head) rides the query columns of the QKV projection, folded into its weights and bias before upload.
+                      cache: KVCache | None = None, valid: int | None = None) -> NDArray[np.float32]:
+    """Runs one GPT-2 transformer block over a sequence on the device, keeping every intermediate resident in DMEM.
 
     Args:
         hidden: [tokens, model] block input, a sequence length a compiled attention image covers.
@@ -797,53 +800,149 @@ def transformer_block(hidden: NDArray[np.float32], weights: dict, *, heads: int 
             ``ln_2.b``, ``mlp.fc.w``, ``mlp.fc.b``, ``mlp.proj.w``, ``mlp.proj.b``.
         heads: Attention heads the model width splits into.
         cache: The layer's KV cache, which the block's keys and values are copied into, or None for no cache.
+        valid: Rows of the input that are real tokens, the rest padding, which is the length the cache records.
+            None counts every row as real.
 
     Returns:
         The [tokens, model] block output.
     """
-    model = hidden.shape[1]
-    scale = np.ones(3 * model, dtype=np.float32)
-    scale[:model] = 1.0 / math.sqrt(model // heads)
-
-    d_owned: list[DeviceTensor | ResidentWeights] = []
-    d_constants: list[int] = []
-
-    def kept(d_tensor):
-        """Records a device allocation so the block frees it however it exits."""
-        d_owned.append(d_tensor)
-        return d_tensor
-
-    try:
-        d_weights = {name: kept(upload_weights(weights[name] * (scale if name == "attn.qkv.w" else 1.0)))
-                     for name in ("attn.qkv.w", "attn.proj.w", "mlp.fc.w", "mlp.proj.w")}
-        d_biases = {name: kept(upload_bias(weights[name] * (scale if name == "attn.qkv.b" else 1.0)))
-                    for name in ("attn.qkv.b", "attn.proj.b", "mlp.fc.b", "mlp.proj.b")}
-        for gamma, beta in (("ln_1.g", "ln_1.b"), ("ln_2.g", "ln_2.b")):
-            d_constants.append(upload_layernorm_constants(weights[gamma], weights[beta]))
-
-        d_hidden = kept(upload_activations(hidden))
-        d_normed = kept(layernorm_resident(d_hidden, d_constants[0]))
-        d_fused = kept(add_bias_resident(kept(gemm_resident(d_normed, d_weights["attn.qkv.w"])),
-                                         d_biases["attn.qkv.b"]))
+    def attend(d_fused: DeviceTensor) -> DeviceTensorSlice:
+        """Fills the cache from the sequence's keys and values, then attends the sequence causally."""
         if cache is not None:
-            cache.extend(d_fused)
-        d_attended = attention(d_fused, heads=heads)
-        d_projected = kept(add_bias_resident(kept(gemm_resident(d_attended, d_weights["attn.proj.w"])),
-                                             d_biases["attn.proj.b"]))
-        d_residual = kept(add_resident(d_hidden, d_projected))
+            cache.extend(d_fused, tokens=valid)
+        return attention(d_fused, heads=heads)
 
-        d_normed = kept(layernorm_resident(d_residual, d_constants[1]))
-        d_wide = kept(add_bias_resident(kept(gemm_resident(d_normed, d_weights["mlp.fc.w"])),
-                                        d_biases["mlp.fc.b"]))
-        # Applies the GELU while staging the down projection's operand, so it costs no launch of its own.
-        d_narrow = kept(add_bias_resident(kept(gemm_resident(d_wide, d_weights["mlp.proj.w"], activate=True)),
-                                          d_biases["mlp.proj.b"]))
-        return download_activations(kept(add_resident(d_residual, d_narrow)))
-    finally:
-        for d_tensor in d_owned:
-            d_tensor.free()
-        for address in d_constants:
-            minitpuFree(address)
+    return _run_layer(hidden, weights, heads=heads, attend=attend)
+
+
+def decode_block(hidden: NDArray[np.float32], weights: dict, cache: KVCache, *,
+                 heads: int = 12) -> NDArray[np.float32]:
+    """Runs one decode step's new token through one GPT-2 block on the device, attending over the layer's cache.
+
+    Args:
+        hidden: [model] the new token's block input.
+        weights: The block's parameters, keyed as `transformer_block` reads them.
+        cache: The layer's KV cache, which the new token's keys and values are appended to.
+        heads: Attention heads the model width splits into.
+
+    Returns:
+        The [model] block output for the new token.
+    """
+    # Pads the token to the token block every launch covers, its rows independent outside attention.
+    padded = np.zeros((_BLOCK_TOKENS, hidden.shape[-1]), dtype=np.float32)
+    padded[0] = hidden
+
+    def attend(d_fused: DeviceTensor) -> DeviceTensorSlice:
+        """Appends the new token's keys and values to the cache, then attends it over every cached token."""
+        cache.append(d_fused)
+        return decode_attention(d_fused, cache, heads=heads)
+
+    return _run_layer(padded, weights, heads=heads, attend=attend)[0]
+
+
+def embed(token_ids: NDArray[np.int64], shared: dict, *, start: int = 0) -> NDArray[np.float32]:
+    """Returns the input the first layer reads, each token's embedding plus its position's.
+
+    Args:
+        token_ids: The tokens, in order.
+        shared: The shared weights `load_gpt2_weights` returns, which hold `wte` and `wpe`.
+        start: Position of the first token, which a decode step sets past the tokens already attended.
+
+    Returns:
+        The [tokens, model] embeddings.
+    """
+    positions = start + np.arange(len(token_ids))
+    return (shared["wte"][np.asarray(token_ids)] + shared["wpe"][positions]).astype(np.float32)
+
+
+def prefill(token_ids: NDArray[np.int64], layers: list[dict], shared: dict, *, heads: int = 12,
+            capacity: int = _MAX_CONTEXT,
+            observe: Callable[[int, NDArray[np.float32], NDArray[np.float32]], None] | None = None,
+            ) -> tuple[NDArray[np.float32], list[KVCache]]:
+    """Runs a prompt through every layer on the device, filling one KV cache per layer.
+
+    Notes:
+        The prompt is padded at its end to the shortest sequence length a compiled attention image covers. Attention
+        is causal, so no real token reads a padded one, and each cache records only the real tokens.
+
+    Args:
+        token_ids: The prompt's tokens, in order.
+        layers: Each layer's weights, as `load_gpt2_weights` returns them.
+        shared: The shared weights, as `load_gpt2_weights` returns them.
+        heads: Attention heads.
+        capacity: Tokens each cache holds room for, which bounds the prompt plus every decoded token.
+        observe: Called with each layer's index, its padded input and its padded output, or None.
+
+    Returns:
+        The last layer's output for the real tokens, and each layer's cache, which the caller frees.
+
+    Raises:
+        ValueError: If no compiled attention image covers the prompt, or the caches cannot hold it.
+    """
+    tokens = len(token_ids)
+    lengths = sorted(entry["tokens"] for entry in _manifest().values() if entry["kind"] == "attention")
+    padded = next((length for length in lengths if length >= tokens), None)
+    if padded is None or padded > capacity:
+        message = (
+            f"Unable to prefill a prompt of {tokens} tokens. A compiled attention image covers "
+            f"{', '.join(map(str, lengths))} tokens and the caches hold {capacity}, so add a longer length to "
+            f"tools/build_gpt2_images.py or shorten the prompt."
+        )
+        raise ValueError(message)
+    padding = np.full(padded - tokens, _END_OF_TEXT, dtype=np.int64)
+    hidden = embed(np.concatenate([np.asarray(token_ids, dtype=np.int64), padding]), shared)
+    caches = [KVCache(capacity=capacity) for _ in layers]
+    try:
+        for index, (weights, cache) in enumerate(zip(layers, caches, strict=True)):
+            layer_input = hidden
+            hidden = transformer_block(hidden, weights, heads=heads, cache=cache, valid=tokens)
+            if observe is not None:
+                observe(index, layer_input, hidden)
+    except BaseException:
+        for cache in caches:
+            cache.free()
+        raise
+    return hidden[:tokens], caches
+
+
+def decode_step(token_id: int, layers: list[dict], shared: dict, caches: list[KVCache], *, heads: int = 12,
+                observe: Callable[[int, NDArray[np.float32], NDArray[np.float32]], None] | None = None,
+                ) -> NDArray[np.float32]:
+    """Runs one new token through every layer on the device, appending its keys and values to each layer's cache.
+
+    Args:
+        token_id: The new token.
+        layers: Each layer's weights, as `load_gpt2_weights` returns them.
+        shared: The shared weights, as `load_gpt2_weights` returns them.
+        caches: Each layer's KV cache, holding every earlier token, whose length is the new token's position.
+        heads: Attention heads.
+        observe: Called with each layer's index, its input for the new token and its output, or None.
+
+    Returns:
+        The [model] last layer's output for the new token.
+    """
+    hidden = embed(np.asarray([token_id]), shared, start=caches[0].length)[0]
+    for index, (weights, cache) in enumerate(zip(layers, caches, strict=True)):
+        layer_input = hidden
+        hidden = decode_block(hidden, weights, cache, heads=heads)
+        if observe is not None:
+            observe(index, layer_input, hidden)
+    return hidden
+
+
+def next_token_logits(hidden: NDArray[np.float32], shared: dict) -> NDArray[np.float32]:
+    """Applies the final LayerNorm and the tied language head to one token's output, scoring every token.
+
+    Args:
+        hidden: [model] the last layer's output for the token being predicted from.
+        shared: The shared weights, as `load_gpt2_weights` returns them.
+
+    Returns:
+        The [vocabulary] logits.
+    """
+    centred = hidden - hidden.mean()
+    normalised = centred / np.sqrt((centred * centred).mean() + _LN_EPSILON)
+    return (normalised * shared["ln_f.g"] + shared["ln_f.b"]) @ shared["wte"].T
 
 
 def transformer_block_reference(hidden: NDArray[np.float32], weights: dict) -> NDArray[np.float32]:
@@ -1265,6 +1364,100 @@ def check_kv_cache(*, tokens: int = 64, model: int = _MODEL_WIDTH) -> str:
     return f"{tokens} prefill tokens and one decode token, [{cache.length},{2 * model}] keys and values, exact"
 
 
+def check_gpt2_prefill() -> str:
+    """Runs a prompt through GPT-2 small's twelve layers and holds each layer to the host reference.
+
+    Notes:
+        Each layer is compared against the reference run on that layer's own device input, so one layer's error is
+        measured alone rather than compounded over the layers before it.
+
+    Returns:
+        The detail the report line carries.
+
+    Raises:
+        AssertionError: If a layer exceeds the error bound, or a cache records other than the prompt's length.
+    """
+    layers, shared = load_gpt2_weights()
+    tokens = len(_PROMPT)
+    errors: list[float] = []
+
+    def compare(index: int, layer_input: NDArray[np.float32], layer_output: NDArray[np.float32]) -> None:
+        """Measures one layer's real rows against the reference run on the same input."""
+        expected = transformer_block_reference(hidden=layer_input, weights=layers[index])[:tokens]
+        errors.append(float(np.linalg.norm(layer_output[:tokens] - expected) / np.linalg.norm(expected)))
+
+    started = time.time()
+    _, caches = prefill(np.asarray(_PROMPT), layers, shared, observe=compare)
+    elapsed = time.time() - started
+    lengths = {cache.length for cache in caches}
+    for cache in caches:
+        cache.free()
+    worst = int(np.argmax(errors))
+    assert lengths == {tokens}, f"the caches recorded lengths {sorted(lengths)} for a {tokens}-token prompt"
+    assert errors[worst] < _BLOCK_ERROR_LIMIT, (
+        f"layer {worst} differs from the host reference by {errors[worst]:.2%}, past {_BLOCK_ERROR_LIMIT:.0%}")
+    return (f"{tokens} prompt tokens, {len(layers)} layers in {elapsed:.1f} s, worst layer {worst} at "
+            f"{errors[worst]:.2%} relative error, caches holding {tokens} tokens each")
+
+
+def check_gpt2_decode() -> str:
+    """Prefills a prompt, decodes the next token through every layer, and holds both to the host reference.
+
+    Notes:
+        Each decode layer is compared against the reference run over the prompt's and the new token's device inputs
+        to that layer, so its error is measured alone. The two greedy tokens are held to the reference's own.
+
+    Returns:
+        The detail the report line carries.
+
+    Raises:
+        AssertionError: If a decode layer exceeds the error bound, a cache records the wrong length, or a greedy
+            token differs from the reference's.
+    """
+    layers, shared = load_gpt2_weights()
+    tokens = len(_PROMPT)
+    prompt_inputs: dict[int, NDArray[np.float32]] = {}
+    errors: list[float] = []
+
+    def remember(index: int, layer_input: NDArray[np.float32], _: NDArray[np.float32]) -> None:
+        """Keeps each layer's input for the prompt's real tokens."""
+        prompt_inputs[index] = layer_input[:tokens]
+
+    def compare(index: int, layer_input: NDArray[np.float32], layer_output: NDArray[np.float32]) -> None:
+        """Measures one decode layer against the reference over the prompt and the new token."""
+        rows = np.concatenate([prompt_inputs[index], layer_input[None, :]], axis=0)
+        expected = transformer_block_reference(hidden=rows, weights=layers[index])[-1]
+        errors.append(float(np.linalg.norm(layer_output - expected) / np.linalg.norm(expected)))
+
+    hidden, caches = prefill(np.asarray(_PROMPT), layers, shared, observe=remember)
+    try:
+        first = int(np.argmax(next_token_logits(hidden[-1], shared)))
+        started = time.time()
+        second = int(np.argmax(next_token_logits(decode_step(first, layers, shared, caches, observe=compare),
+                                                 shared)))
+        elapsed = time.time() - started
+        lengths = {cache.length for cache in caches}
+    finally:
+        for cache in caches:
+            cache.free()
+
+    # Runs the same greedy steps through the reference alone, the prompt then the prompt and the first token.
+    reference = []
+    for sequence in (_PROMPT, (*_PROMPT, first)):
+        rows = embed(np.asarray(sequence), shared)
+        for weights in layers:
+            rows = transformer_block_reference(hidden=rows, weights=weights)
+        reference.append(int(np.argmax(next_token_logits(rows[-1], shared))))
+
+    worst = int(np.argmax(errors))
+    assert lengths == {tokens + 1}, f"the caches recorded lengths {sorted(lengths)} after one decode step"
+    assert errors[worst] < _BLOCK_ERROR_LIMIT, (
+        f"decode layer {worst} differs from the host reference by {errors[worst]:.2%}, past {_BLOCK_ERROR_LIMIT:.0%}")
+    assert [first, second] == reference, f"greedy tokens {[first, second]} differ from the reference's {reference}"
+    return (f"greedy tokens {[first, second]} match the reference, one decode step through {len(layers)} layers in "
+            f"{elapsed:.1f} s, worst layer {worst} at {errors[worst]:.2%} relative error")
+
+
 def check_transformer_block(*, tokens: int = 64) -> str:
     """Runs one GPT-2 transformer block on the device and verifies it against the host reference.
 
@@ -1347,7 +1540,7 @@ def _compiled_image(*, kind: str, **shape: int | bool) -> tuple[bytes, dict]:
     if cached is not None:
         return cached
 
-    manifest = json.loads((_IMAGE_DIRECTORY / "manifest.json").read_text())
+    manifest = _manifest()
     found = next((name for name, entry in manifest.items()
                   if entry["kind"] == kind and all(entry.get(field) == value for field, value in shape.items())), None)
     if found is None:
@@ -1382,6 +1575,73 @@ def _attention_constants(entry: dict) -> int:
     minitpuHostReset()
     _ATTENTION_CONSTANTS[entry["constants"]] = d_address
     return d_address
+
+
+def _run_layer(hidden: NDArray[np.float32], weights: dict, *, heads: int,
+               attend: Callable[[DeviceTensor], DeviceTensorSlice]) -> NDArray[np.float32]:
+    """Runs one GPT-2 block on the device around the attention it is given, every intermediate resident in DMEM.
+
+    Notes:
+        Both LayerNorms, all four projections, every bias and residual add and the attention run as launches
+        that read the previous launch's output where it lies, so the block crosses the host boundary once on
+        entry and once on exit. Attention's 1/sqrt(head) rides the query columns of the QKV projection, folded
+        into its weights and bias before upload.
+
+    Args:
+        hidden: [tokens, model] block input, a whole number of token blocks.
+        weights: The block's parameters, keyed as `transformer_block` reads them.
+        heads: Attention heads the model width splits into.
+        attend: Attends the fused QKV projection, returning the attention output resident.
+
+    Returns:
+        The [tokens, model] block output.
+    """
+    model = hidden.shape[1]
+    scale = np.ones(3 * model, dtype=np.float32)
+    scale[:model] = 1.0 / math.sqrt(model // heads)
+
+    d_owned: list[DeviceTensor | ResidentWeights] = []
+    d_constants: list[int] = []
+
+    def kept(d_tensor):
+        """Records a device allocation so the block frees it however it exits."""
+        d_owned.append(d_tensor)
+        return d_tensor
+
+    try:
+        d_weights = {name: kept(upload_weights(weights[name] * (scale if name == "attn.qkv.w" else 1.0)))
+                     for name in ("attn.qkv.w", "attn.proj.w", "mlp.fc.w", "mlp.proj.w")}
+        d_biases = {name: kept(upload_bias(weights[name] * (scale if name == "attn.qkv.b" else 1.0)))
+                    for name in ("attn.qkv.b", "attn.proj.b", "mlp.fc.b", "mlp.proj.b")}
+        for gamma, beta in (("ln_1.g", "ln_1.b"), ("ln_2.g", "ln_2.b")):
+            d_constants.append(upload_layernorm_constants(weights[gamma], weights[beta]))
+
+        d_hidden = kept(upload_activations(hidden))
+        d_normed = kept(layernorm_resident(d_hidden, d_constants[0]))
+        d_fused = kept(add_bias_resident(kept(gemm_resident(d_normed, d_weights["attn.qkv.w"])),
+                                         d_biases["attn.qkv.b"]))
+        d_attended = attend(d_fused)
+        d_projected = kept(add_bias_resident(kept(gemm_resident(d_attended, d_weights["attn.proj.w"])),
+                                             d_biases["attn.proj.b"]))
+        d_residual = kept(add_resident(d_hidden, d_projected))
+
+        d_normed = kept(layernorm_resident(d_residual, d_constants[1]))
+        d_wide = kept(add_bias_resident(kept(gemm_resident(d_normed, d_weights["mlp.fc.w"])),
+                                        d_biases["mlp.fc.b"]))
+        # Applies the GELU while staging the down projection's operand, so it costs no launch of its own.
+        d_narrow = kept(add_bias_resident(kept(gemm_resident(d_wide, d_weights["mlp.proj.w"], activate=True)),
+                                          d_biases["mlp.proj.b"]))
+        return download_activations(kept(add_resident(d_residual, d_narrow)))
+    finally:
+        for d_tensor in d_owned:
+            d_tensor.free()
+        for address in d_constants:
+            minitpuFree(address)
+
+
+def _manifest() -> dict:
+    """Returns the manifest describing every compiled image, keyed by file name."""
+    return json.loads((_IMAGE_DIRECTORY / "manifest.json").read_text())
 
 
 def _launch_copy(*, rows: int, stride: int, source: int, destination: int) -> None:
@@ -1515,6 +1775,8 @@ def main() -> int:
         run_check(name="LayerNorm", check=check_layernorm),
         run_check(name="KV cache", check=check_kv_cache),
         run_check(name="Transformer block", check=check_transformer_block),
+        run_check(name="GPT-2 prefill", check=check_gpt2_prefill),
+        run_check(name="GPT-2 decode", check=check_gpt2_decode),
     ]
     print(f"\n{sum(outcomes)} of {len(outcomes)} checks passed")
     return 0 if all(outcomes) else 1

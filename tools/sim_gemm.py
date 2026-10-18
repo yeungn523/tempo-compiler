@@ -36,7 +36,7 @@ _TOLERANCE: float = 0.02
 """Relative error the BF16 accumulate chain is allowed, which the board check also holds to."""
 
 _DEFAULT_RTL: pathlib.Path = _HERE.parent.parent / "minitpu-tmp"
-"""Checkout `MINITPU_RTL` falls back to, being a sibling of this repository."""
+"""Checkout `minitpu_rtl` falls back to, being a sibling of this repository."""
 
 _PASS_MARKER: str = "=== TB_KERNEL_IMAGE PASS ==="
 """Line the testbench prints once every round has halted."""
@@ -197,10 +197,10 @@ def _rtl_root() -> pathlib.Path:
     Raises:
         FileNotFoundError: If the checkout does not carry `tb/run_kernel_image.sh`.
     """
-    root = pathlib.Path(os.environ.get("MINITPU_RTL", _DEFAULT_RTL)).expanduser()
+    root = pathlib.Path(os.environ.get("minitpu_rtl", _DEFAULT_RTL)).expanduser()
     if not (root / "tb" / "run_kernel_image.sh").is_file():
         message = (
-            f"Unable to find the RTL under {root}. This repository does not vendor it, so set MINITPU_RTL to a "
+            f"Unable to find the RTL under {root}. This repository does not vendor it, so set minitpu_rtl to a "
             f"checkout carrying tb/run_kernel_image.sh."
         )
         raise FileNotFoundError(message)

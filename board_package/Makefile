@@ -3,10 +3,10 @@ SHELL := /bin/bash
 HERE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 PYTHON ?= python3 -u
 
-.PHONY: help minitpu provision check kernels identity
+.PHONY: help program provision check kernels identity
 
 help:
-	@echo "sudo make minitpu     set the PL clock, program the PL, provision UIO/udmabuf"
+	@echo "sudo make program     set the PL clock, program the PL, provision UIO/udmabuf"
 	@echo "                      override the clock with PL_CLK_MHZ=<n> (default $(PL_CLK_MHZ))"
 	@echo "sudo make provision   provision UIO/udmabuf on a PL that is already programmed"
 	@echo "make check            verify package files and run the host tests, without hardware"
@@ -25,7 +25,7 @@ help:
 # +0.049 ns, which is 1 % margin.
 PL_CLK_MHZ ?= 187
 
-minitpu:
+program:
 	@$(HERE)minitpu/scripts/quiesce_pl.sh
 	@$(HERE)minitpu/scripts/set_pl_clock.sh $(PL_CLK_MHZ)
 	@$(HERE)minitpu/scripts/program_pl.sh

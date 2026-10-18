@@ -23,7 +23,7 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent.parent
 """Stores the path to the repository's root directory."""
 
 _ADDRESS: str = "132.236.59."
-"""Network the course boards sit on, which the last octet selects one of."""
+"""Network the boards sit on, the board ID completing a board's address."""
 
 _SHARED: tuple[str, ...] = ("operands", "constexprs", "strides", "dims")
 """Flags every operation passes to its entry point untouched, being the ones describing the launch rather than
@@ -187,8 +187,8 @@ def main() -> int:
     parser.add_argument("--kernel", action="append", metavar="FILE:NAME",
                         help="the kernel to compile, as a Python file and the name it is declared under, repeated "
                              "to run several in the one session, defaulting to the ones the workload declares")
-    parser.add_argument("--octet", required=True, help=f"last octet of the board's address, under {_ADDRESS}0/24")
-    parser.add_argument("--user", default=getpass.getuser(), help="the account the board authorises, being a netid")
+    parser.add_argument("--board", required=True, help="the board ID, such as 192")
+    parser.add_argument("--user", default=getpass.getuser(), help="the account the board authorises")
     parser.add_argument("--run", default="", metavar="COMMAND",
                         help="run this shell command on the board instead of the compiled kernel, from inside the "
                              "unpacked package")
@@ -216,9 +216,9 @@ def main() -> int:
 
     # Provisions every run, since a board revokes this account's devices once its session releases, exactly as it
     # erases the home directory. Programming provisions as its own last step.
-    privileged = "minitpu" if arguments.program else ("" if arguments.no_provision else "provision")
+    privileged = "program" if arguments.program else ("" if arguments.no_provision else "provision")
     password = getpass.getpass("sudo password for the board: ") if privileged else ""
-    target = f"{arguments.user}@{_ADDRESS}{arguments.octet}"
+    target = f"{arguments.user}@{_ADDRESS}{arguments.board}"
     
     print(f"running {len(images)} on {target}, {len(stream) / 1e6:.1f} MB to send")
     return subprocess.run(["ssh", target,

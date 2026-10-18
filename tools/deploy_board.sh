@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deploy the board package and program the PL, with the copies gated on md5.
 #
-#   tools/deploy_board.sh <account> 187 [--program]
+#   tools/deploy_board.sh <account> <board-id> [--program]
 #
 # The account is the caller's own login on the board, which the board authorises
 # a key for. It is not baked in, because each board carries its own accounts.
@@ -12,8 +12,8 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ACCOUNT="${1:?usage: deploy_board.sh <account> <last-octet> [--program]}"
-IP="132.236.59.${2:?usage: deploy_board.sh <account> <last-octet> [--program]}"
+ACCOUNT="${1:?usage: deploy_board.sh <account> <board-id> [--program]}"
+IP="132.236.59.${2:?usage: deploy_board.sh <account> <board-id> [--program]}"
 PROGRAM="${3:-}"
 REMOTE=/home/$ACCOUNT/board_package
 
@@ -33,7 +33,7 @@ FILES+=("board_package/minitpu/minitpu_zcu104.bit.bin")
 FILES+=("board_package/Makefile" "board_package/README.md")
 
 # The scripts that program the board, and the overlay and module they load, go
-# over the gate too and keep their subdirectory, so `sudo make minitpu` never runs
+# over the gate too and keep their subdirectory, so `sudo make program` never runs
 # a stale copy.
 while IFS= read -r f; do FILES+=("$f"); done < <(
   cd "$HERE" && ls board_package/minitpu/scripts/* board_package/minitpu/overlay.dtso \

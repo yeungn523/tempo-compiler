@@ -7,8 +7,9 @@ compiler, so every image it launches is compiled on a host and arrives in
 
 ```sh
 make check           # the package is complete (bitstream, overlay, host tests)
-sudo make program    # set the clock, program the PL, create the runtime devices
+sudo make minitpu    # set the clock, program the PL, create the runtime devices
 make kernels         # the board checks
+make generate        # continue a prompt with GPT-2 small
 ```
 
 A board erases the home directory whenever no session holds it, so after every
@@ -16,13 +17,13 @@ login run `tools/prepare_board.sh <account> <board-id>` on the host with a sessi
 open on the board. It exports GPT-2's weights and tokenizer, builds every image
 and deploys them with this package.
 
-**Run `sudo make program` from THIS package, not a copy already on the board.**
-The clock is set by this Makefile's `program` target and a board that programs
+**Run `sudo make minitpu` from THIS package, not a copy already on the board.**
+The clock is set by this Makefile's `minitpu` target and a board that programs
 the PL without it runs the fabric at 99.999 MHz — where every check still
 passes and every time is about 1.8x too slow. `tools/deploy_board.sh` ships the
 Makefile under its md5 gate for exactly that reason.
 
-`sudo make program` is needed after boot or whenever the PL is replaced. It
+`sudo make minitpu` is needed after boot or whenever the PL is replaced. It
 loads `minitpu/minitpu_zcu104.bit.bin`, applies `minitpu/overlay.dtso`, and
 exposes the NPU as a UIO device plus a contiguous DMA buffer, falling back
 to the bundled kernel-matched `minitpu/u-dma-buf.ko` when no in-tree module
@@ -53,7 +54,7 @@ its 1 % bar.
 | KV cache | 64 prefill tokens + 1 decode token, 1536 features | exact |
 | **Transformer block** | 64 × 768, 12 causal heads, resident | **1.28 %** |
 | GPT-2 prefill | "The capital of France is", 12 layers of real weights, each against its reference | not yet run on the board |
-| GPT-2 decode | One greedy token decoded through 12 layers, each layer and both tokens against the reference | not yet run on the board |
+| GPT-2 decode | One greedy token decoded through 12 layers, each layer and both tokens against the reference | tokens match, worst layer 1.67 % |
 
 The GEMM check runs **two** operand sets. The structured one is exactly
 representable and pins the kernel bit for bit; the varying one differs along
@@ -73,10 +74,12 @@ QKV projection drained them. Activations remain in DMEM from the body's entry up
 exit download. Projection biases are stored as one row and broadcast by
 stride-zero VMEM reads rather than materialised for each token shape.
 
-The PS performs all launch orchestration, the embedding, the final LayerNorm and the
-tied language head. `prefill` runs a prompt through every layer and fills one KV
-cache per layer, and `decode_step` runs each new token through every layer over
-those caches. The generation loop is not yet in this package.
+The PS performs all launch orchestration, the embedding and the tied language head,
+while the final LayerNorm runs on the NPU through the compiled LayerNorm image.
+`prefill` runs a prompt through every layer and fills one KV cache per layer,
+`decode_step` runs each new token through every layer over those caches, and
+`generate` loops the two greedily. `make generate PROMPT="..." TOKENS=8` prints a
+prompt's continuation.
 
 The compiled attention image fixes its sequence length when it is built, so the
 transformer block runs only at the lengths `tools/build_gpt2_images.py` lists,
@@ -89,7 +92,10 @@ The package is three layers. Each one only knows about the one below it.
 | Path | Purpose |
 | --- | --- |
 | | **The kernels** |
-| `gpt2_kernels.py` | **Entry point for the checks.** Host drivers, layer references, the board suite. `make kernels`. |
+| `gpt2.py` | GPT-2 small's inference: device tensors, the launches of every compiled image, the forward pass, and generation. |
+| `board_checks.py` | **Entry point for the checks.** The board suite `make kernels` runs. |
+| `references.py` | The host references every check holds the device to. |
+| `tokenizer.py` | GPT-2's byte-level BPE, reading the exported vocabulary and merges. |
 | `emit.py` | The templates the compiler emits every image's bundles from. |
 | `images/` | The compiled images and the manifest describing them, written by `tools/build_gpt2_images.py`. |
 | `bf16.py` | Device geometry, BF16 packing, operand layouts, host references. Touches no device, so it can be checked by inspection. |
@@ -101,12 +107,8 @@ The package is three layers. Each one only knows about the one below it.
 | `minitpu/` | Bitstream, device-tree overlay, PL bring-up scripts. |
 | `minitpu_runtime/runtime/` | Board runtime: UIO, udmabuf, COPY, LAUNCH. |
 | `minitpu_runtime/minitpu/` | Hardware ABI, register map, launch limits. |
-| | **Examples and tests** |
-| `run_compiled_kernel.py` | Launches the image the compiler produced. `kernel_entry_point.py` emits it, and it is copied here as `triton_kernel.bin`. |
+| | **Tests** |
 | `tests/` | Host-only tests: assembler encodings, scheduling distances, the operand rule, and the compiler held to the hand-written images it replaced, frozen in `tests/golden/`. `make check` runs them. |
-
-`run_compiled_kernel.py` launches a pre-built `triton_kernel.bin` against the
-explicit allocate/COPY/LAUNCH primitives and reduces the drain on the host.
 
 ## Reading `asm.py` first
 

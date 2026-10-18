@@ -3,15 +3,16 @@ SHELL := /bin/bash
 HERE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 PYTHON ?= python3 -u
 
-.PHONY: help program provision check kernels identity
+.PHONY: help minitpu provision check kernels identity generate
 
 help:
-	@echo "sudo make program     set the PL clock, program the PL, provision UIO/udmabuf"
+	@echo "sudo make minitpu     set the PL clock, program the PL, provision UIO/udmabuf"
 	@echo "                      override the clock with PL_CLK_MHZ=<n> (default $(PL_CLK_MHZ))"
 	@echo "sudo make provision   provision UIO/udmabuf on a PL that is already programmed"
 	@echo "make check            verify package files and run the host tests, without hardware"
 	@echo "make identity         which bitstream is loaded"
 	@echo "make kernels          the board checks"
+	@echo "make generate         continue PROMPT by TOKENS tokens with GPT-2 small"
 
 # PL_CLK_MHZ is set here because it is NOT set by the bitstream. PL0_REF_CTRL is
 # programmed by the FSBL inside BOOT.BIN -- dated May 2025, older than any
@@ -25,7 +26,7 @@ help:
 # +0.049 ns, which is 1 % margin.
 PL_CLK_MHZ ?= 187
 
-program:
+minitpu:
 	@$(HERE)minitpu/scripts/quiesce_pl.sh
 	@$(HERE)minitpu/scripts/set_pl_clock.sh $(PL_CLK_MHZ)
 	@$(HERE)minitpu/scripts/program_pl.sh
@@ -42,4 +43,11 @@ identity:
 	@$(PYTHON) $(HERE)minitpu/scripts/read_build_id.py
 
 kernels:
-	@$(PYTHON) $(HERE)gpt2_kernels.py
+	@$(PYTHON) $(HERE)board_checks.py
+
+# PROMPT and TOKENS pass through to the generator, e.g. make generate PROMPT="The capital of France is" TOKENS=8.
+PROMPT ?= The capital of France is
+TOKENS ?= 8
+
+generate:
+	@$(PYTHON) $(HERE)gpt2.py --prompt "$(PROMPT)" --tokens $(TOKENS)

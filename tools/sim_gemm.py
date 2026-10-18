@@ -2,7 +2,7 @@
 """Provides the RTL check that a GEMM image computes the product it claims.
 
 The image comes either from the dimensions named on the command line, which emits one directly, or from the
-artifacts `kernel_entry_point.py` wrote for a Triton kernel, which is the path a board launches. Both end in the
+artifacts `kernel_entry_point.py` wrote for a Triton kernel, which is the path a compiled kernel takes. Both end in the
 same testbench, so a kernel is checked here before it reaches hardware.
 """
 

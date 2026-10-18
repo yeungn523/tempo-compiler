@@ -33,7 +33,7 @@ FILES+=("board_package/minitpu/minitpu_zcu104.bit.bin")
 FILES+=("board_package/Makefile" "board_package/README.md")
 
 # The scripts that program the board, and the overlay and module they load, go
-# over the gate too and keep their subdirectory, so `sudo make program` never runs
+# over the gate too and keep their subdirectory, so `sudo make minitpu` never runs
 # a stale copy.
 while IFS= read -r f; do FILES+=("$f"); done < <(
   cd "$HERE" && ls board_package/minitpu/scripts/* board_package/minitpu/overlay.dtso \

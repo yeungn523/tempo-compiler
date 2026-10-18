@@ -14,7 +14,7 @@ into a launch, and emits the 128-bit VLIW bundles the board fetches. The board c
 built on a host and run there from `board_package/`, which holds the assembler, the runtime, and the layer drivers.
 
 The NPU's RTL lives in a separate repository. This repository ships its synthesized design as the bitstream
-`board_package/minitpu/minitpu_zcu104.bit.bin`, which `sudo make program` loads onto the board, so running on the
+`board_package/minitpu/minitpu_zcu104.bit.bin`, which `sudo make minitpu` loads onto the board, so running on the
 board needs no RTL checkout. Only the simulation tools read the RTL itself.
 
 ## Features
@@ -65,11 +65,11 @@ Hold a session open on the board, then run `tools/prepare_board.sh <account> <bo
 downloads GPT-2 small's weights and tokenizer, compiles every image the layers launch, and deploys them with the board
 package. The board erases the home directory whenever no session holds it, so run the script after every login.
 
-On the board, `sudo make program` programs the PL and `make kernels` runs the board checks, which end in a prefill and
-a greedy decode step through all twelve layers of the real model. See [board_package/README.md](board_package/README.md)
-for what each check proves.
+On the board, `sudo make minitpu` programs the PL, `make kernels` runs the board checks, and
+`make generate PROMPT="The capital of France is" TOKENS=8` prints GPT-2 small's greedy continuation of a prompt. See
+[board_package/README.md](board_package/README.md) for what each check proves.
 
-***Warning!*** Program the PL through `sudo make program` only. The target sets the PL clock first, and a PL programmed
+***Warning!*** Program the PL through `sudo make minitpu` only. The target sets the PL clock first, and a PL programmed
 without it runs at 99.999 MHz, where every check still passes and every launch is about 1.8 times too slow.
 
 ### Simulating Against the RTL
@@ -77,7 +77,6 @@ without it runs at 99.999 MHz, where every check still passes and every launch i
 | Tool                              | Checks                                                                       |
 |-----------------------------------|------------------------------------------------------------------------------|
 | `tools/sim_gemm.py`               | An emitted GEMM image against a float64 reference                            |
-| `tools/sim_ffn.py`                | The fused feed-forward image at GPT-2 small's shape                          |
 | `tools/sim_layernorm.py`          | The compiled LayerNorm against the hand-written image it replaced            |
 | `tools/sim_resident_attention.py` | The compiled attention over a sequence, or one decode step with `--decode`   |
 

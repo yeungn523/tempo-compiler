@@ -402,35 +402,6 @@ class Launch:
 
 
 @dataclass(frozen=True, slots=True)
-class FusedLaunch:
-    """Describes one image running a matmul pair and the transform between them.
-
-    The hidden width is walked one tile at a time, each chunk contracted, activated and consumed where it lies,
-    so the intermediate never reaches memory and the pair costs one launch rather than two.
-
-    Attributes:
-        row_blocks: Token blocks a host issues this image for.
-        chunks: Tiles the hidden width covers, being the loop both matmuls sit inside.
-        steps: Tiles the producing matmul's contraction covers.
-        output_tiles: Tiles the consuming matmul's output covers, swept inside each chunk.
-        produces: Position of the matmul leaving the intermediate.
-        consumes: Position of the matmul reading it.
-    """
-
-    row_blocks: int
-    chunks: int
-    steps: int
-    output_tiles: int
-    produces: int
-    consumes: int
-
-    @property
-    def launches(self) -> int:
-        """Returns the launches a host issues, being one per token block."""
-        return self.row_blocks
-
-
-@dataclass(frozen=True, slots=True)
 class FlashLaunch:
     """Describes one image running an attention block's whole key loop.
 
@@ -593,7 +564,7 @@ class Plan:
         issued_over_useful: Multiplies the padded shapes issue over the multiplies the problems hold.
     """
 
-    launches: tuple[Launch | FusedLaunch | FlashLaunch, ...]
+    launches: tuple[Launch | FlashLaunch, ...]
     drains: tuple[Drain, ...]
     padding: tuple[Padding, ...]
     repack: tuple[Repack, ...]

@@ -24,7 +24,7 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE / "minitpu_runtime"))
 
-from gpt2_kernels import _BLOCK_DEPTH, _on_bf16_grid, assert_operands_discriminating  # noqa: E402
+from bf16 import _BLOCK_DEPTH, _on_bf16_grid, assert_operands_discriminating  # noqa: E402
 
 _TOKENS: int = 32
 """The number of token rows in the test activations."""

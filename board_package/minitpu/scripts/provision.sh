@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Provision UIO + udmabuf for the NPU on ZCU104.  Runs ON the board, as root.
 #
-# After `make program` programs the PL, this script:
+# After `make minitpu` programs the PL, this script:
 #   1. Compiles and applies the device-tree overlay (minitpu_0 → generic-uio)
 #   2. Manually binds uio_pdrv_genirq (no auto-match on this kernel)
 #   3. Loads u-dma-buf if not already present
 #   4. Verifies /dev/uioN (name "minitpu") and /dev/udmabuf0 exist
 #
 # Prerequisites:
-#   - PL must be programmed first (`make program`)
+#   - PL must be programmed first (`make minitpu`)
 #   - dtc (device-tree compiler) must be installed
 #   - The bundled minitpu/u-dma-buf.ko must match the board kernel, unless an
 #     in-tree module is available.
@@ -133,7 +133,7 @@ else
     exit 1
 fi
 
-# `make program` needs root to configure the FPGA, but the programs that launch
+# `make minitpu` needs root to configure the FPGA, but the programs that launch
 # should not need root merely to mmap their two device nodes. Give the user who
 # invoked sudo access to this boot's selected nodes; device-node ownership is
 # reset at reboot, so this does not create a persistent system-wide policy.

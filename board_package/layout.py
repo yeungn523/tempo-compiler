@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from bf16 import (_MAX_DESCRIPTOR_ROWS, _TILE, _TILE_VREGS,
                   _VMEM_ENTRIES_PER_LANE)
 from isa_model import PROFILE
-from asm import AGU_SHIFT_W
 
 
 class LayoutError(ValueError):
@@ -104,31 +103,6 @@ class VmemRegion:
                        f"which has {self.tiles}.")
             raise LayoutError(message)
         return self.base + tile * self.tile_stride + offset
-
-
-@dataclass(frozen=True, slots=True)
-class FusedRegisterMap:
-    """Holds where the fused feed-forward layer's tiles live in the vector register file.
-
-    Attributes:
-        hidden: First register of each token group's hidden tile, which the up projection accumulates, the
-            activation rewrites in place and the down projection pushes.
-        output: First register of each token group's output tile, read and written per output tile swept.
-        staged: First register of each token group's staged input tile.
-        weight: First register of the staged weight tile, being the base a vmatload streams from.
-        result: First register a matrix result pops into.
-    """
-
-    hidden: tuple[int, ...]
-    output: tuple[int, ...]
-    staged: tuple[int, ...]
-    weight: int
-    result: int
-
-    @property
-    def used(self) -> int:
-        """Returns the registers the map hands out."""
-        return self.result + _TILE_VREGS
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,46 +254,6 @@ class VmemAllocator:
         self._regions.append(region)
         return region
 
-    def token_major_region(self, name: str, tokens: int, *, tiles: int) -> VmemRegion:
-        """Reserves `tokens` rows of `tiles` consecutive feature tiles each.
-
-        A token is contiguous here, so an access walking its tiles reads consecutive rows and the tokens are what sit a
-        stride apart.
-
-        Args:
-            name: What is being staged, for collision and overflow reports.
-            tokens: Tokens staged.
-            tiles: Feature tiles one token owns.
-
-        Returns:
-            The region, whose `rows` is one token's tiles and whose
-            `tile_stride` is that rounded up to a power of two.
-
-        Raises:
-            LayoutError: If it does not fit, or one token needs more rows than a
-                descriptor moves.
-        """
-        if tokens < 1 or tiles < 1:
-            message = (f"Unable to reserve {tokens} tokens of {tiles} tiles for "
-                       f"{name!r}. Both must be positive.")
-            raise LayoutError(message)
-        if tiles > _MAX_DESCRIPTOR_ROWS:
-            message = (
-                f"Unable to gather {tiles} tiles for {name!r} in one descriptor: "
-                f"past the {_MAX_DESCRIPTOR_ROWS} the row field encodes."
-            )
-            raise LayoutError(message)
-        region = VmemRegion(name, self._next, tiles, rows_per_token(tiles), tokens)
-        if region.end > self.capacity:
-            message = (
-                f"Unable to place {name!r}: {region.span} rows at {self._next} "
-                f"runs past the slot's {self.capacity}. Already placed: "
-                f"{', '.join(f'{r.name}[{r.base}:{r.end}]' for r in self._regions)}"
-            )
-            raise LayoutError(message)
-        self._next = region.end
-        self._regions.append(region)
-        return region
 
     def check_disjoint(self) -> None:
         """Raises if any two regions overlap.
@@ -334,38 +268,6 @@ class VmemAllocator:
                     f"boundary does not clear VMEM, so the collision is silent."
                 )
                 raise LayoutError(message)
-
-
-def fused_register_map(*, token_groups: int) -> FusedRegisterMap:
-    """Returns where the fused feed-forward layer's tiles sit, refusing an allocation the file cannot hold.
-
-    Args:
-        token_groups: Token groups one block covers, each carrying a tile of every region the layer holds.
-
-    Returns:
-        The map.
-
-    Raises:
-        LayoutError: If the tiles the layer holds live want more registers than the file has.
-    """
-    if token_groups < 1:
-        message = f"Unable to map {token_groups} token groups. A block covers at least one."
-        raise LayoutError(message)
-    grouped = token_groups * _TILE_VREGS
-    hidden, output, staged = (tuple(base + _TILE_VREGS * group for group in range(token_groups))
-                              for base in (0, grouped, 2 * grouped))
-    weight = 3 * grouped
-    mapped = FusedRegisterMap(hidden=hidden, output=output, staged=staged, weight=weight,
-                              result=weight + _TILE_VREGS)
-    entries = PROFILE["vreg_entry_count"]
-    if mapped.used > entries:
-        message = (
-            f"Unable to hold a fused layer over {token_groups} token groups: its hidden, output and input "
-            f"tiles, its weight tile and its result tile want {mapped.used} of the {entries} registers present. "
-            f"Narrow the block's rows."
-        )
-        raise LayoutError(message)
-    return mapped
 
 
 def register_map(*, block_m: int, block_n: int) -> RegisterMap:
@@ -498,32 +400,3 @@ def flash_register_map(*, queries: int, head: int) -> FlashRegisterMap:
 
     resident = (free - _TILE_VREGS) // per_tile
     return FlashRegisterMap(**fields, scratch=accumulator + resident * per_tile, resident=resident)
-
-
-def rows_per_token(tiles: int) -> int:
-    """Returns the VMEM rows one token owns when its feature tiles land consecutively.
-
-    Rounded up to a power of two, because the AGU reaches a token by shifting the loop index rather than multiplying it.
-
-    Args:
-        tiles: Feature tiles one token's row covers.
-
-    Returns:
-        Rows per token, a power of two at or above `tiles`.
-
-    Raises:
-        LayoutError: If the stride needs a shift wider than the AGU's field.
-    """
-    if tiles < 1:
-        message = f"Unable to lay out {tiles} feature tiles. At least one is needed."
-        raise LayoutError(message)
-    per_token = 1 << (tiles - 1).bit_length()
-    max_shift = (1 << AGU_SHIFT_W) - 1
-    if per_token.bit_length() - 1 > max_shift:
-        message = (
-            f"Unable to walk {per_token} rows per token. The AGU shift field is "
-            f"{AGU_SHIFT_W} bits, so the shift reaches {max_shift} and the stride "
-            f"{1 << max_shift}."
-        )
-        raise LayoutError(message)
-    return per_token

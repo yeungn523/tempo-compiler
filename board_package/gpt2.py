@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Provides the GPT-2 host drivers, the layer references and the checks that say the device path is right.
+"""Provides GPT-2 small's inference on the NPU: the device tensors, the launches of every compiled image, and the
+forward pass that chains them.
 
-Running this module on a board executes every check in order. Composition lives here, while the arithmetic is in
-bf16.py, the hand-written schedules are in kernels.py and every GEMM image comes from the compiler through images/.
-A transformer block runs resident in DMEM, every operation in it a launch reading the previous one's output.
+Running this module generates a continuation of a prompt on a board.
 """
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Callable
-
 import json
 import math
 import pathlib
@@ -19,46 +18,38 @@ import time
 import numpy as np
 from numpy.typing import NDArray
 
-HERE = pathlib.Path(__file__).resolve().parent
+HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent
+"""The board package's directory."""
+
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE / "minitpu_runtime"))
 
-from bf16 import (  # noqa: E402,F401  (re-exported, the operand tests importing them from here)
+from bf16 import (  # noqa: E402
     _BLOCK_ACTIVATION_BYTES,
     _BLOCK_DEPTH,
     _BLOCK_TOKENS,
     _BLOCK_WEIGHT_BYTES,
-    _CORRUPTION_WORD,
     _ELEMENT_BYTES,
-    _LAUNCH_REPEATS,
-    _LN_EPSILON,
-    _MAX_DESCRIPTOR_ROWS,
     _MODEL_WIDTH,
     _NUM_LANES,
     _ROW_BYTES,
     _TILE,
-    _TILE_VREGS,
     _VREG_ELEMENTS,
     _ZERO_TILE_BYTES,
     _ZERO_TILE_WORDS,
     _on_bf16_grid,
-    _single_launch_operands,
     as_bf16_words,
-    assert_operands_discriminating,
-    build_operands,
     from_bf16_words,
-    gelu_lut_reference,
     pack_activations,
     decode_mask_tiles,
     pack_attention_constants,
     pack_bias,
     pack_weights,
 )
-from asm import AsmBuilder, AsmKernel  # noqa: E402
+from tokenizer import Tokenizer  # noqa: E402
 from runtime import (  # noqa: E402
     MemcpyKind,
     minitpuFree,
-    minitpuGetAddressSpace,
     minitpuHostAlloc,
     minitpuHostReset,
     minitpuLaunchKernel,
@@ -66,23 +57,6 @@ from runtime import (  # noqa: E402
     minitpuMemcpy,
     minitpuSetDevice,
 )
-
-
-sys.path.insert(0, str(HERE))
-
-
-sys.path.insert(0, str(HERE / "minitpu_runtime"))
-
-
-
-
-_GEMM_ERROR_LIMIT: float = 0.01
-
-
-_SOFTMAX_ERROR_LIMIT: float = 0.02
-
-
-_BLOCK_ERROR_LIMIT: float = 0.05
 
 
 _TENSOR_POOL: dict[tuple[int, int], list[int]] = {}
@@ -101,24 +75,28 @@ _IMAGE_DIRECTORY: pathlib.Path = HERE / "images"
 `tools/build_gpt2_images.py`."""
 
 
-_UIO_NAME: str = "minitpu"
+UIO_NAME: str = "minitpu"
 """UIO node every image launches on."""
 
 
 _COMPILED_IMAGES: dict[tuple, tuple[bytes, dict]] = {}
 """Compiled images and their manifest entries, keyed by kind and shape, each read from disk once."""
 
+
 _ATTENTION_CONSTANTS: dict[str, int] = {}
 """DMEM address of each attention image's constants block, keyed by its file, each uploaded once."""
+
 
 _MAX_CONTEXT: int = 1024
 """Tokens GPT-2 small attends over at most, being the positions its position embedding covers."""
 
+
 _END_OF_TEXT: int = 50256
 """Token a prompt is padded with, being GPT-2's end-of-text token."""
 
-_PROMPT: tuple[int, ...] = (464, 3139, 286, 4881, 318)
-"""Tokens of "The capital of France is", which the prefill check runs through every layer."""
+
+_NPU_CLOCK: list[float] = [0.0]
+"""Seconds spent inside launches since the process started, from issue until the NPU retires each image."""
 
 _DECODE_CONSTANTS: dict[int, int] = {}
 """DMEM address of each decode image's constants block, keyed by the cache length it walks, rewritten each step."""
@@ -325,6 +303,11 @@ class KVCache:
         return d_fused.features // 3 // _TILE * _BLOCK_TOKENS * _ROW_BYTES
 
 
+def npu_seconds() -> float:
+    """Returns the seconds spent inside launches so far, which excludes every upload, download and host step."""
+    return _NPU_CLOCK[0]
+
+
 def load_gpt2_weights(path: pathlib.Path | None = None) -> tuple[list[dict], dict]:
     """Reads the weights `tools/export_gpt2_weights.py` wrote, as float32 arrays.
 
@@ -355,48 +338,6 @@ def load_gpt2_weights(path: pathlib.Path | None = None) -> tuple[list[dict], dic
     return layers, shared
 
 
-def layernorm_reference(
-    rows: NDArray[np.float32], gamma: NDArray[np.float32], beta: NDArray[np.float32]
-) -> NDArray[np.float32]:
-    """Returns the LayerNorm a BF16 device computes, on the host.
-
-    Notes:
-        Rounds where the device rounds: the mean and variance are BF16 sums scaled by a BF16 1/width,
-        and the affine is two BF16 operations. What is left is the rsqrt table's interpolation.
-    """
-    values = _on_bf16_grid(values=rows)
-    inverse = _on_bf16_grid(values=np.float32(1.0 / _MODEL_WIDTH))
-    mean = _on_bf16_grid(values=values.sum(axis=1, keepdims=True, dtype=np.float32) * inverse)
-    centred = _on_bf16_grid(values=values - mean)
-    variance = _on_bf16_grid(
-        values=_on_bf16_grid(values=centred * centred).sum(axis=1, keepdims=True, dtype=np.float32)
-        * inverse)
-    scale = _on_bf16_grid(values=1.0 / np.sqrt(_on_bf16_grid(values=variance + _LN_EPSILON)))
-    return _on_bf16_grid(values=_on_bf16_grid(values=centred * scale) * _on_bf16_grid(values=gamma)
-                         + _on_bf16_grid(values=beta))
-
-
-def softmax_reference(scores: NDArray[np.float32]) -> NDArray[np.float32]:
-    """Returns the row-wise softmax a BF16 device computes, on the host.
-
-    Notes:
-        Quantises at each step the device quantises at: the subtraction, the exponential and the
-        product all round to BF16, and the reciprocal is the SFU's own. What is left over is the
-        table's interpolation error, which is what a check's bound has to cover.
-
-    Args:
-        scores: One row per reduction, each `_VREG_ELEMENTS` wide.
-
-    Returns:
-        The float32 softmax of each row.
-    """
-    values = _on_bf16_grid(values=scores)
-    shifted = _on_bf16_grid(values=values - values.max(axis=1, keepdims=True))
-    weights = _on_bf16_grid(values=np.exp(shifted, dtype=np.float32))
-    totals = _on_bf16_grid(values=weights.sum(axis=1, keepdims=True, dtype=np.float32))
-    return _on_bf16_grid(values=weights * _on_bf16_grid(values=1.0 / totals))
-
-
 def upload_weights(h_weights: NDArray[np.float32]) -> ResidentWeights:
     """Packs a weight matrix and leaves it in DMEM for repeated launches.
 
@@ -407,7 +348,7 @@ def upload_weights(h_weights: NDArray[np.float32]) -> ResidentWeights:
         A handle `full_gemm` accepts in place of the array.
     """
     words = pack_weights(weights=_on_bf16_grid(values=h_weights.astype(np.float32)))
-    minitpuSetDevice(_UIO_NAME)
+    minitpuSetDevice(UIO_NAME)
     host = minitpuHostAlloc(words.nbytes)
     host.view.view("<u2")[: words.size] = words
     # One block of slack for the kernel's last prefetch, which reads one block past
@@ -431,7 +372,7 @@ def upload_bias(h_bias: NDArray[np.float32]) -> ResidentWeights:
             f"whole {_NUM_LANES}-lane tiles."
         )
     words = pack_bias(_on_bf16_grid(values=h_bias.astype(np.float32)))
-    minitpuSetDevice(_UIO_NAME)
+    minitpuSetDevice(UIO_NAME)
     host = minitpuHostAlloc(words.nbytes)
     host.view.view("<u2")[:words.size] = words
     address = minitpuMalloc(words.nbytes)
@@ -491,8 +432,6 @@ def download_activations(d_tensor: DeviceTensor) -> NDArray[np.float32]:
 # per-region free, so a process sweeping many shapes exhausts its 16 MiB udmabuf and a benchmark takes one
 # shape per process. Caching a region per role does not survive `minitpuHostReset`, which the drivers call
 # and which drops the udmabuf out from under every region carved from it. The fix belongs in the allocator.
-
-
 def upload_layernorm_constants(h_gamma: NDArray[np.float32],
                                h_beta: NDArray[np.float32]) -> int:
     """Uploads one LayerNorm's constants block and returns its DMEM address.
@@ -551,10 +490,10 @@ def layernorm_resident(d_rows: DeviceTensor, d_constants: int, *,
     if d_out is None:
         d_out = _allocate_tensor(d_rows.tokens, d_rows.features)
 
-    minitpuSetDevice(_UIO_NAME)
+    minitpuSetDevice(UIO_NAME)
     d_image = _stage_image(image_bytes)
     for block in range(d_rows.blocks):
-        minitpuLaunchKernel(
+        _launch(
             d_image, len(image_bytes),
             args=[d_rows.operand(block), d_constants, d_out.operand(block)])
     return d_out
@@ -589,10 +528,10 @@ def add_resident(d_left: DeviceTensor, d_right: DeviceTensor, *,
     if d_out is None:
         d_out = _allocate_tensor(d_left.tokens, d_left.features)
 
-    minitpuSetDevice(_UIO_NAME)
+    minitpuSetDevice(UIO_NAME)
     d_image = _stage_image(image_bytes)
     for block in range(d_left.blocks):
-        minitpuLaunchKernel(
+        _launch(
             d_image, len(image_bytes),
             args=[d_left.operand(block), d_right.operand(block), d_out.operand(block)])
     return d_out
@@ -619,10 +558,10 @@ def add_bias_resident(d_left: DeviceTensor, d_bias: ResidentWeights, *,
     if d_out is None:
         d_out = _allocate_tensor(d_left.tokens, d_left.features)
 
-    minitpuSetDevice(_UIO_NAME)
+    minitpuSetDevice(UIO_NAME)
     d_image = _stage_image(image_bytes)
     for block in range(d_left.blocks):
-        minitpuLaunchKernel(
+        _launch(
             d_image, len(image_bytes),
             args=[d_left.operand(block), d_bias.address, d_out.operand(block)])
     return d_out
@@ -676,11 +615,11 @@ def gemm_resident(d_activations: DeviceTensor, d_weights: ResidentWeights, *,
     if d_out is None:
         d_out = _allocate_tensor(tokens, columns)
 
-    minitpuSetDevice(_UIO_NAME)
+    minitpuSetDevice(UIO_NAME)
     d_image = _stage_image(image_bytes)
 
     for block in range(tokens // _BLOCK_TOKENS):
-        minitpuLaunchKernel(
+        _launch(
             d_image, len(image_bytes),
             args=[d_activations.operand(block), d_weights.address, d_out.d_drain(block)])
     return d_out
@@ -738,7 +677,7 @@ def full_gemm(
     drain_words = _ZERO_TILE_WORDS + column_tiles * _BLOCK_TOKENS * _TILE
     result = np.empty((tokens, columns), dtype=np.float32)
 
-    minitpuSetDevice(_UIO_NAME)
+    minitpuSetDevice(UIO_NAME)
     minitpuHostReset()
     d_owned: list[int] = []
 
@@ -774,7 +713,7 @@ def full_gemm(
             h_activations.view.view("<u2")[: block_words.size] = block_words
             minitpuMemcpy(d_activations, h_activations, block_words.nbytes, MemcpyKind.HostToDevice)
 
-            minitpuLaunchKernel(d_image, len(image_bytes),
+            _launch(d_image, len(image_bytes),
                                 args=[d_activations, d_weights, d_drain])
             minitpuMemcpy(h_drain, d_drain, drain_words * _ELEMENT_BYTES, MemcpyKind.DeviceToHost)
 
@@ -930,8 +869,46 @@ def decode_step(token_id: int, layers: list[dict], shared: dict, caches: list[KV
     return hidden
 
 
+def final_layernorm(hidden: NDArray[np.float32], shared: dict) -> NDArray[np.float32]:
+    """Applies GPT-2's final LayerNorm to token rows on the device, through the compiled LayerNorm image.
+
+    Args:
+        hidden: [tokens, model] the last layer's output.
+        shared: The shared weights, as `load_gpt2_weights` returns them, which hold `ln_f.g` and `ln_f.b`.
+
+    Returns:
+        The [tokens, model] normalised rows.
+    """
+    tokens = hidden.shape[0]
+    padded = np.zeros((-(-tokens // _BLOCK_TOKENS) * _BLOCK_TOKENS, hidden.shape[1]), dtype=np.float32)
+    padded[:tokens] = hidden
+    d_rows, d_constants = upload_activations(padded), upload_layernorm_constants(shared["ln_f.g"], shared["ln_f.b"])
+    try:
+        d_normed = layernorm_resident(d_rows, d_constants)
+        try:
+            return download_activations(d_normed)[:tokens]
+        finally:
+            d_normed.free()
+    finally:
+        d_rows.free()
+        minitpuFree(d_constants)
+
+
+def lm_head(normalised: NDArray[np.float32], shared: dict) -> NDArray[np.float32]:
+    """Scores every vocabulary token against one normalised row through the tied embedding.
+
+    Args:
+        normalised: [model] the final LayerNorm's output for the token being predicted from.
+        shared: The shared weights, as `load_gpt2_weights` returns them, which hold `wte`.
+
+    Returns:
+        The [vocabulary] logits.
+    """
+    return normalised @ shared["wte"].T
+
+
 def next_token_logits(hidden: NDArray[np.float32], shared: dict) -> NDArray[np.float32]:
-    """Applies the final LayerNorm and the tied language head to one token's output, scoring every token.
+    """Scores every vocabulary token after one token, the final LayerNorm on the device and the head on the host.
 
     Args:
         hidden: [model] the last layer's output for the token being predicted from.
@@ -940,35 +917,47 @@ def next_token_logits(hidden: NDArray[np.float32], shared: dict) -> NDArray[np.f
     Returns:
         The [vocabulary] logits.
     """
-    centred = hidden - hidden.mean()
-    normalised = centred / np.sqrt((centred * centred).mean() + _LN_EPSILON)
-    return (normalised * shared["ln_f.g"] + shared["ln_f.b"]) @ shared["wte"].T
+    return lm_head(final_layernorm(hidden[None, :], shared)[0], shared)
 
 
-def transformer_block_reference(hidden: NDArray[np.float32], weights: dict) -> NDArray[np.float32]:
-    """Returns the block output a BF16 device computes, on the host."""
-    normalised = layernorm_reference(rows=hidden, gamma=weights["ln_1.g"], beta=weights["ln_1.b"])
-    fused = (normalised.astype(np.float64) @ weights["attn.qkv.w"].astype(np.float64)
-             + weights["attn.qkv.b"]).astype(np.float32)
-    query, key, value = np.split(fused, 3, axis=1)
-    heads = 12
-    head = hidden.shape[1] // heads
-    gathered = np.concatenate(
-        [attention_reference(query=np.ascontiguousarray(query[:, i * head:(i + 1) * head]),
-                             key=np.ascontiguousarray(key[:, i * head:(i + 1) * head]),
-                             value=np.ascontiguousarray(value[:, i * head:(i + 1) * head]), causal=True)
-         for i in range(heads)], axis=1)
-    attended = (_on_bf16_grid(values=gathered).astype(np.float64)
-                @ weights["attn.proj.w"].astype(np.float64) + weights["attn.proj.b"]).astype(np.float32)
-    residual = _on_bf16_grid(values=hidden + attended)
+def generate(token_ids: NDArray[np.int64], layers: list[dict], shared: dict, *, new_tokens: int, heads: int = 12,
+             capacity: int = _MAX_CONTEXT) -> list[int]:
+    """Greedily generates a prompt's continuation, prefilling the prompt and decoding one token per step.
 
-    normalised = layernorm_reference(rows=residual, gamma=weights["ln_2.g"], beta=weights["ln_2.b"])
-    expanded = (normalised.astype(np.float64) @ weights["mlp.fc.w"].astype(np.float64)
-                + weights["mlp.fc.b"]).astype(np.float32)
-    activated = from_bf16_words(words=gelu_lut_reference(words=as_bf16_words(values=expanded)))
-    contracted = (activated.astype(np.float64) @ weights["mlp.proj.w"].astype(np.float64)
-                  + weights["mlp.proj.b"]).astype(np.float32)
-    return _on_bf16_grid(values=residual + contracted)
+    Args:
+        token_ids: The prompt's tokens, in order.
+        layers: Each layer's weights, as `load_gpt2_weights` returns them.
+        shared: The shared weights, as `load_gpt2_weights` returns them.
+        new_tokens: Tokens to generate at most, generation stopping early at GPT-2's end-of-text token.
+        heads: Attention heads.
+        capacity: Tokens each layer's cache holds room for.
+
+    Returns:
+        The generated tokens, in order.
+
+    Raises:
+        ValueError: If the prompt and its continuation outgrow the caches.
+    """
+    if len(token_ids) + new_tokens > capacity:
+        message = (
+            f"Unable to generate {new_tokens} tokens after a {len(token_ids)}-token prompt. The caches hold "
+            f"{capacity} tokens, so ask for fewer."
+        )
+        raise ValueError(message)
+    hidden, caches = prefill(token_ids, layers, shared, heads=heads, capacity=capacity)
+    generated: list[int] = []
+    try:
+        logits = next_token_logits(hidden[-1], shared)
+        while len(generated) < new_tokens:
+            token = int(np.argmax(logits))
+            generated.append(token)
+            if token == _END_OF_TEXT or len(generated) == new_tokens:
+                break
+            logits = next_token_logits(decode_step(token, layers, shared, caches, heads=heads), shared)
+    finally:
+        for cache in caches:
+            cache.free()
+    return generated
 
 
 def attention(d_fused: DeviceTensor, *, heads: int = 12) -> DeviceTensorSlice:
@@ -990,9 +979,9 @@ def attention(d_fused: DeviceTensor, *, heads: int = 12) -> DeviceTensorSlice:
     """
     image_bytes, entry = _compiled_image(kind="attention", tokens=d_fused.tokens, heads=heads)
     d_constants = _attention_constants(entry)
-    minitpuSetDevice(_UIO_NAME)
+    minitpuSetDevice(UIO_NAME)
     d_image = _stage_image(image_bytes)
-    minitpuLaunchKernel(d_image, len(image_bytes), args=[d_constants, 0, d_fused.operand(0)])
+    _launch(d_image, len(image_bytes), args=[d_constants, 0, d_fused.operand(0)])
     return DeviceTensorSlice(d_fused, 0, d_fused.features // 3)
 
 
@@ -1023,475 +1012,10 @@ def decode_attention(d_fused: DeviceTensor, cache: KVCache, *, heads: int = 12) 
         raise ValueError(message)
     image_bytes, entry = _compiled_image(kind="decode_attention", keys=keys, heads=heads)
     d_constants = _decode_constants(entry, length=cache.length)
-    minitpuSetDevice(_UIO_NAME)
+    minitpuSetDevice(UIO_NAME)
     d_image = _stage_image(image_bytes)
-    minitpuLaunchKernel(d_image, len(image_bytes), args=[d_constants, cache.tensor.operand(0), d_fused.operand(0)])
+    _launch(d_image, len(image_bytes), args=[d_constants, cache.tensor.operand(0), d_fused.operand(0)])
     return DeviceTensorSlice(d_fused, 0, d_fused.features // 3)
-
-
-def attention_reference(
-    query: NDArray[np.float32], key: NDArray[np.float32], value: NDArray[np.float32], *, causal: bool = False
-) -> NDArray[np.float32]:
-    """Returns the attention output a BF16 device computes, on the host.
-
-    Args:
-        query: [tokens, head] queries.
-        key: [tokens, head] keys.
-        value: [tokens, head] values.
-        causal: Determines whether a query attends only at or before its own position, every later key's score
-            replaced by the large negative constant the device's mask adds.
-
-    Returns:
-        The [tokens, head] attention output.
-    """
-    head = query.shape[1]
-    scaled = _on_bf16_grid(values=(query / math.sqrt(head)).astype(np.float32))
-    scores = _on_bf16_grid(values=(scaled.astype(np.float64) @ _on_bf16_grid(values=key).T
-                                   .astype(np.float64)).astype(np.float32))
-    if causal:
-        later = np.arange(key.shape[0])[None, :] > np.arange(query.shape[0])[:, None]
-        scores = np.where(later, np.float32(-1.0e30), scores)
-    weights = softmax_reference(scores=scores)
-    return (weights.astype(np.float64) @ _on_bf16_grid(values=value).astype(np.float64)).astype(np.float32)
-
-
-def check_kernel_launch(image_bytes: bytes) -> None:
-    """Verifies the LAUNCH path by staging a resident kernel image and starting it from the host.
-
-    Notes:
-        The transfer reaches device memory through the copy engine's alias of the kernel aperture, while the
-        loader reads the staged image back through the MINITPU's own device-memory port. Only a launch crosses
-        both routes, so an aperture whose two addresses resolve to different DRAM surfaces fails here rather
-        than in a workload result. Repeating the launch requires the command processor to return to idle.
-
-    Args:
-        image_bytes: The assembled image staged and started.
-
-    Raises:
-        RuntimeError: If the loader flags an error and the command processor abandons the launch.
-        TimeoutError: If a command fails to retire, which is how a core that never halts presents.
-    """
-    address_space = minitpuGetAddressSpace()
-
-    minitpuSetDevice(_UIO_NAME)
-    minitpuHostReset()
-    try:
-        staging = minitpuHostAlloc(len(image_bytes))
-        staging.view[: len(image_bytes) // 4] = np.frombuffer(image_bytes, dtype="<u4")
-        minitpuMemcpy(
-            dst=address_space.kernel_base,
-            src=staging,
-            nbytes=len(image_bytes),
-            kind=MemcpyKind.HostToDevice,
-        )
-
-        for _ in range(_LAUNCH_REPEATS):
-            minitpuLaunchKernel(kbin_addr=address_space.kernel_base, kbin_size=len(image_bytes))
-    finally:
-        minitpuHostReset()
-
-
-def check_copy_roundtrip(words: NDArray[np.uint32], *, uio_name: str = "minitpu") -> None:
-    """Verifies that a kernel's argument words cross to device memory and return byte for byte unchanged.
-
-    Notes:
-        The words travel from the pinned PS-DDR host buffer to the DMEM device aperture and back, so the check
-        covers minitpuMemcpy in both directions over the exact payload a kernel is given. Both transfers translate
-        the device pointer the same way, so a returned payload establishes transport fidelity rather than the
-        address the words occupy in DMEM.
-
-    Args:
-        words: The BF16 container words to send through device memory.
-        uio_name: The name of the board's UIO device node.
-
-    Raises:
-        AssertionError: If the words the device returns differ from the words sent to it.
-    """
-    minitpuSetDevice(uio_name)
-    minitpuHostReset()
-    device_address = None
-    try:
-        source = minitpuHostAlloc(words.nbytes)
-        destination = minitpuHostAlloc(words.nbytes)
-        source.view.view("<u2")[: words.size] = words
-        device_address = minitpuMalloc(words.nbytes)
-        minitpuMemcpy(dst=device_address, src=source, nbytes=words.nbytes, kind=MemcpyKind.HostToDevice)
-
-        # Writes the corruption word so a transfer that moves nothing fails. The udmabuf outlives the process and
-        # every run reuses its offsets, so an untouched destination still holds the last run's words. The flush
-        # carries the word past the cache lines the read-back invalidates.
-        destination.view.view("<u2")[: words.size] = _CORRUPTION_WORD & 0xFFFF
-        destination.sync_to_device()
-
-        minitpuMemcpy(dst=destination, src=device_address, nbytes=words.nbytes, kind=MemcpyKind.DeviceToHost)
-        np.testing.assert_array_equal(
-            destination.view.view("<u2")[: words.size], words)
-    finally:
-        if device_address is not None:
-            minitpuFree(device_address)
-        minitpuHostReset()
-
-
-def run_check(name: str, check: Callable[[], str]) -> bool:
-    """Runs one check and reports whether it passed.
-
-    Args:
-        name: The label the report line carries.
-        check: The callable performing the check, which returns the detail its report line carries.
-
-    Returns:
-        Whether the check passed.
-    """
-    try:
-        detail = check()
-    except Exception as error:  # noqa: BLE001
-        print(f"[FAIL] {name}: {error}")
-        return False
-    print(f"[PASS] {name}: {detail}")
-    return True
-
-
-def check_halt() -> str:
-    """Stages the shortest valid program and starts it repeatedly.
-
-    Returns:
-        The detail the report line carries.
-
-    Raises:
-        RuntimeError: If the loader flags an error and the command processor abandons the launch.
-        TimeoutError: If a command fails to retire, which is how a core that never halts presents.
-    """
-    check_kernel_launch(image_bytes=AsmKernel(name="halt", bundles=(AsmBuilder().halt(),)).to_bytes(pad_to=4))
-    return f"staged and launched {_LAUNCH_REPEATS} times"
-
-
-def check_copy_argument() -> str:
-    """Sends one GEMM argument through device memory and reads it back.
-
-    Returns:
-        The detail the report line carries.
-
-    Raises:
-        AssertionError: If the payload read back differs from the payload sent.
-    """
-    gemm_input = _single_launch_operands()[3]
-    check_copy_roundtrip(words=gemm_input)
-    return f"{gemm_input.nbytes}-byte GEMM argument"
-
-
-def check_full_gemm(*, tokens: int = 32, depth: int = 768, columns: int = 3072) -> str:
-    """Runs a product at model dimensions through its compiled image and verifies it against a host reference.
-
-    Notes:
-        Runs two operand sets, either alone being blind. The structured set is exactly representable and pins
-        the kernel to the host reference bit for bit, but its token rows are identical and its weights constant
-        along the contraction, so a kernel confusing one token or one contraction block for another still
-        passes. The varying set differs along every axis, which makes those confusions observable, and carries
-        a relative bound because its BF16 partial sums cost exactness.
-
-    Args:
-        tokens: Rows the product covers, which must be a whole number of token blocks.
-        depth: The contraction, which a compiled image in the manifest must cover together with `columns`.
-        columns: Output features, which must be a whole number of tiles.
-
-    Returns:
-        The detail the report line carries, naming the shapes, the launch count and the measured time.
-
-    Raises:
-        AssertionError: If the compiled image disagrees with the host reference on either operand set.
-    """
-    launches = tokens // _BLOCK_TOKENS
-
-    left, right = build_operands(tokens, depth, columns, kind="structured", seed=0)
-
-    started = time.perf_counter()
-    actual = full_gemm(activations=left, weights=right)
-    elapsed = time.perf_counter() - started
-    np.testing.assert_allclose(actual, left @ right, rtol=0, atol=0)
-
-    # build_operands runs assert_operands_discriminating on this pair, so a set that stopped
-    # varying along an axis fails here rather than passing the check below for free.
-    varying_left, varying_right = build_operands(tokens, depth, columns, kind="varying", seed=0)
-    varying_actual = full_gemm(activations=varying_left, weights=varying_right)
-    expected = varying_left.astype(np.float64) @ varying_right.astype(np.float64)
-    error = float(np.linalg.norm(varying_actual - expected) / np.linalg.norm(expected))
-    if error >= _GEMM_ERROR_LIMIT:
-        message = (
-            f"Unable to verify the product against the host reference on operands that vary along "
-            f"every axis. The relative error must stay below {_GEMM_ERROR_LIMIT:.0%}, which is what "
-            f"the BF16 partial sums explain, but got {error:.3%}. The structured operands above "
-            f"passed, so the kernel agrees on a product whose token rows are identical and whose "
-            f"weights are constant along the contraction, and disagrees once they are not."
-        )
-        raise AssertionError(message)
-
-    return (
-        f"[{tokens},{depth}] @ [{depth},{columns}] compiled, {2 * launches} launches in {elapsed:.1f} s "
-        f"({1e6 * elapsed / launches:.0f} us each), varying-operand relative error {error:.2%}"
-    )
-
-
-def check_elementwise_add(*, tokens: int = 32, features: int = 768) -> str:
-    """Adds two DMEM tensors, and one tensor and a broadcast bias row, on the device and compares against the host.
-
-    Returns:
-        The detail the report line carries.
-
-    Raises:
-        AssertionError: If either device sum is not the host's, exactly.
-    """
-    rng = np.random.default_rng(53)
-    h_left = _on_bf16_grid(values=rng.standard_normal((tokens, features)).astype(np.float32))
-    h_right = _on_bf16_grid(values=rng.standard_normal((tokens, features)).astype(np.float32))
-    h_bias = _on_bf16_grid(values=rng.standard_normal(features).astype(np.float32))
-    d_left, d_right, d_bias = upload_activations(h_left), upload_activations(h_right), upload_bias(h_bias)
-    try:
-        started = time.time()
-        d_sum = add_resident(d_left, d_right)
-        elapsed = time.time() - started
-        d_biased = add_bias_resident(d_left, d_bias)
-        try:
-            actual, biased = download_activations(d_sum), download_activations(d_biased)
-        finally:
-            d_sum.free()
-            d_biased.free()
-    finally:
-        d_left.free()
-        d_right.free()
-        d_bias.free()
-
-    for name, device, expected in (("sum", actual, h_left + h_right), ("bias sum", biased, h_left + h_bias)):
-        expected = _on_bf16_grid(values=expected)
-        assert np.array_equal(device, expected), (
-            f"device {name} differs from the host by up to {np.abs(device - expected).max():.3e}")
-    return f"[{tokens},{features}] + [{tokens},{features}] in {elapsed * 1e3:.0f} ms, and + bias row, exact"
-
-
-def check_decode_attention(*, context: int = 48, model: int = _MODEL_WIDTH, heads: int = 12) -> str:
-    """Prefills a KV cache, appends a decode step's token and attends it over the cache on the device.
-
-    Returns:
-        The detail the report line carries.
-
-    Raises:
-        AssertionError: If the device disagrees with the host reference.
-    """
-    rng = np.random.default_rng(19)
-    tokens = -(-context // _BLOCK_TOKENS) * _BLOCK_TOKENS
-    h_prefill = _on_bf16_grid(values=rng.standard_normal((tokens, 3 * model)).astype(np.float32))
-    h_step = _on_bf16_grid(values=rng.standard_normal((_BLOCK_TOKENS, 3 * model)).astype(np.float32))
-    d_prefill, d_step = upload_activations(h_prefill), upload_activations(h_step)
-    cache = KVCache(capacity=tokens + _BLOCK_TOKENS, model=model)
-    try:
-        cache.extend(d_prefill, tokens=context)
-        cache.append(d_step)
-        started = time.time()
-        actual = download_activations(decode_attention(d_step, cache, heads=heads))[0]
-        elapsed = time.time() - started
-    finally:
-        cache.free()
-        d_prefill.free()
-        d_step.free()
-
-    head = model // heads
-    keys = np.concatenate([h_prefill[:context, model:2 * model], h_step[:1, model:2 * model]], axis=0)
-    values = np.concatenate([h_prefill[:context, 2 * model:], h_step[:1, 2 * model:]], axis=0)
-    expected = np.empty(model, dtype=np.float64)
-    for index in range(heads):
-        columns = slice(index * head, (index + 1) * head)
-        scores = keys[:, columns].astype(np.float64) @ h_step[0, columns].astype(np.float64)
-        weights = np.exp(scores - scores.max())
-        expected[columns] = (weights / weights.sum()) @ values[:, columns].astype(np.float64)
-
-    error = float(np.linalg.norm(actual - expected) / np.linalg.norm(expected))
-    assert error < 0.05, f"decode attention relative error {error:.4%} is too large"
-    return (f"{heads} heads x 1 query over {cache.length} cached keys, compiled, 1 launch in {elapsed:.2f} s, "
-            f"relative error {error:.2%}")
-
-
-def check_layernorm(*, tokens: int = 32) -> str:
-    """Runs the compiled LayerNorm over a resident tensor and verifies it against the host reference."""
-    rng = np.random.default_rng(0)
-    values = _on_bf16_grid(values=(rng.standard_normal((tokens, _MODEL_WIDTH)) * 2.0).astype(np.float32))
-    gamma = _on_bf16_grid(values=(1.0 + 0.1 * rng.standard_normal(_MODEL_WIDTH)).astype(np.float32))
-    beta = _on_bf16_grid(values=(0.1 * rng.standard_normal(_MODEL_WIDTH)).astype(np.float32))
-    d_rows, d_constants = upload_activations(values), upload_layernorm_constants(gamma, beta)
-    try:
-        d_normed = layernorm_resident(d_rows, d_constants)
-        try:
-            actual = download_activations(d_normed)
-        finally:
-            d_normed.free()
-    finally:
-        d_rows.free()
-        minitpuFree(d_constants)
-    expected = layernorm_reference(rows=values, gamma=gamma, beta=beta)
-    error = float(np.linalg.norm(actual - expected) / np.linalg.norm(expected))
-    if error >= _SOFTMAX_ERROR_LIMIT:
-        message = (
-            f"Unable to verify LayerNorm against the host reference. The relative error must stay "
-            f"below {_SOFTMAX_ERROR_LIMIT:.0%}, but got {error:.3%}."
-        )
-        raise AssertionError(message)
-    return f"[{tokens},{_MODEL_WIDTH}] rows compiled, relative error {error:.2%}"
-
-
-def check_kv_cache(*, tokens: int = 64, model: int = _MODEL_WIDTH) -> str:
-    """Fills a KV cache from a prefill's fused projection and one decode step's, and reads it back.
-
-    Returns:
-        The detail the report line carries.
-
-    Raises:
-        AssertionError: If the cache holds other than each token's keys and values, exactly.
-    """
-    rng = np.random.default_rng(31)
-    h_prefill = _on_bf16_grid(values=rng.standard_normal((tokens, 3 * model)).astype(np.float32))
-    h_step = _on_bf16_grid(values=rng.standard_normal((_BLOCK_TOKENS, 3 * model)).astype(np.float32))
-    d_prefill, d_step = upload_activations(h_prefill), upload_activations(h_step)
-    cache = KVCache(capacity=tokens + _BLOCK_TOKENS, model=model)
-    try:
-        cache.extend(d_prefill)
-        cache.append(d_step)
-        held = download_activations(cache.tensor)[:cache.length]
-    finally:
-        cache.free()
-        d_prefill.free()
-        d_step.free()
-    expected = np.concatenate([h_prefill[:, model:], h_step[:1, model:]], axis=0)
-    assert np.array_equal(held, expected), (
-        f"the cache differs from the tokens' keys and values by up to {np.abs(held - expected).max():.3e}")
-    return f"{tokens} prefill tokens and one decode token, [{cache.length},{2 * model}] keys and values, exact"
-
-
-def check_gpt2_prefill() -> str:
-    """Runs a prompt through GPT-2 small's twelve layers and holds each layer to the host reference.
-
-    Notes:
-        Each layer is compared against the reference run on that layer's own device input, so one layer's error is
-        measured alone rather than compounded over the layers before it.
-
-    Returns:
-        The detail the report line carries.
-
-    Raises:
-        AssertionError: If a layer exceeds the error bound, or a cache records other than the prompt's length.
-    """
-    layers, shared = load_gpt2_weights()
-    tokens = len(_PROMPT)
-    errors: list[float] = []
-
-    def compare(index: int, layer_input: NDArray[np.float32], layer_output: NDArray[np.float32]) -> None:
-        """Measures one layer's real rows against the reference run on the same input."""
-        expected = transformer_block_reference(hidden=layer_input, weights=layers[index])[:tokens]
-        errors.append(float(np.linalg.norm(layer_output[:tokens] - expected) / np.linalg.norm(expected)))
-
-    started = time.time()
-    _, caches = prefill(np.asarray(_PROMPT), layers, shared, observe=compare)
-    elapsed = time.time() - started
-    lengths = {cache.length for cache in caches}
-    for cache in caches:
-        cache.free()
-    worst = int(np.argmax(errors))
-    assert lengths == {tokens}, f"the caches recorded lengths {sorted(lengths)} for a {tokens}-token prompt"
-    assert errors[worst] < _BLOCK_ERROR_LIMIT, (
-        f"layer {worst} differs from the host reference by {errors[worst]:.2%}, past {_BLOCK_ERROR_LIMIT:.0%}")
-    return (f"{tokens} prompt tokens, {len(layers)} layers in {elapsed:.1f} s, worst layer {worst} at "
-            f"{errors[worst]:.2%} relative error, caches holding {tokens} tokens each")
-
-
-def check_gpt2_decode() -> str:
-    """Prefills a prompt, decodes the next token through every layer, and holds both to the host reference.
-
-    Notes:
-        Each decode layer is compared against the reference run over the prompt's and the new token's device inputs
-        to that layer, so its error is measured alone. The two greedy tokens are held to the reference's own.
-
-    Returns:
-        The detail the report line carries.
-
-    Raises:
-        AssertionError: If a decode layer exceeds the error bound, a cache records the wrong length, or a greedy
-            token differs from the reference's.
-    """
-    layers, shared = load_gpt2_weights()
-    tokens = len(_PROMPT)
-    prompt_inputs: dict[int, NDArray[np.float32]] = {}
-    errors: list[float] = []
-
-    def remember(index: int, layer_input: NDArray[np.float32], _: NDArray[np.float32]) -> None:
-        """Keeps each layer's input for the prompt's real tokens."""
-        prompt_inputs[index] = layer_input[:tokens]
-
-    def compare(index: int, layer_input: NDArray[np.float32], layer_output: NDArray[np.float32]) -> None:
-        """Measures one decode layer against the reference over the prompt and the new token."""
-        rows = np.concatenate([prompt_inputs[index], layer_input[None, :]], axis=0)
-        expected = transformer_block_reference(hidden=rows, weights=layers[index])[-1]
-        errors.append(float(np.linalg.norm(layer_output - expected) / np.linalg.norm(expected)))
-
-    hidden, caches = prefill(np.asarray(_PROMPT), layers, shared, observe=remember)
-    try:
-        first = int(np.argmax(next_token_logits(hidden[-1], shared)))
-        started = time.time()
-        second = int(np.argmax(next_token_logits(decode_step(first, layers, shared, caches, observe=compare),
-                                                 shared)))
-        elapsed = time.time() - started
-        lengths = {cache.length for cache in caches}
-    finally:
-        for cache in caches:
-            cache.free()
-
-    # Runs the same greedy steps through the reference alone, the prompt then the prompt and the first token.
-    reference = []
-    for sequence in (_PROMPT, (*_PROMPT, first)):
-        rows = embed(np.asarray(sequence), shared)
-        for weights in layers:
-            rows = transformer_block_reference(hidden=rows, weights=weights)
-        reference.append(int(np.argmax(next_token_logits(rows[-1], shared))))
-
-    worst = int(np.argmax(errors))
-    assert lengths == {tokens + 1}, f"the caches recorded lengths {sorted(lengths)} after one decode step"
-    assert errors[worst] < _BLOCK_ERROR_LIMIT, (
-        f"decode layer {worst} differs from the host reference by {errors[worst]:.2%}, past {_BLOCK_ERROR_LIMIT:.0%}")
-    assert [first, second] == reference, f"greedy tokens {[first, second]} differ from the reference's {reference}"
-    return (f"greedy tokens {[first, second]} match the reference, one decode step through {len(layers)} layers in "
-            f"{elapsed:.1f} s, worst layer {worst} at {errors[worst]:.2%} relative error")
-
-
-def check_transformer_block(*, tokens: int = 64) -> str:
-    """Runs one GPT-2 transformer block on the device and verifies it against the host reference.
-
-    Notes:
-        The whole block runs resident on the device: two LayerNorms, all four projections, every bias and
-        residual add, and twelve causal attention heads.
-
-    Args:
-        tokens: Sequence length, which the softmax fixes at one VREG's width.
-
-    Returns:
-        The detail the report line carries.
-
-    Raises:
-        AssertionError: If the relative error exceeds what a block's chained BF16 steps explain.
-    """
-    rng = np.random.default_rng(1)
-    hidden = _on_bf16_grid(values=(rng.standard_normal((tokens, _MODEL_WIDTH)) * 0.5).astype(np.float32))
-    weights = _block_weights(model=_MODEL_WIDTH, seed=2)
-
-    started = time.perf_counter()
-    actual = transformer_block(hidden=hidden, weights=weights)
-    elapsed = time.perf_counter() - started
-    expected = transformer_block_reference(hidden=hidden, weights=weights)
-    error = float(np.linalg.norm(actual - expected) / np.linalg.norm(expected))
-    if error >= _BLOCK_ERROR_LIMIT:
-        message = (
-            f"Unable to verify one transformer block against the host reference. The relative error "
-            f"must stay below {_BLOCK_ERROR_LIMIT:.0%}, which is what two LayerNorms, thirteen "
-            f"products and twelve softmaxes contribute in BF16, but got {error:.3%}."
-        )
-        raise AssertionError(message)
-    return (f"[{tokens},{_MODEL_WIDTH}] block, 12 heads, in {elapsed:.1f} s, "
-            f"relative error {error:.2%}")
 
 
 def _compiled_gemm(*, depth: int, columns: int, activate: bool) -> bytes:
@@ -1639,6 +1163,13 @@ def _run_layer(hidden: NDArray[np.float32], weights: dict, *, heads: int,
             minitpuFree(address)
 
 
+def _launch(image: int, size: int, *, args: list[int]) -> None:
+    """Launches one staged image and waits for the NPU to retire it, adding that time to the NPU clock."""
+    started = time.perf_counter()
+    minitpuLaunchKernel(image, size, args=args)
+    _NPU_CLOCK[0] += time.perf_counter() - started
+
+
 def _manifest() -> dict:
     """Returns the manifest describing every compiled image, keyed by file name."""
     return json.loads((_IMAGE_DIRECTORY / "manifest.json").read_text())
@@ -1647,9 +1178,9 @@ def _manifest() -> dict:
 def _launch_copy(*, rows: int, stride: int, source: int, destination: int) -> None:
     """Copies rows spaced `stride` bytes apart from one DMEM address to another through the compiled copy image."""
     image_bytes, _ = _compiled_image(kind="copy", rows=rows, stride=stride)
-    minitpuSetDevice(_UIO_NAME)
+    minitpuSetDevice(UIO_NAME)
     d_image = _stage_image(image_bytes)
-    minitpuLaunchKernel(d_image, len(image_bytes), args=[source, 0, destination])
+    _launch(d_image, len(image_bytes), args=[source, 0, destination])
 
 
 def _decode_constants(entry: dict, *, length: int) -> int:
@@ -1726,7 +1257,7 @@ def _allocate_tensor(tokens: int, features: int) -> DeviceTensor:
 
     # Allocating and zeroing both need a bound device, and a caller may reach this
     # before any launch has bound one.
-    minitpuSetDevice(_UIO_NAME)
+    minitpuSetDevice(UIO_NAME)
     tensor = DeviceTensor(base=0, tokens=tokens, features=features)
     tensor.base = minitpuMalloc(tensor.nbytes)
     host = minitpuHostAlloc(_ZERO_TILE_BYTES)
@@ -1736,50 +1267,27 @@ def _allocate_tensor(tokens: int, features: int) -> DeviceTensor:
     return tensor
 
 
-def _block_weights(model: int, seed: int) -> dict:
-    """Builds one block's parameters at GPT-2 initialisation scales, on the BF16 grid."""
-    rng = np.random.default_rng(seed)
-    hidden = 4 * model
-
-    def normal(shape: tuple, scale: float) -> NDArray[np.float32]:
-        return _on_bf16_grid(values=(rng.standard_normal(shape) * scale).astype(np.float32))
-
-    return {
-        "ln_1.g": _on_bf16_grid(values=np.ones(model, dtype=np.float32)),
-        "ln_1.b": normal((model,), 0.02),
-        "attn.qkv.w": normal((model, 3 * model), 0.02),
-        "attn.qkv.b": normal((3 * model,), 0.02),
-        "attn.proj.w": normal((model, model), 0.02),
-        "attn.proj.b": normal((model,), 0.02),
-        "ln_2.g": _on_bf16_grid(values=np.ones(model, dtype=np.float32)),
-        "ln_2.b": normal((model,), 0.02),
-        "mlp.fc.w": normal((model, hidden), 0.02),
-        "mlp.fc.b": normal((hidden,), 0.02),
-        "mlp.proj.w": normal((hidden, model), 0.02),
-        "mlp.proj.b": normal((model,), 0.02),
-    }
-
-
 def main() -> int:
-    """Runs the demo programs on the board and reports each result against a host model.
+    """Generates a prompt's continuation on the board and prints it.
 
     Returns:
-        Zero when every program matched its expected output, and one when any of them did not.
+        Zero once the continuation is printed.
     """
-    outcomes = [
-        run_check(name="Halt", check=check_halt),
-        run_check(name="COPY round trip", check=check_copy_argument),
-        run_check(name="Full GEMM", check=check_full_gemm),
-        run_check(name="Elementwise add on device", check=check_elementwise_add),
-        run_check(name="Decode attention, all heads", check=check_decode_attention),
-        run_check(name="LayerNorm", check=check_layernorm),
-        run_check(name="KV cache", check=check_kv_cache),
-        run_check(name="Transformer block", check=check_transformer_block),
-        run_check(name="GPT-2 prefill", check=check_gpt2_prefill),
-        run_check(name="GPT-2 decode", check=check_gpt2_decode),
-    ]
-    print(f"\n{sum(outcomes)} of {len(outcomes)} checks passed")
-    return 0 if all(outcomes) else 1
+    parser = argparse.ArgumentParser(description="Generates a prompt's continuation with GPT-2 small on the NPU.")
+    parser.add_argument("--prompt", default="The capital of France is", help="the text to continue")
+    parser.add_argument("--tokens", type=int, default=8, help="tokens to generate at most")
+    arguments = parser.parse_args()
+
+    tokenizer = Tokenizer()
+    layers, shared = load_gpt2_weights()
+    prompt = np.asarray(tokenizer.encode(arguments.prompt), dtype=np.int64)
+    started, launched = time.time(), npu_seconds()
+    generated = generate(prompt, layers, shared, new_tokens=arguments.tokens)
+    elapsed, on_npu = time.time() - started, npu_seconds() - launched
+    print(arguments.prompt + tokenizer.decode(generated))
+    print(f"[{len(prompt)} prompt tokens, {len(generated)} generated in {elapsed:.1f} s, "
+          f"{on_npu:.2f} s of it on the NPU]")
+    return 0
 
 
 if __name__ == "__main__":

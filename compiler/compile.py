@@ -7,10 +7,10 @@ from numpy.typing import NDArray
 
 from asm import IRAM_DEPTH, AsmKernel
 from bf16 import _BLOCK_DEPTH, _TILE
-from emit import (Staging, flash_attention_stream, fused_ffn_stream, looped_gemm_stream, pointwise_stream,
+from emit import (Staging, flash_attention_stream, looped_gemm_stream, pointwise_stream,
                   resident_attention_stream, row_stream, strided_copy_stream)
 
-from .ir import FlashLaunch, FusedLaunch, Launch, MatMul, PointwiseLaunch, ProgramError, RowLaunch
+from .ir import FlashLaunch, Launch, MatMul, PointwiseLaunch, ProgramError, RowLaunch
 
 
 def stage(left: NDArray[np.float32], right: NDArray[np.float32], *, matmul: MatMul,
@@ -39,7 +39,7 @@ def stage(left: NDArray[np.float32], right: NDArray[np.float32], *, matmul: MatM
     return staged[0], staged[1]
 
 
-def compile_launch(launch: Launch | FusedLaunch | FlashLaunch) -> tuple[bytes, Staging]:
+def compile_launch(launch: Launch | FlashLaunch) -> tuple[bytes, Staging]:
     """Returns the image one launch compiles to and what a host stages for it.
 
     Args:
@@ -70,12 +70,6 @@ def compile_launch(launch: Launch | FusedLaunch | FlashLaunch) -> tuple[bytes, S
         # cannot see, so a packed image would move a load ahead of the store it reads.
         return _assemble(name="flash_attention", bundles=bundles, placements=("",),
                          remedy="narrow the head the block accumulates"), staging
-
-    if isinstance(launch, FusedLaunch):
-        bundles, staging = fused_ffn_stream(chunks=launch.chunks, steps=launch.steps,
-                                            output_tiles=launch.output_tiles)
-        return _assemble(name="fused_ffn", bundles=bundles,
-                         remedy="narrow the output the layer covers"), staging
 
     counts = dict(column_tiles=launch.column_tiles, groups=launch.groups,
                   loop_blocks=launch.loop_blocks, activate=launch.activate,

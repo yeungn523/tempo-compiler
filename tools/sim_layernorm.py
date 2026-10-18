@@ -33,7 +33,7 @@ from bf16 import (  # noqa: E402
 )
 from build_gpt2_images import _compile_rows  # noqa: E402
 from compiler_tests.hand_images import layernorm_rows  # noqa: E402
-from gpt2_kernels import layernorm_reference  # noqa: E402
+from references import layernorm_reference  # noqa: E402
 from sim_gemm import _run_image  # noqa: E402
 
 _TOLERANCE: float = 0.01

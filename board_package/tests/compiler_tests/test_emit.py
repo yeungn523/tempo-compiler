@@ -21,8 +21,8 @@ sys.path.insert(0, str(_HERE / "minitpu_runtime"))
 import asm  # noqa: E402
 import bf16  # noqa: E402
 import emit  # noqa: E402
-import kernels  # noqa: E402
 import numpy as np  # noqa: E402
+from compiler_tests import hand_images  # noqa: E402
 from compiler_tests.test_layout import renaming_onto  # noqa: E402
 from layout import register_map  # noqa: E402
 
@@ -35,27 +35,8 @@ _F_LBEGIN: int = 1
 _F_LOOP_END: int = 2
 """F-slot opcode closing the innermost hardware loop."""
 
-
-class EmitterConformanceTest(unittest.TestCase):
-    """Holds the emitted GEMM to the hand-placed one."""
-
-    def setUp(self) -> None:
-        self.hand = tuple(
-            kernels.build_looped_gemm(bf16._STEP_TILES, bf16._TOKEN_GROUPS, activate=False).image.assemble())
-        self.derived, _ = emit.looped_gemm_stream(
-            column_tiles=bf16._STEP_TILES, groups=bf16._TOKEN_GROUPS, loop_blocks=bf16._LOOP_BLOCKS)
-
-    def test_placement_matches_the_hand_written_image(self) -> None:
-        """Asserts the emitter places its slots at the same offsets the hand-written kernel does."""
-        self.assertEqual(len(self.derived), len(self.hand))
-
-    def test_scheduling_reproduces_the_hand_written_image(self) -> None:
-        """Asserts the emitted stream assembles to the same words once the scheduler fills its delays.
-
-        The emitter places slots and leaves every delay field zero, so the scheduler deriving the same delays is what
-        says the placement carries the same dependence distances the hand-tuned one does.
-        """
-        self.assertIsNotNone(renaming_onto(tuple(asm.schedule(list(self.derived))), self.hand))
+_E_OPCODE_SHIFT: int = 15
+"""Bit the opcode starts at within an E-slot word, above its three five bit register fields."""
 
 
 class EmitterSerialisationTest(unittest.TestCase):
@@ -63,21 +44,24 @@ class EmitterSerialisationTest(unittest.TestCase):
 
     def test_the_emitted_stream_serialises_to_the_hand_written_image(self) -> None:
         """Asserts the emitted stream, wrapped in a kernel, writes the bytes the hand-written builder does."""
-        for fuse_groups in (False, True):
+        for activate in (False, True):
             for column_tiles in (1, 3, 6):
                 for groups in (1, 3):
-                    for loop_blocks in (2, 4):
-                        with self.subTest(fuse_groups=fuse_groups, column_tiles=column_tiles, groups=groups,
-                                          loop_blocks=loop_blocks):
-                            hand = kernels.build_looped_gemm(
-                                column_tiles, groups, activate=False, fuse_groups=fuse_groups,
-                                loop_blocks=loop_blocks).image.assemble(pad_to=4)
+                    for loop_blocks in (2, 4, 6):
+                        with self.subTest(activate=activate, column_tiles=column_tiles,
+                                          groups=groups, loop_blocks=loop_blocks):
+                            hand = hand_images.looped_gemm(column_tiles, groups, activate=activate,
+                                                           loop_blocks=loop_blocks)
                             derived = asm.AsmKernel(
                                 name="looped_gemm",
                                 bundles=emit.looped_gemm_stream(
                                     column_tiles=column_tiles, groups=groups, loop_blocks=loop_blocks,
-                                    fuse_groups=fuse_groups)[0]).assemble(pad_to=4)
+                                    activate=activate)[0]).assemble(pad_to=4)
                             self.assertIsNotNone(renaming_onto(derived, hand))
+                            # Holds the E-slot opcodes apart, which `renaming_onto` does not compare, so a step
+                            # dropping or misplacing its vgelu fails here.
+                            self.assertEqual(tuple(_e_opcode(word) for word in derived),
+                                             tuple(_e_opcode(word) for word in hand))
 
 
 class EmitterRegisterBudgetTest(unittest.TestCase):
@@ -115,8 +99,7 @@ class EmitterHandoverTest(unittest.TestCase):
         """
         for counts in (dict(column_tiles=3, groups=3, loop_blocks=2),
                        dict(column_tiles=4, groups=3, loop_blocks=2, block_n=32),
-                       dict(column_tiles=3, groups=3, loop_blocks=2, block_m=16),
-                       dict(column_tiles=3, groups=3, loop_blocks=2, fuse_groups=True)):
+                       dict(column_tiles=3, groups=3, loop_blocks=2, block_m=16)):
             with self.subTest(**counts):
                 words, staging = emit.looped_gemm_stream(**counts)
                 stored = {_descriptor_rows(word) for word in words if _stores(word)}
@@ -146,11 +129,10 @@ class EmitterHandoverTest(unittest.TestCase):
         """
         for counts in (dict(column_tiles=3, groups=3, loop_blocks=2),
                        dict(column_tiles=4, groups=3, loop_blocks=2, block_n=32),
-                       dict(column_tiles=3, groups=3, loop_blocks=2, block_m=16),
-                       dict(column_tiles=4, groups=3, loop_blocks=2, block_n=32, fuse_groups=True)):
+                       dict(column_tiles=3, groups=3, loop_blocks=2, block_m=16)):
             with self.subTest(**counts):
                 words, staging = emit.looped_gemm_stream(**counts)
-                # Pads a fused launch's vector, whose drain sits outside the group loop and carries the block alone.
+                # Pads each vector, the drain sitting outside the group loop and carrying the block alone.
                 issued = [(counters + (0,))[:2] for counters in _drain_sequence(words)]
                 self.assertEqual(issued, [(block, partial) for block in range(staging.blocks)
                                           for partial in range(staging.partials)])
@@ -330,67 +312,9 @@ def _scalar_addend(word: int) -> int:
     return immediate - 0x10000 if immediate & 0x8000 else immediate
 
 
-def _loop_opcode(word: int) -> tuple[int, int]:
-    """Returns the F-slot loop opcode one bundle carries and the trip count it names."""
-    field = (word >> asm._F_SHIFT) & ((1 << asm.F_SLOT_W) - 1)
-    return ((field >> (asm.F_SLOT_W - 3)) & 0x7 if field else 0), field & 0xFFFF
-
-
-def _chunk_body(words: tuple[int, ...], *, chunks: int) -> tuple[int, ...]:
-    """Returns the words the fused layer's chunk loop encloses, which is where its weight staging rides."""
-    depth, first = 0, None
-    for at, word in enumerate(words):
-        operation, trips = _loop_opcode(word)
-        if operation == _F_LBEGIN and (first is not None or trips == chunks):
-            depth += 1
-            first = at + 1 if first is None else first
-        elif operation == _F_LOOP_END and first is not None:
-            depth -= 1
-            if not depth:
-                return words[first:at]
-    return ()
-
-
-class FusedFeedForwardEmitterTest(unittest.TestCase):
-    """Holds the emitted fused layer to the staging its sweeps carry."""
-
-    def test_the_weight_staging_rides_the_sweeps(self) -> None:
-        """Asserts a sweep never opens with more descriptors outstanding than the slots carrying them."""
-        for steps, output_tiles in ((32, 32), (48, 48)):
-            with self.subTest(steps=steps, output_tiles=output_tiles):
-                words, _ = emit.fused_ffn_stream(chunks=2, steps=steps, output_tiles=output_tiles)
-                outstanding = 0
-                for word in _chunk_body(words, chunks=2):
-                    if _loads(word):
-                        outstanding += 1
-                        self.assertLessEqual(outstanding, asm.DMA_SLOT_COUNT)
-                    elif _loop_opcode(word)[0] == _F_LBEGIN:
-                        outstanding = 0
-
-    def test_the_chunk_stages_exactly_its_weights(self) -> None:
-        """Asserts a chunk's descriptors move its own two weight tiles and no more."""
-        for steps, output_tiles in ((32, 32), (48, 48)):
-            with self.subTest(steps=steps, output_tiles=output_tiles):
-                words, _ = emit.fused_ffn_stream(chunks=2, steps=steps, output_tiles=output_tiles)
-                moved = sum(_descriptor_rows(word) for word in _chunk_body(words, chunks=2)
-                            if _loads(word))
-                self.assertEqual(moved, (steps + output_tiles) * bf16._TILE)
-
-    def test_the_splits_cover_every_tile_of_a_sweep(self) -> None:
-        """Asserts splitting a sweep for its issue points leaves its trip count whole."""
-        for steps, output_tiles in ((32, 32), (48, 48)):
-            with self.subTest(steps=steps, output_tiles=output_tiles):
-                words, _ = emit.fused_ffn_stream(chunks=2, steps=steps, output_tiles=output_tiles)
-                trips = [named for word in _chunk_body(words, chunks=2)
-                         for opcode, named in (_loop_opcode(word),) if opcode == _F_LBEGIN]
-                self.assertEqual(sum(trips), steps + output_tiles)
-
-    def test_the_emitted_layer_states_the_block_it_drains(self) -> None:
-        """Asserts the staging names the token block and the width the layer's output covers."""
-        _, staging = emit.fused_ffn_stream(chunks=2, steps=2, output_tiles=4)
-        self.assertEqual((staging.rows, staging.columns), (bf16._BLOCK_TOKENS, 4 * bf16._TILE))
-        self.assertEqual(staging.drain_rows, bf16._BLOCK_TOKENS * 4)
-
+def _e_opcode(word: int) -> int:
+    """Returns the E-slot opcode one bundle carries, or zero for an empty slot."""
+    return ((word >> asm._E_SHIFT) & ((1 << asm.E_SLOT_W) - 1)) >> _E_OPCODE_SHIFT
 
 
 class StepBodyTest(unittest.TestCase):

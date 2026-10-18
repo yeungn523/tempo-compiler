@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Provision UIO + udmabuf for the MINITPU on ZCU104.  Runs ON the board, as root.
+# Provision UIO + udmabuf for the NPU on ZCU104.  Runs ON the board, as root.
 #
 # After `make minitpu` programs the PL, this script:
 #   1. Compiles and applies the device-tree overlay (minitpu_0 → generic-uio)
@@ -133,7 +133,7 @@ else
     exit 1
 fi
 
-# `make minitpu` needs root to configure the FPGA, but normal tutorial programs
+# `make minitpu` needs root to configure the FPGA, but the programs that launch
 # should not need root merely to mmap their two device nodes. Give the user who
 # invoked sudo access to this boot's selected nodes; device-node ownership is
 # reset at reboot, so this does not create a persistent system-wide policy.

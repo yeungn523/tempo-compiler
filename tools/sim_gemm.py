@@ -2,7 +2,7 @@
 """Provides the RTL check that a GEMM image computes the product it claims.
 
 The image comes either from the dimensions named on the command line, which emits one directly, or from the
-artifacts `kernel_entry_point.py` wrote for a Triton kernel, which is the path a board launches. Both end in the
+artifacts `kernel_entry_point.py` wrote for a Triton kernel, which is the path a compiled kernel takes. Both end in the
 same testbench, so a kernel is checked here before it reaches hardware.
 """
 
@@ -36,7 +36,7 @@ _TOLERANCE: float = 0.02
 """Relative error the BF16 accumulate chain is allowed, which the board check also holds to."""
 
 _DEFAULT_RTL: pathlib.Path = _HERE.parent.parent / "minitpu-tmp"
-"""Checkout `MINITPU_RTL` falls back to, being a sibling of this repository."""
+"""Checkout `minitpu_rtl` falls back to, being a sibling of this repository."""
 
 _PASS_MARKER: str = "=== TB_KERNEL_IMAGE PASS ==="
 """Line the testbench prints once every round has halted."""
@@ -61,7 +61,7 @@ def simulate(*, launch: Launch, reduction: int, build_dir: str | None = None,
         RuntimeError: If the testbench does not report every round halted.
     """
     counts = dict(column_tiles=launch.column_tiles, groups=launch.groups, loop_blocks=launch.loop_blocks,
-                  fuse_groups=launch.fuse_groups, block_m=launch.block_m, block_n=launch.block_n)
+                  block_m=launch.block_m, block_n=launch.block_n)
     # Takes every shape from the emitter, which settled them placing the bundles, so this states none of its own.
     bundles, staging = emit.looped_gemm_stream(**counts)
     image = asm.AsmKernel(name="looped_gemm", bundles=bundles).to_bytes(pad_to=4)
@@ -140,7 +140,7 @@ def _issued(*, order: str, tokens: int, columns: int) -> list[tuple[int, int]]:
 
 
 def _run_image(*, image: bytes, activations: bytes, weights: bytes, drain_bytes: int,
-               build_dir: str | None, max_cycles: int | None, what: str) -> bytes:
+               build_dir: str | None, max_cycles: int | None, what: str, drain: bytes | None = None) -> bytes:
     """Runs one image against the RTL with the operands a launch reads, returning the bytes it drained.
 
     Args:
@@ -152,6 +152,7 @@ def _run_image(*, image: bytes, activations: bytes, weights: bytes, drain_bytes:
         max_cycles: Cycles one round may take before the testbench reports it timed out, or None for the bound the
             testbench carries.
         what: The product being run, for the message a failed round carries.
+        drain: What the drain buffer holds before the launch, or None for zeros.
 
     Returns:
         The drained bytes.
@@ -164,7 +165,7 @@ def _run_image(*, image: bytes, activations: bytes, weights: bytes, drain_bytes:
         (stage / "kernel.bin").write_bytes(image)
         (stage / "arg0.bin").write_bytes(activations)
         (stage / "arg1.bin").write_bytes(weights)
-        (stage / "arg2.bin").write_bytes(bytes(drain_bytes))
+        (stage / "arg2.bin").write_bytes(bytes(drain_bytes) if drain is None else drain)
 
         environment = dict(os.environ)
         if build_dir is not None:
@@ -196,10 +197,10 @@ def _rtl_root() -> pathlib.Path:
     Raises:
         FileNotFoundError: If the checkout does not carry `tb/run_kernel_image.sh`.
     """
-    root = pathlib.Path(os.environ.get("MINITPU_RTL", _DEFAULT_RTL)).expanduser()
+    root = pathlib.Path(os.environ.get("minitpu_rtl", _DEFAULT_RTL)).expanduser()
     if not (root / "tb" / "run_kernel_image.sh").is_file():
         message = (
-            f"Unable to find the RTL under {root}. This repository does not vendor it, so set MINITPU_RTL to a "
+            f"Unable to find the RTL under {root}. This repository does not vendor it, so set minitpu_rtl to a "
             f"checkout carrying tb/run_kernel_image.sh."
         )
         raise FileNotFoundError(message)
@@ -221,7 +222,6 @@ def main() -> int:
     parser.add_argument("--rows", type=int, default=_BLOCK_TOKENS, help="token rows, being one block")
     parser.add_argument("--depth", type=int, default=192, help="the contraction, a multiple of the group depth")
     parser.add_argument("--columns", type=int, default=48, help="output columns, a multiple of the tile")
-    parser.add_argument("--fuse-groups", action="store_true", help="accumulate the groups on the device")
     parser.add_argument("--loop-blocks", type=int, default=2, help="blocks one group carries")
     parser.add_argument("--block-m", type=int, default=_BLOCK_TOKENS, help="token rows one block covers")
     parser.add_argument("--block-n", type=int, default=_TILE, help="output columns one block covers")
@@ -247,12 +247,11 @@ def main() -> int:
         # States the launch, since these dimensions came from a person rather than from a plan.
         launch = Launch(row_blocks=arguments.rows // arguments.block_m, column_tiles=arguments.columns // _TILE,
                         groups=arguments.depth // (arguments.loop_blocks * _BLOCK_DEPTH),
-                        loop_blocks=arguments.loop_blocks, activate=False, fuse_groups=arguments.fuse_groups,
+                        loop_blocks=arguments.loop_blocks, activate=False,
                         block_m=arguments.block_m, block_n=arguments.block_n)
         error = simulate(launch=launch, reduction=arguments.depth, build_dir=arguments.build_dir,
                          max_cycles=arguments.max_cycles)
-        what = (f"{arguments.rows}x{arguments.depth} @ {arguments.depth}x{arguments.columns} "
-                f"fuse_groups={arguments.fuse_groups}")
+        what = f"{arguments.rows}x{arguments.depth} @ {arguments.depth}x{arguments.columns}"
 
     verdict = "PASS" if error <= _TOLERANCE else "FAIL"
     print(f"{what}  {verdict}  relative error {error * 100:.4f}%")

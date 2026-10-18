@@ -16,7 +16,7 @@
 #
 # ALWAYS reprogram after changing it.  The fabric is not designed to survive a
 # clock change underneath itself; programming holds it in reset and starts it
-# cleanly on the new clock.  Then re-run `python3 gpt2_kernels.py` -- 16/16 at
+# cleanly on the new clock.  Then re-run `python3 board_checks.py` -- 16/16 at
 # 187 MHz with accuracy identical to 100 MHz is the evidence this is safe, and it
 # is evidence for THIS bitstream only.
 set -euo pipefail
@@ -70,4 +70,4 @@ devmem "$PL0_REF_CTRL" 32 "$updated"
 echo "written: $(devmem "$PL0_REF_CTRL" 32)"
 echo
 echo "NOW REPROGRAM:  sudo make -C board_package minitpu"
-echo "THEN VERIFY:    python3 board_package/gpt2_kernels.py"
+echo "then verify:    python3 board_package/board_checks.py"

@@ -24,7 +24,7 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE / "minitpu_runtime"))
 
-from gpt2_kernels import _BLOCK_DEPTH, _on_bf16_grid, assert_operands_discriminating  # noqa: E402
+from bf16 import _BLOCK_DEPTH, _on_bf16_grid, assert_operands_discriminating  # noqa: E402
 
 _TOKENS: int = 32
 """The number of token rows in the test activations."""
@@ -76,11 +76,6 @@ class OperandDiscriminationTest(unittest.TestCase):
         """
         activations, weights = _varying_operands(depth=2 * _BLOCK_DEPTH)
         assert_operands_discriminating(activations=activations, weights=weights)
-
-    def test_a_whole_number_of_blocks_is_assumed(self) -> None:
-        """Verifies that the test depth divides evenly into contraction blocks."""
-        self.assertEqual(_DEPTH % _BLOCK_DEPTH, 0)
-
 
 def _varying_operands(depth: int = _DEPTH) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
     """Returns an activation and weight pair that varies along every axis the guard inspects.

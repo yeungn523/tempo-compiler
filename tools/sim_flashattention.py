@@ -88,12 +88,14 @@ def simulate(*, key_blocks: int = 2, row_blocks: int = 1, head: int = _VREG_ELEM
     Raises:
         RuntimeError: If the testbench does not report the round halted.
     """
-    placed = _placed(kernel_name=kernel_name, head=head)
-    image, _ = compile_launch(dataclasses.replace(placed, key_blocks=key_blocks, row_blocks=row_blocks))
+    placed = dataclasses.replace(_placed(kernel_name=kernel_name, head=head), key_blocks=key_blocks,
+                                 row_blocks=row_blocks)
+    image, _ = compile_launch(placed)
     query, key, value = _operands(key_blocks=key_blocks, row_blocks=row_blocks, head=head, seed=seed)
 
+    mask = placed.mask_scores
     staged, streamed = pack_attention(query, key, value, initial_maximum=placed.entering,
-                                      constants=placed.constants)
+                                      constants=placed.constants, masks=placed.mask_tiles)
 
     words = row_blocks * head * _NUM_LANES
     dump = _run_image(image=image,
@@ -107,10 +109,12 @@ def simulate(*, key_blocks: int = 2, row_blocks: int = 1, head: int = _VREG_ELEM
                                drained.reshape(row_blocks, head // _TILE, _TILE, _NUM_LANES)], axis=0)
 
     scores = scale * (query.astype(np.float64) @ key.astype(np.float64).T)
+    if mask is not None:
+        scores = scores + mask
     weights = np.exp(scores - scores.max(axis=1, keepdims=True))
     expected = (weights / weights.sum(axis=1, keepdims=True)) @ value.astype(np.float64)
     modelled = attention_bf16_reference((scale * query).astype(np.float32), key, value,
-                                        initial_maximum=placed.entering)
+                                        initial_maximum=placed.entering, mask=mask)
     bound = np.abs(expected).max()
     return (float(np.abs(attended - expected).max() / bound),
             float(np.abs(modelled - expected).max() / bound))
@@ -137,7 +141,7 @@ def _placed(*, kernel_name: str, head: int) -> FlashLaunch:
         row_blocks=1, key_blocks=1, queries=_TILE, head=head,
         body=attention_body(placement, trip=trip, steps=head // _TILE, tiles=registers.output_tiles),
         epilogue=attention_epilogue(trip, tiles=registers.output_tiles), constants=trip.constants,
-        entering=staged_maximum(0.0 if entering is None else entering))
+        entering=staged_maximum(0.0 if entering is None else entering), mask=trip.mask)
 
 
 def main() -> int:

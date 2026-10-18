@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .ir import MatMul, Operation, ProgramError
+from .ir import MatMul, Operation, ProgramError, ScoreMask
 
 CARRIED: str = "carried"
 """Role of a value the key loop hands from each trip to the next, which holds a dedicated register region."""
@@ -57,12 +57,16 @@ class Trip:
         after: The operations the loop's result passes through once the loop ends.
         values: Role of every value the trip names, keyed by identifier.
         carried: Identifier a region holds entering one trip and the one it holds leaving it, keyed by region.
+        mask: The predicate the trip selects its scores by, or None where it selects nothing.
+        masked: Identifier the mask add reads the predicate under, being the streamed value its tile loads into.
     """
 
     operations: tuple[Operation, ...]
     after: tuple[Operation, ...]
     values: dict[int, Value]
     carried: dict[str, tuple[int, int]]
+    mask: ScoreMask | None = None
+    masked: int | None = None
 
     @property
     def constants(self) -> tuple[float, ...]:
@@ -95,10 +99,12 @@ def attention_trip(matmuls: tuple[MatMul, ...], *, produces: int, consumes: int)
     running = {operation.position for operation in operations}
     after = tuple(one for one in attended.epilogue_chain if one.position not in running)
     regions = _carried_regions(attended=attended)
+    mask, masked = attended.mask if attended.mask is not None else (None, None)
     return Trip(operations=operations, after=after,
                 values=_values(operations, attended=attended, regions=regions,
                                numbers=dict(attended.constants)),
-                carried={regions[one.position]: (one.inside, one.leaving) for one in attended.carried})
+                carried={regions[one.position]: (one.inside, one.leaving) for one in attended.carried},
+                mask=mask, masked=masked)
 
 
 def _trip_operations(*, scores: MatMul, attended: MatMul) -> tuple[Operation, ...]:

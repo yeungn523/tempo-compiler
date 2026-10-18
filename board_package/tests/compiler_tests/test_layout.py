@@ -156,10 +156,6 @@ class FlashRegisterMapTest(unittest.TestCase):
         self.assertGreater(mapped.spilled, 0)
         self.assertIsNotNone(mapped.scratch)
 
-    def test_key_block_width_does_not_enter_the_budget(self) -> None:
-        """Verifies that the map depends on the queries and the head alone, the scores staging in VMEM."""
-        self.assertEqual(flash_register_map(queries=16, head=64), flash_register_map(queries=16, head=64))
-
     def test_wider_query_block_is_refused(self) -> None:
         """Verifies that a query block whose own staging overruns the file is refused."""
         with self.assertRaises(LayoutError):

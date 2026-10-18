@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compiles one Triton kernel into the image and packed operands a board launches it from."""
+"""Compiles one Triton kernel into the image and packed operands tools/sim_gemm.py runs it from."""
 
 from __future__ import annotations
 
@@ -19,17 +19,12 @@ sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE / "board_package"))
 
 from compiler import ProgramError, compile_launch, plan, read_program, signature_of, stage  # noqa: E402
-from compiler.ir import FlashLaunch, FusedLaunch  # noqa: E402
+from compiler.ir import FlashLaunch  # noqa: E402
 from asm import BUNDLE_BYTES, IRAM_DEPTH  # noqa: E402
 from bf16 import (  # noqa: E402
-    _BLOCK_TOKENS,
     _BLOCK_WEIGHT_BYTES,
     _ELEMENT_BYTES,
-    _TILE,
-    fused_ffn_bf16_reference,
-    fused_ffn_reference,
     pack_activations,
-    pack_fused_ffn,
     pack_weights,
 )
 from triton.runtime import JITFunction  # noqa: E402
@@ -123,45 +118,6 @@ def _pack_operands(*, path: pathlib.Path, left: NDArray[np.float32], right: NDAr
     )
 
 
-def _pack_fused_operands(*, path: pathlib.Path, activations: NDArray[np.float32],
-                         up_weight: NDArray[np.float32], down_weight: NDArray[np.float32],
-                         drain) -> None:
-    """Writes the fused layer's packed operands and every size a board allocates and reshapes from.
-
-    The layer reads three operands rather than a pair, and both projections ride one staging so that the two
-    walk on one scalar register.
-
-    Args:
-        path: The npz file to write.
-        activations: The layer input, whose rows are tokens.
-        up_weight: The up projection, contracted against the input's columns.
-        down_weight: The down projection, contracted against the hidden width.
-        drain: The drain the plan states.
-    """
-    # One staged buffer per token block, the weights being the same for every one of them.
-    blocks = [pack_fused_ffn(activations[token:token + _BLOCK_TOKENS], up_weight, down_weight)
-              for token in range(0, activations.shape[0], _BLOCK_TOKENS)]
-    staged, weights = np.stack([block[0] for block in blocks]), blocks[0][1]
-    expected = fused_ffn_reference(activations, up_weight, down_weight).astype(np.float32)
-    modelled = fused_ffn_bf16_reference(activations, up_weight, down_weight)
-    np.savez(
-        path,
-        activations=staged,
-        weights=weights,
-        expected=expected,
-        # The bar a launch is held to, since BF16 over a contraction this deep costs more than the tolerance a
-        # single product is allowed and the board is too slow a core to derive it there.
-        format_cost=float(np.abs(modelled - expected).max() / max(float(np.abs(expected).max()), 1e-9)),
-        activation_bytes=staged[0].nbytes,
-        weight_bytes=weights.nbytes,
-        drain_words=drain.words,
-        drain_bytes=drain.words * _ELEMENT_BYTES,
-        zero_tile_words=drain.zero_tile_words,
-        drain_shape=drain.shape,
-        output_columns=down_weight.shape[1],
-    )
-
-
 def _load_module(path: pathlib.Path) -> ModuleType:
     """Returns the module one Python file holds, executed under the file's own name.
 
@@ -234,25 +190,6 @@ def _integer_bindings(argument: str, *, flag: str) -> dict[str, int]:
     return bindings
 
 
-def _matmuls_covered(matmuls, launches) -> list[tuple[int, ...]]:
-    """Returns the matmuls each launch runs, which is a pair for one image running both projections of a layer.
-
-    Args:
-        matmuls: The matmuls the kernel states, in program order.
-        launches: The launches the plan made of them.
-
-    Returns:
-        One tuple of matmul positions per launch, in the order the host issues them.
-    """
-    fused = {position: (launch.produces, launch.consumes)
-             for position, launch in enumerate(launches) if isinstance(launch, FusedLaunch)}
-    paired = {position for pair in fused.values() for position in pair}
-    # The planner appends a plain launch per matmul it did not fuse, in program order, and rewrites the
-    # producer's slot for a pair, so the ones left over fill the remaining slots in that same order.
-    alone = [position for position in range(len(matmuls)) if position not in paired]
-    return [fused[position] if position in fused else (alone.pop(0),) for position in range(len(launches))]
-
-
 def main() -> int:
     """Compiles the kernel one call names and prints the matmuls read from it and the launches planned for them.
 
@@ -275,25 +212,8 @@ def main() -> int:
                         help="npy file holding the left operand, which is packed beside the image it feeds")
     parser.add_argument("--weights", default=None,
                         help="npy file holding the right operand, named together with --activations")
-    parser.add_argument("--up-weight", default=None,
-                        help="npy file holding a fused layer's up projection, named with --down-weight")
-    parser.add_argument("--down-weight", default=None,
-                        help="npy file holding a fused layer's down projection, named with --up-weight")
     arguments = parser.parse_args()
-    if (arguments.up_weight is None) != (arguments.down_weight is None):
-        message = (
-            "Unable to pack one projection alone. A fused layer contracts its input against the up projection "
-            "and that product against the down projection, so name both or neither."
-        )
-        raise ProgramError(message)
-    if arguments.weights is not None and arguments.up_weight is not None:
-        message = (
-            "Unable to read a weight operand two ways. --weights names the pair a plain product reads, and "
-            "--up-weight with --down-weight the three a fused layer reads, so name one form or the other."
-        )
-        raise ProgramError(message)
-    if (arguments.activations is not None) != (arguments.weights is not None
-                                              or arguments.up_weight is not None):
+    if (arguments.activations is not None) != (arguments.weights is not None):
         message = (
             "Unable to pack one operand alone. The operands are padded to the extent one launch covers and "
             "packed against each other, so name the activations and their weights together or neither."
@@ -332,31 +252,21 @@ def main() -> int:
     if attention:
         message = (
             f"Unable to pack launch {attention[0]}, which is an attention block. Its queries, keys and values are "
-            f"packed a query block at a time and its drain carries no clearing tile, so compile it through "
-            f"flash_entry_point.py."
+            f"packed a query block at a time and its drain carries no clearing tile, so check it through "
+            f"tools/sim_flashattention.py."
         )
         raise ProgramError(message)
 
-    covered = _matmuls_covered(matmuls, planned.launches)
-    for index, launch in enumerate(planned.launches):
-        for position in covered[index]:
-            matmul = matmuls[position]
-            print(f"matmul {position}  {matmul.rows}x{matmul.columns} tile over {matmul.depth}, reduction "
-                  f"{matmul.reduction}, accumulator {matmul.accumulator}")
+    for index, (matmul, launch) in enumerate(zip(matmuls, planned.launches, strict=True)):
+        print(f"matmul {index}  {matmul.rows}x{matmul.columns} tile over {matmul.depth}, reduction "
+              f"{matmul.reduction}, accumulator {matmul.accumulator}")
         issued = f"{launch.launches} launches" if launch.launches > 1 else "one launch"
-        if isinstance(launch, FusedLaunch):
-            print(f"fused  {index}  matmuls {launch.produces} and {launch.consumes} in one image, issued over "
-                  f"{issued} of {_BLOCK_TOKENS} by {launch.output_tiles * _TILE}")
-            print(f"launch {index}  row_blocks={launch.row_blocks} chunks={launch.chunks} "
-                  f"steps={launch.steps} output_tiles={launch.output_tiles}")
-        else:
-            # The block covers whatever the nest keeps live inside its reduction, so every order that plans is
-            # the order the launches walk.
-            print(f"nest   {index}  kernel walks {', '.join(launch.nest)}, issued as written over "
-                  f"{issued} of {launch.block_m} by {launch.block_n}")
-            print(f"launch {index}  row_blocks={launch.row_blocks} column_tiles={launch.column_tiles} "
-                  f"groups={launch.groups} loop_blocks={launch.loop_blocks} activate={launch.activate} "
-                  f"fuse_groups={launch.fuse_groups}")
+        # The block covers whatever the nest keeps live inside its reduction, so every order that plans is the
+        # order the launches walk.
+        print(f"nest   {index}  kernel walks {', '.join(launch.nest)}, issued as written over "
+              f"{issued} of {launch.block_m} by {launch.block_n}")
+        print(f"launch {index}  row_blocks={launch.row_blocks} column_tiles={launch.column_tiles} "
+              f"groups={launch.groups} loop_blocks={launch.loop_blocks} activate={launch.activate}")
         try:
             image, staging = compile_launch(launch)
         except NotImplementedError as error:
@@ -372,21 +282,8 @@ def main() -> int:
             print(f"wrote  {index}  {target}")
         if written is not None and arguments.activations is not None:
             packed = written / f"matmul_{index}_operands.npz"
-            if isinstance(launch, FusedLaunch):
-                if arguments.up_weight is None:
-                    message = (
-                        f"Unable to pack the operands of launch {index}, which runs both projections of a "
-                        f"feed-forward layer and so reads three of them rather than a pair. Name them with "
-                        f"--up-weight and --down-weight, or omit --activations to compile the image alone."
-                    )
-                    raise ProgramError(message)
-                _pack_fused_operands(path=packed, activations=np.load(arguments.activations),
-                                     up_weight=np.load(arguments.up_weight),
-                                     down_weight=np.load(arguments.down_weight), drain=drain)
-            else:
-                _pack_operands(path=packed, left=np.load(arguments.activations),
-                               right=np.load(arguments.weights),
-                               matmul=matmuls[covered[index][0]], launch=launch, staging=staging, drain=drain)
+            _pack_operands(path=packed, left=np.load(arguments.activations), right=np.load(arguments.weights),
+                           matmul=matmul, launch=launch, staging=staging, drain=drain)
             print(f"packed {index}  {packed}")
     for padded in planned.padding:
         print(f"padding   matmul {padded.matmul} covers {padded.extent} of {padded.axis} by {padded.padded}")

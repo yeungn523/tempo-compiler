@@ -21,15 +21,16 @@ sys.path.insert(0, str(_HERE / "board_package" / "minitpu_runtime"))
 import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
-import kernels  # noqa: E402
+import build_gpt2_images  # noqa: E402
 import sample_triton  # noqa: E402
-from bf16 import _BLOCK_DEPTH, _BLOCK_TOKENS, _TILE  # noqa: E402
+from bf16 import _BLOCK_DEPTH, _TILE  # noqa: E402
 from compiler import ProgramError, compile_launch, plan, read_program, signature_of  # noqa: E402
 from compiler.allocation import COMMIT, allocate  # noqa: E402
 import emit  # noqa: E402
 from compiler.dataflow import (CARRIED, CONSTANT, STREAMED, TRANSIENT, Trip,  # noqa: E402
                                Value, attention_trip)
-from compiler.ir import FlashLaunch, FusedLaunch, Operation  # noqa: E402
+from compiler.ir import FlashLaunch, Operation  # noqa: E402
+from compiler_tests import hand_images  # noqa: E402
 from compiler_tests.test_layout import renaming_onto  # noqa: E402
 from layout import flash_register_map, register_map  # noqa: E402
 
@@ -51,15 +52,9 @@ class SignatureTest(unittest.TestCase):
 
     def test_a_kernel_states_its_own_operands(self) -> None:
         """Asserts an annotated pointer is typed from the annotation, with nothing passed for it."""
-        for kernel, pointers in ((sample_triton.matmul_kernel, {
-                "activation_pointer": "*bf16", "weight_pointer": "*bf16", "output_pointer": "*fp32"}),
-                (sample_triton.fused_ffn_kernel, {
-                    "activation_pointer": "*bf16", "up_weight_pointer": "*bf16",
-                    "down_weight_pointer": "*bf16", "output_pointer": "*fp32"})):
-            with self.subTest(kernel=kernel.__name__):
-                signature = signature_of(kernel, operands={})
-                self.assertEqual({name: kind for name, kind in signature.items() if kind != "constexpr"},
-                                 pointers)
+        signature = signature_of(sample_triton.matmul_kernel, operands={})
+        self.assertEqual({name: kind for name, kind in signature.items() if kind != "constexpr"},
+                         {"activation_pointer": "*bf16", "weight_pointer": "*bf16", "output_pointer": "*fp32"})
 
     def test_an_argument_overrides_the_annotation(self) -> None:
         """Asserts a named operand wins over what the kernel annotated, which is what the flag is for."""
@@ -369,7 +364,6 @@ class PlannerTest(unittest.TestCase):
         self.assertEqual(launch.groups, 3)
         self.assertEqual(launch.loop_blocks, 2)
         self.assertFalse(launch.activate)
-        self.assertTrue(launch.fuse_groups)
         self.assertEqual(planned.issued_over_useful, 1.0)
         self.assertEqual(planned.padding, ())
         self.assertEqual(planned.repack, ())
@@ -395,7 +389,6 @@ class PlannerTest(unittest.TestCase):
         matmuls, planned = compile_ffn()
         self.assertEqual(matmuls[1].left_source, 0)
         self.assertEqual([launch.activate for launch in planned.launches], [False, True])
-        self.assertTrue(all(launch.fuse_groups for launch in planned.launches))
 
     def test_the_feed_forward_launches_meet_at_the_hidden_width(self) -> None:
         """Asserts the up projection's columns and the down projection's reduction cover the same width."""
@@ -411,26 +404,6 @@ class PlannerTest(unittest.TestCase):
             plan((matmuls[0], narrowed), strides=dict(stride_am=192, stride_ak=1, stride_uk=192, stride_un=1,
                                                       stride_dk=16, stride_dn=1, stride_cm=16, stride_cn=1),
                  dims=({"m": 32}, {"m": 32, "n": 16}))
-
-    def test_a_pair_one_image_holds_plans_as_one_launch(self) -> None:
-        """Asserts a kernel at the shape one image runs plans the pair as a single fused launch."""
-        launches = compile_fused().launches
-        self.assertEqual(len(launches), 1)
-        fused = launches[0]
-        self.assertIsInstance(fused, FusedLaunch)
-        self.assertEqual((fused.chunks, fused.steps, fused.produces, fused.consumes), (4, 8, 0, 1))
-
-    def test_a_fused_launch_compiles_to_an_image(self) -> None:
-        """Asserts the fused launch reaches an image and states the block that image drains."""
-        image, staging = compile_launch(compile_fused().launches[0])
-        self.assertGreater(len(image), 0)
-        self.assertEqual((staging.rows, staging.columns), (_BLOCK_TOKENS, _TILE))
-
-    def test_a_wider_hidden_chunk_plans_as_two_launches(self) -> None:
-        """Asserts a pair whose chunk the registers cannot hold keeps the two launches it needs."""
-        launches = compile_ffn()[1].launches
-        self.assertEqual(len(launches), 2)
-        self.assertFalse(any(isinstance(launch, FusedLaunch) for launch in launches))
 
     def test_a_single_matmul_is_the_same_plan_either_way(self) -> None:
         """Asserts the fusion flag leaves a kernel stating one matmul untouched, there being no pair to find."""
@@ -472,17 +445,6 @@ class PlannerTest(unittest.TestCase):
 class PipelineTest(unittest.TestCase):
     """Covers the whole path, holding the image a plan emits to the one the hand-written builder assembles."""
 
-    def test_the_planned_image_matches_the_hand_written_builder(self) -> None:
-        """Asserts a compiled kernel emits the bundle stream `build_looped_gemm` assembles for the same launch."""
-        _, planned = compile_one(gemm)
-        launch = planned.launches[0]
-        hand = kernels.build_looped_gemm(launch.column_tiles, launch.groups, activate=launch.activate,
-                                         fuse_groups=launch.fuse_groups,
-                                         loop_blocks=launch.loop_blocks).image.assemble(pad_to=4)
-        emitted, _ = compile_launch(launch)
-        derived = tuple(int.from_bytes(emitted[at:at + 16], "little") for at in range(0, len(emitted), 16))
-        self.assertIsNotNone(renaming_onto(derived, hand))
-
     def test_every_field_the_image_carries_reaches_it(self) -> None:
         """Asserts each launch field describing the image changes it, so none is dropped before the emitter.
 
@@ -494,7 +456,7 @@ class PipelineTest(unittest.TestCase):
         base = dataclasses.replace(compile_one(gemm)[1].launches[0], column_tiles=4)
         reference, _ = compile_launch(base)
         for field, value in (("column_tiles", 8), ("groups", 6), ("loop_blocks", 4),
-                             ("fuse_groups", False), ("block_m", 16), ("block_n", 32)):
+                             ("block_m", 16), ("block_n", 32)):
             with self.subTest(field=field):
                 altered, _ = compile_launch(dataclasses.replace(base, **{field: value}))
                 self.assertNotEqual(altered, reference)
@@ -536,12 +498,22 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual((launch.blocks, launch.partials, launch.output_tiles, launch.block_m, _TILE),
                          (staging.blocks, staging.partials, staging.output_tiles, staging.rows, _TILE))
 
-    def test_a_launch_that_activates_is_refused(self) -> None:
-        """Asserts a launch carrying an epilogue raises, since the emitter places the plain product only."""
+    def test_every_gpt2_image_matches_the_hand_written_builder(self) -> None:
+        """Asserts each GEMM a GPT-2 layer launches compiles to the stream the hand-written builder assembled."""
+        for depth, columns, activate in build_gpt2_images._SHAPES:
+            with self.subTest(depth=depth, columns=columns, activate=activate):
+                image, entry = build_gpt2_images._compile_gemm(depth=depth, columns=columns, activate=activate)
+                hand = hand_images.looped_gemm(entry["column_tiles"], entry["groups"], activate=activate,
+                                               loop_blocks=entry["loop_blocks"])
+                derived = tuple(int.from_bytes(image[at:at + 16], "little") for at in range(0, len(image), 16))
+                self.assertIsNotNone(renaming_onto(derived, hand))
+                self.assertEqual(entry["column_tiles"], columns // _TILE)
 
-        base = compile_one(gemm)[1].launches[0]
-        with self.assertRaises(NotImplementedError):
-            compile_launch(dataclasses.replace(base, activate=True))
+    def test_an_activated_wide_block_is_refused(self) -> None:
+        """Asserts an activating launch over more than one output tile raises, its staged tiles being rewritten."""
+        base = dataclasses.replace(compile_one(gemm_activated)[1].launches[0], column_tiles=4)
+        with self.assertRaises(ValueError):
+            compile_launch(dataclasses.replace(base, block_n=2 * _TILE))
 
     def test_a_wide_block_reaches_the_emitter(self) -> None:
         """Asserts the block a kernel names changes the image, rather than being dropped on the way to the emitter.
@@ -556,8 +528,8 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(launch.block_n, 32)
         # Serialised the same way the tool does, so padding cannot make the two differ on its own.
         narrow = asm.AsmKernel(name="looped_gemm", bundles=emit.looped_gemm_stream(
-            column_tiles=launch.column_tiles, groups=launch.groups, loop_blocks=launch.loop_blocks,
-            fuse_groups=launch.fuse_groups)[0]).to_bytes(pad_to=4)
+            column_tiles=launch.column_tiles, groups=launch.groups,
+            loop_blocks=launch.loop_blocks)[0]).to_bytes(pad_to=4)
         self.assertNotEqual(compile_launch(launch)[0], narrow)
 
     def test_a_wide_block_keeps_an_accumulator_set_per_tile(self) -> None:
@@ -568,8 +540,7 @@ class PipelineTest(unittest.TestCase):
 
         launch = compile_one(gemm_wide_columns, dims=({"m": 32},))[1].launches[0]
         words, _ = emit.looped_gemm_stream(column_tiles=launch.column_tiles, groups=launch.groups,
-                                           loop_blocks=launch.loop_blocks, fuse_groups=launch.fuse_groups,
-                                           block_n=launch.block_n)
+                                           loop_blocks=launch.loop_blocks, block_n=launch.block_n)
         touched: set[int] = set()
         for word in words:
             decoded = asm._decode(word)
@@ -844,43 +815,6 @@ def ffn_chunked(ap, up, dp, op, stride_am, stride_ak, stride_uk, stride_un, stri
         d = dp + (chunk + offs_h)[:, None] * stride_dk + offs_n[None, :] * stride_dn
         out += tl.dot(activated, tl.load(d))
     tl.store(op + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, out)
-
-
-@triton.jit
-def ffn_fused(ap, up, dp, op, stride_am, stride_ak, stride_uk, stride_un, stride_dk, stride_dn,
-              stride_cm, stride_cn,
-              M: tl.constexpr = 32, K: tl.constexpr = 128, H: tl.constexpr = 64, N: tl.constexpr = 16,
-              BLOCK_M: tl.constexpr = 32, BLOCK_K: tl.constexpr = 64, BLOCK_H: tl.constexpr = 16,
-              BLOCK_N: tl.constexpr = 16):
-    """Runs both projections at the shape one image holds, the hidden width walked one tile per chunk."""
-    offs_m, offs_k = tl.arange(0, BLOCK_M), tl.arange(0, BLOCK_K)
-    offs_h, offs_n = tl.arange(0, BLOCK_H), tl.arange(0, BLOCK_N)
-    out = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for chunk in range(0, H, BLOCK_H):
-        a = ap + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-        u = up + offs_k[:, None] * stride_uk + (chunk + offs_h)[None, :] * stride_un
-        hidden = tl.zeros((BLOCK_M, BLOCK_H), dtype=tl.float32)
-        for _ in range(0, K, BLOCK_K):
-            hidden += tl.dot(tl.load(a), tl.load(u))
-            a += BLOCK_K * stride_ak
-            u += BLOCK_K * stride_uk
-        widened = hidden.to(tl.bfloat16).to(tl.float32)
-        activated = (0.5 * widened * (1.0 + tl.math.erf(widened / _ROOT_TWO))).to(tl.bfloat16)
-        d = dp + (chunk + offs_h)[:, None] * stride_dk + offs_n[None, :] * stride_dn
-        out += tl.dot(activated, tl.load(d))
-    tl.store(op + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, out)
-
-
-def compile_fused(*, fuse: bool = True):
-    """Returns the plan the fused-shaped feed-forward kernel makes, with fusion on or off."""
-    operands = {"ap": "*bf16", "up": "*bf16", "dp": "*bf16", "op": "*fp32"}
-    constexprs = {parameter.name: parameter.default for parameter in ffn_fused.params
-                  if parameter.is_constexpr}
-    matmuls = read_program(ffn_fused, signature=signature_of(ffn_fused, operands=operands),
-                           constexprs=constexprs)
-    strides = dict(stride_am=128, stride_ak=1, stride_uk=64, stride_un=1, stride_dk=16, stride_dn=1,
-                   stride_cm=16, stride_cn=1)
-    return plan(matmuls, strides=strides, dims=({"m": 32}, {"m": 32, "n": 16}), fuse=fuse)
 
 
 def compile_ffn():

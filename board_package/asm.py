@@ -310,25 +310,6 @@ class AsmBuilder:
             word |= int(value)
         self.bundles.append(_bundle(word))
 
-    def include_binary(self, path: str | Path) -> None:
-        """Inlines an existing 128-bit bundle image into the stream under construction.
-
-        Args:
-            path: The bundle image to read.
-
-        Raises:
-            ValueError: If the file is empty or its length is not a whole number of bundles.
-        """
-        data = Path(path).read_bytes()
-        if not data or len(data) % BUNDLE_BYTES:
-            message = (
-                f"Unable to inline the image at {path}. The file must hold a whole number of {BUNDLE_BYTES} byte "
-                f"bundles and at least one, but got {len(data)} bytes."
-            )
-            raise ValueError(message)
-        for offset in range(0, len(data), BUNDLE_BYTES):
-            self.bundle(int.from_bytes(data[offset : offset + BUNDLE_BYTES], "little"))
-
     def smov_arg(self, rd: int, arg: int) -> int:
         """Returns an S-slot word binding a launch argument to a scalar register.
 

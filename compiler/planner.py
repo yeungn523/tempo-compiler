@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import math
 
-from bf16 import _BLOCK_DEPTH, _BLOCK_TOKENS, _TILE, _ZERO_TILE_WORDS, staged_maximum
+from bf16 import (_BLOCK_DEPTH, _BLOCK_TOKENS, _MAX_DESCRIPTOR_ROWS, _NUM_LANES, _TILE, _VREG_ELEMENTS,
+                  _ZERO_TILE_WORDS, staged_maximum)
 from layout import LayoutError, flash_register_map, register_map
 
-from .ir import (_EMITTED_NEST, _REDUCTION_AXIS, Drain, FlashLaunch, FusedLaunch, Launch, MatMul, Padding,
-                 Plan, ProgramError, Repack)
+from .ir import (_EMITTED_NEST, _REDUCTION_AXIS, Drain, FlashLaunch, Launch, MatMul, Padding,
+                 Plan, Pointwise, PointwiseLaunch, ProgramError, Repack, RowLaunch, Rows)
 from .allocation import allocate
 from .dataflow import attention_trip
-from .lowering import attention_block, attention_body, attention_epilogue, attention_extents, unnameable
+from .lowering import (attention_block, attention_body, attention_epilogue, attention_extents, pointwise_body,
+                       row_body, unnameable)
 
 _MINIMUM_LOOP_BLOCKS: int = 2
 """Smallest number of accumulation blocks a group carries, set by the two way unroll of the block loop."""
@@ -53,7 +55,7 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
             number the machine can judge.
         dims: Extent of each matmul's problem, keyed "m", "n" and "k" for whichever the module leaves open,
             which is an axis put on the grid or a reduction bounded by a runtime argument.
-        fuse: Determines whether a matmul pair one image can run is planned as one launch. Clearing it plans
+        fuse: Determines whether an attention block's two matmuls are planned as one launch. Clearing it plans
             every matmul on its own, which is the same pair passing its intermediate through memory.
 
     Returns:
@@ -70,27 +72,22 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
         raise ProgramError(message)
     _check_strides_bound(matmuls, strides=strides)
 
-    # Reads the pairs before planning, a consumer reading registers being one no plain launch describes. A
-    # kernel stating one matmul leaves this empty, so its plan is the loop below and nothing else.
-    pairs = _fusable_pairs(matmuls) if fuse else {}
     absorbed = _epilogues_absorbed(matmuls)
     # Reads the attention pairs before planning, an online softmax being a chain no plain launch describes.
     attention = {matmuls[index].left_source: index for index in range(len(matmuls))
                  if fuse and attention_block(matmuls, index=index)}
 
-    launches: list[Launch | FusedLaunch] = []
+    launches: list[Launch | FlashLaunch] = []
     drains: list[Drain] = []
     padding: list[Padding] = []
     repack: list[Repack] = []
     masks_covered: list[str] = []
     covered_by_index: dict[int, dict[str, int]] = {}
-    planned_at: dict[int, int] = {}
     ratio = 1.0
-    consumed = set(pairs.values()) | set(attention.values())
+    consumed = set(attention.values())
     for index, (matmul, extent) in enumerate(zip(matmuls, dims, strict=True)):
         if index in attention:
             launch = _attention_launch(matmuls, produces=index, consumes=attention[index])
-            planned_at[index] = len(launches)
             launches.append(launch)
             shape = (launch.row_blocks, 1, launch.output_tiles, launch.queries, _TILE)
             drains.append(Drain(zero_tile_words=0, words=math.prod(shape), shape=shape))
@@ -170,9 +167,6 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
             groups=covered["k"] // (blocks * _BLOCK_DEPTH),
             loop_blocks=blocks,
             activate=_PROLOGUES[matmul.prologue] == "gelu",
-            # Places the accumulator where the kernel put it, summing the groups on the device for one it
-            # carries across the reduction and draining a partial each for one it writes to memory per step.
-            fuse_groups=not matmul.stores_inside_reduction,
             # Covers every block the nest keeps live, which is what a tile loop inside the reduction asks for
             # and the kernel's own tile otherwise.
             block_m=block_m,
@@ -181,7 +175,6 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
             # indistinguishable from any other.
             nest=(*(axis for axis in _EMITTED_NEST if axis not in matmul.nest), *matmul.nest),
         )
-        planned_at[index] = len(launches)
         launches.append(launch)
         # Measures the drain in the block the launch states, since a narrower one drains fewer rows.
         shape = (launch.image_blocks, launch.partials, launch.output_tiles, launch.block_m, _TILE)
@@ -190,23 +183,57 @@ def plan(matmuls: tuple[MatMul, ...], *, strides: dict[str, int],
             words=_ZERO_TILE_WORDS + math.prod(shape),
             shape=shape,
         ))
-    for produces, consumes in pairs.items():
-        _check_fused_width(produces=produces, consumes=consumes, matmuls=matmuls,
-                           covered=covered_by_index[produces])
-        position = planned_at[produces]
-        launches[position] = FusedLaunch(
-            row_blocks=covered_by_index[produces]["m"] // matmuls[produces].rows,
-            chunks=covered_by_index[produces]["n"] // _TILE,
-            steps=covered_by_index[produces]["k"] // _TILE,
-            output_tiles=_output_tiles_of(matmuls[consumes]),
-            produces=produces, consumes=consumes,
-        )
-        shape = (1, 1, launches[position].output_tiles, _BLOCK_TOKENS, _TILE)
-        drains[position] = Drain(zero_tile_words=_ZERO_TILE_WORDS,
-                                 words=_ZERO_TILE_WORDS + math.prod(shape), shape=shape)
 
     return Plan(launches=tuple(launches), drains=tuple(drains), padding=tuple(padding), repack=tuple(repack),
                 masks_covered=tuple(masks_covered), issued_over_useful=ratio)
+
+
+def plan_pointwise(pointwise: Pointwise) -> PointwiseLaunch:
+    """Plans the image a pointwise kernel runs, which a host issues once per token block.
+
+    Args:
+        pointwise: The kernel the reader recovered.
+
+    Returns:
+        The launch.
+
+    Raises:
+        ProgramError: If one token block of the row is not a whole number of descriptor chunks, or an operation has
+            no vector operation to run as.
+    """
+    rows = _BLOCK_TOKENS * pointwise.features // _NUM_LANES
+    if pointwise.features % _TILE or rows % _MAX_DESCRIPTOR_ROWS:
+        message = (
+            f"Unable to plan a pointwise image over {pointwise.features} features. One token block of them is {rows} "
+            f"VMEM rows, which must be a whole number of the {_MAX_DESCRIPTOR_ROWS} rows one descriptor moves."
+        )
+        raise ProgramError(message)
+    return PointwiseLaunch(chunks=rows // _MAX_DESCRIPTOR_ROWS, broadcast_right=pointwise.broadcast_right,
+                           body=pointwise_body(pointwise))
+
+
+def plan_rows(rows: Rows) -> RowLaunch:
+    """Plans the image a row kernel runs, which a host issues once per token block.
+
+    Args:
+        rows: The kernel the reader recovered.
+
+    Returns:
+        The launch.
+
+    Raises:
+        ProgramError: If a row is not a whole number of VREGs or outgrows one descriptor, or the row's arithmetic
+            has no vector operation to run as or outnumbers the registers.
+    """
+    if rows.features % _VREG_ELEMENTS or rows.features // _NUM_LANES > _MAX_DESCRIPTOR_ROWS:
+        message = (
+            f"Unable to plan a row image over {rows.features} features. `vredsum` reduces one VREG, so a row must be "
+            f"a whole number of {_VREG_ELEMENTS} features, and one descriptor gathers at most "
+            f"{_MAX_DESCRIPTOR_ROWS * _NUM_LANES} of them."
+        )
+        raise ProgramError(message)
+    scalars, prologue, body = row_body(rows)
+    return RowLaunch(features=rows.features, rows=len(rows.rows), scalars=scalars, prologue=prologue, body=body)
 
 
 def _attention_launch(matmuls: tuple[MatMul, ...], *, produces: int, consumes: int) -> FlashLaunch:
@@ -244,7 +271,7 @@ def _attention_launch(matmuls: tuple[MatMul, ...], *, produces: int, consumes: i
     return FlashLaunch(**extents,
                        body=attention_body(placement, trip=trip, steps=extents["head"] // _TILE, tiles=tiles),
                        epilogue=attention_epilogue(trip, tiles=tiles), constants=trip.constants,
-                       entering=staged_maximum(0.0 if entering is None else entering))
+                       entering=staged_maximum(0.0 if entering is None else entering), mask=trip.mask)
 
 
 def _check_dimensions_match(*, index: int, matmul: MatMul, covered: dict[str, int],
@@ -268,74 +295,6 @@ def _check_dimensions_match(*, index: int, matmul: MatMul, covered: dict[str, in
             f"{noun} the two state apart: the product covers {produced[drained]} and this matmul reads "
             f"{covered[staged]}. A hidden width is the producing matmul's columns and the consuming matmul's "
             f"reduction at once, so both statements of it have to agree, after the padding each is covered to."
-        )
-        raise ProgramError(message)
-
-
-def _fusable_pairs(matmuls: tuple[MatMul, ...]) -> dict[int, int]:
-    """Returns the consuming matmul of each one whose product it reads out of the registers that hold it.
-
-    A pair runs in one image only at the shape its registers afford: one tile of hidden width per chunk, one
-    output tile per token group, and the activation the staging fuses standing between the two.
-
-    Args:
-        matmuls: The matmuls a kernel computes, in program order.
-
-    Returns:
-        The position of the consuming matmul, keyed by the position of the one it reads.
-    """
-    pairs: dict[int, int] = {}
-    for consumes, matmul in enumerate(matmuls):
-        produces = matmul.left_source
-        if produces is None or produces in pairs:
-            continue
-        producer = matmuls[produces]
-        fits = (_PROLOGUES.get(matmul.prologue) == "gelu"
-                and matmul.depth == _TILE and not matmul.columns % _TILE
-                and producer.columns == _TILE and not producer.prologue and not matmul.epilogue
-                and producer.rows == matmul.rows == _BLOCK_TOKENS)
-        if fits:
-            pairs[produces] = consumes
-    return pairs
-
-
-def _output_tiles_of(matmul: MatMul) -> int:
-    """Returns the tiles a fused consumer's output covers, being what its sweep loops over.
-
-    The width is the consumer's own block together with every loop walking its output columns, because the image
-    sweeps the whole output inside each chunk rather than holding it live. Reading the block alone would cover
-    one iteration of that loop and leave the rest of the output uncomputed, and a kernel has to write the sweep
-    as a loop wherever the width is not a power of two, which a block on its own cannot be.
-
-    Args:
-        matmul: The matmul reading the intermediate.
-
-    Returns:
-        The tiles the sweep covers.
-    """
-    swept = math.prod(loop.trips for loop in matmul.tile_loops if loop.axis == "n")
-    return swept * matmul.columns // _TILE
-
-
-def _check_fused_width(*, produces: int, consumes: int, matmuls: tuple[MatMul, ...],
-                       covered: dict[str, int]) -> None:
-    """Refuses a fused pair whose consumer contracts a width its producer does not leave.
-
-    Args:
-        produces: Position of the matmul leaving the intermediate.
-        consumes: Position of the matmul reading it.
-        matmuls: The matmuls a kernel computes.
-        covered: Padded extent the producing matmul covers along each axis.
-
-    Raises:
-        ProgramError: If the two state the hidden width apart.
-    """
-    reduction = matmuls[consumes].reduction
-    if reduction is not None and reduction != covered["n"]:
-        message = (
-            f"Unable to fuse matmul {consumes} onto matmul {produces}, whose hidden width the two state apart: "
-            f"the product covers {covered['n']} columns and this matmul contracts over {reduction}. One image "
-            f"holds the chunk in registers, so the width it walks is the width the producer leaves."
         )
         raise ProgramError(message)
 

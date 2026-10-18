@@ -41,7 +41,9 @@ ___
 
 ## Dependencies
 
-- [Triton](https://triton-lang.org/) 3.8.0, which compiling any kernel needs.
+- [Triton](https://triton-lang.org/) 3.8.0, which compiling any kernel needs. `pyproject.toml` pins it with the rest of
+  the Python dependencies, installed by `pip install --group compiler`, and pins the C++ toolchain `mlir/` builds against
+  (see `mlir/README.md`).
 - A checkout of the separate RTL repository, named by `minitpu_rtl`, for the simulation tools alone. The tools fall
   back to a sibling directory named `minitpu-tmp` when the variable is unset.
 - [LLVM](https://llvm.org/) 17 through 20, supplying the `llvm-tblgen` that `tools/gen_isa_doc.py` reads the ISA

@@ -39,7 +39,7 @@ minitpuisa.program @never_halts {
 
 minitpuisa.program @register_past_the_file {
   minitpuisa.bundle {
-    // expected-error @below {{attribute 'reg' failed to satisfy constraint}}
+    // expected-error @below {{attribute 'reg_idx' failed to satisfy constraint}}
     minitpuisa.vmatpush v32
   }
   minitpuisa.bundle {

@@ -3,9 +3,8 @@
 # version. A glob silently adopts each check a new release adds, which combined with the 'WarningsAsErrors' setting
 # below turns a toolchain upgrade into a build failure across every project that shares this file.
 #
-# 'google-build-using-namespace' and 'google-global-names-in-headers' are absent because the /cpp-style skill
-# prescribes file-scope 'using namespace' for project-internal shared asset namespaces and for the nanobind
-# literals and chrono namespaces. The skill's own rules bound where the directive is allowed.
+# 'google-build-using-namespace' and 'google-global-names-in-headers' are absent because the .cpp files bring the
+# project's own namespaces and MLIR's into scope with file-scope 'using namespace' directives.
 ---
 Checks: '-*,
 bugprone-argument-comment,

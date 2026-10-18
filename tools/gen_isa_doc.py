@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Generates the published ISA operation table, the RTL conformance package and the assembler's scheduling model.
 
-codegen/minitpuisa.td is the single source of truth for the implemented scheduling contract, and it is read through
-llvm-tblgen --dump-json, so nothing here needs an MLIR build. The artifacts derived from it are the operation table
-spliced between the generated markers in docs/ISA_AND_INTERFACES.md, the localparams in tb/isa_latency_pkg.sv and the
-per-opcode facts in codegen/isa_model.py. Running this script with --write regenerates all three, and running it
-with --check exits non-zero when any of them, or any scheduling constant in codegen/asm.py, disagrees with the
-source.
+codegen/minitpuisa.td is the single source of truth for the implemented scheduling contract, and it is read through a
+TableGen driver's --dump-json, the minitpu-tblgen mlir/ builds against the pinned LLVM when it is built and a system
+llvm-tblgen otherwise. The artifacts derived from it are the operation table spliced between the generated markers in
+docs/ISA_AND_INTERFACES.md, the localparams in tb/isa_latency_pkg.sv and the per-opcode facts in codegen/isa_model.py.
+Running this script with --write regenerates all three, and running it with --check exits non-zero when any of them, or
+any scheduling constant in codegen/asm.py, disagrees with the source.
 """
 
 from __future__ import annotations
@@ -58,6 +58,9 @@ _COLUMNS: tuple[str, ...] = (
 )
 """Stores the header cells of the generated operation table."""
 
+_PINNED_TBLGEN: pathlib.Path = _REPO / "mlir" / "build" / "bin" / "minitpu-tblgen"
+"""Stores the TableGen driver mlir/ builds against the pinned LLVM, which is read first whenever it is built."""
+
 _TBLGEN_CANDIDATES: tuple[str, ...] = (
     "llvm-tblgen",
     "llvm-tblgen-18",
@@ -65,7 +68,7 @@ _TBLGEN_CANDIDATES: tuple[str, ...] = (
     "llvm-tblgen-19",
     "llvm-tblgen-20",
 )
-"""Stores the binaries tried in order when LLVM_TBLGEN does not name one."""
+"""Stores the binaries tried in order when LLVM_TBLGEN names none and mlir/ is unbuilt."""
 
 
 def _load() -> dict[str, Any]:
@@ -95,7 +98,7 @@ def _records() -> dict[str, Any]:
 
 
 def _tblgen() -> str:
-    """Returns the llvm-tblgen to read the source with.
+    """Returns the TableGen driver to read the source with, the pinned minitpu-tblgen first.
 
     Raises:
         SystemExit: If none is on PATH, naming the environment variable that overrides the search.
@@ -103,6 +106,8 @@ def _tblgen() -> str:
     override = os.environ.get("LLVM_TBLGEN")
     if override:
         return override
+    if _PINNED_TBLGEN.exists():
+        return str(_PINNED_TBLGEN)
 
     for candidate in _TBLGEN_CANDIDATES:
         found = shutil.which(candidate)
@@ -111,7 +116,7 @@ def _tblgen() -> str:
 
     message = (
         f"Unable to read {_SOURCE.relative_to(_REPO)} without llvm-tblgen, which is not on PATH under any of "
-        f"{', '.join(_TBLGEN_CANDIDATES)}. Install an LLVM package or set LLVM_TBLGEN to the binary."
+        f"{', '.join(_TBLGEN_CANDIDATES)}. Build mlir/, install an LLVM package, or set LLVM_TBLGEN to the binary."
     )
     raise SystemExit(message)
 

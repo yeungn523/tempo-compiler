@@ -15,11 +15,13 @@
 #include <mlir/Transforms/Passes.h>
 #include <triton/Dialect/Triton/IR/Dialect.h>
 #include "minitpu/minitpuisa/minitpuisa.h"
+#include "minitpu/minitpuisa/passes.h"
 
 /// Registers every dialect and pass the pipeline reads and runs, then hands the command line to MLIR's driver.
 int main(int argc, char** argv)
 {
     mlir::registerTransformsPasses();
+    mlir::minitpu::isa::registerMiniTPUISAPasses();
 
     mlir::DialectRegistry registry;
     registry.insert<

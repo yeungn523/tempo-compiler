@@ -2,7 +2,7 @@
  * @file
  *
  * @brief Implements the minitpuisa dialect: its register syntax, the bundle and program verifiers, and the
- * instructions TableGen generates from minitpuisa.td.
+ * instructions TableGen generates from minitpuisa_ops.td.
  *
  * @note The parse, print, verify and initialize names below are the ones MLIR's generated code calls, so they keep
  * MLIR's spelling.

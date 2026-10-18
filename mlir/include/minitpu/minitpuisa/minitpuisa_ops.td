@@ -1,5 +1,5 @@
 /**
- * @file minitpuisa.td
+ * @file minitpuisa_ops.td
  * @brief Provides the minitpuisa dialect, one operation per MiniTPU machine instruction, grouped into bundles exactly
  * as an image carries them.
  *
@@ -9,8 +9,8 @@
  * operation here with no edit to this file.
  */
 
-#ifndef MINITPU_MINITPUISA_TD
-#define MINITPU_MINITPUISA_TD
+#ifndef MINITPU_MINITPUISA_OPS_TD
+#define MINITPU_MINITPUISA_OPS_TD
 
 include "mlir/IR/OpBase.td"
 include "mlir/IR/RegionKindInterface.td"
@@ -30,7 +30,8 @@ def ISA_Dialect : Dialect
  *
  * @details A slot's payload is the instruction's fields at their positions within the slot, before the slot is
  * shifted into the bundle. get_code is what the decoder matches a payload against: the opcode for the slots carrying
- * one, and the store bit for X and D.
+ * one, and the store bit for X and D. Every register operand is named as codegen/minitpuisa.td's register_reads and
+ * register_write name it, so the scheduler reads an instruction's registers by the roles its group publishes.
  */
 def ISA_SlotOpInterface : OpInterface<"SlotOpInterface">
 {
@@ -272,12 +273,12 @@ def ISA_VstOp : ISA_XOp<VectorStore, "vst", 1>;
 /// @brief Provides an M-slot matrix command naming one vector register.
 class ISA_MOp<OpGroup group, string mnemonic> : ISA_Op<group, mnemonic>
 {
-    let arguments = (ins ISA_VectorRegister:$reg);
-    let assemblyFormat = "custom<VectorRegister>($reg) attr-dict";
+    let arguments = (ins ISA_VectorRegister:$reg_idx);
+    let assemblyFormat = "custom<VectorRegister>($reg_idx) attr-dict";
     let formatDefinition = [{
         uint64_t $cppClass::Encode()
         {
-            return kMOpcode.Place(get_code()) | kMRegister.Place(getReg());
+            return kMOpcode.Place(get_code()) | kMRegister.Place(getRegIdx());
         }
 
         ::mlir::Operation* $cppClass::Decode(::mlir::OpBuilder& builder, ::mlir::Location location, uint64_t payload)
@@ -317,12 +318,12 @@ def ISA_SmoviOp : ISA_Op<Scalar, "smovi">
 /// @brief Provides smov_arg, which reads the launch argument its rs field names into a scalar register.
 def ISA_SmovArgOp : ISA_Op<Scalar, "smov_arg">
 {
-    let arguments = (ins ISA_ScalarRegister:$rd, ISA_ScalarRegister:$arg);
-    let assemblyFormat = "custom<ScalarRegister>($rd) `,` `arg` $arg attr-dict";
+    let arguments = (ins ISA_ScalarRegister:$rd, ISA_ScalarRegister:$rs);
+    let assemblyFormat = "custom<ScalarRegister>($rd) `,` `arg` $rs attr-dict";
     let formatDefinition = [{
         uint64_t $cppClass::Encode()
         {
-            return kSValid.Place(1) | kSOpcode.Place(get_code()) | kSRd.Place(getRd()) | kSRs.Place(getArg());
+            return kSValid.Place(1) | kSOpcode.Place(get_code()) | kSRd.Place(getRd()) | kSRs.Place(getRs());
         }
 
         ::mlir::Operation* $cppClass::Decode(::mlir::OpBuilder& builder, ::mlir::Location location, uint64_t payload)
@@ -331,7 +332,7 @@ def ISA_SmovArgOp : ISA_Op<Scalar, "smov_arg">
                 builder,
                 location,
                 kSRd.Extract(payload),  // rd
-                kSRs.Extract(payload)   // arg
+                kSRs.Extract(payload)   // rs
             );
         }
     }];
@@ -436,15 +437,16 @@ def ISA_VmemswapOp : ISA_FBareOp<"vmemswap">;
 class ISA_DOp<string mnemonic, int store_bit> : ISA_Op<Descriptor, mnemonic, store_bit>
 {
     let arguments = (ins ISA_Field<0, 1>:$dma_slot, ISA_Field<0, 16383>:$vmem, ISA_Field<1, 128>:$rows,
-                         ISA_ScalarRegister:$base, ISA_ScalarRegister:$stride);
-    let assemblyFormat = "`slot` $dma_slot `,` `vmem` $vmem `,` `rows` $rows `,` `base` custom<ScalarRegister>($base) "
-                         "`,` `stride` custom<ScalarRegister>($stride) attr-dict";
+                         ISA_ScalarRegister:$base_sreg, ISA_ScalarRegister:$stride_sreg);
+    let assemblyFormat = "`slot` $dma_slot `,` `vmem` $vmem `,` `rows` $rows `,` "
+                         "`base` custom<ScalarRegister>($base_sreg) `,` `stride` custom<ScalarRegister>($stride_sreg) "
+                         "attr-dict";
     let formatDefinition = [{
         uint64_t $cppClass::Encode()
         {
             return kDStore.Place(get_code()) | kDDmaSlot.Place(getDmaSlot()) | kDVmem.Place(getVmem()) |
-                   kDSourceMode.Place(1) | kDRowCount.Place(getRows() - 1) | kDBase.Place(getBase()) |
-                   kDStride.Place(getStride());
+                   kDSourceMode.Place(1) | kDRowCount.Place(getRows() - 1) | kDBase.Place(getBaseSreg()) |
+                   kDStride.Place(getStrideSreg());
         }
 
         ::mlir::Operation* $cppClass::Decode(::mlir::OpBuilder& builder, ::mlir::Location location, uint64_t payload)
@@ -455,8 +457,8 @@ class ISA_DOp<string mnemonic, int store_bit> : ISA_Op<Descriptor, mnemonic, sto
                 kDDmaSlot.Extract(payload),       // dma_slot
                 kDVmem.Extract(payload),          // vmem
                 kDRowCount.Extract(payload) + 1,  // rows
-                kDBase.Extract(payload),          // base
-                kDStride.Extract(payload)         // stride
+                kDBase.Extract(payload),          // base_sreg
+                kDStride.Extract(payload)         // stride_sreg
             );
         }
     }];
@@ -492,4 +494,4 @@ def ISA_ProgramOp : Op<ISA_Dialect, "program", [NoTerminator, SingleBlock, NoReg
     let hasVerifier = 1;
 }
 
-#endif  // MINITPU_MINITPUISA_TD
+#endif  // MINITPU_MINITPUISA_OPS_TD

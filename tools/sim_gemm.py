@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Provides the RTL check that a GEMM image computes the product it claims.
 
-The image comes either from the dimensions named on the command line, which emits one directly, or from the
-artifacts `kernel_entry_point.py` wrote for a Triton kernel, which is the path a compiled kernel takes. Both end in the
-same testbench, so a kernel is checked here before it reaches hardware.
+The image comes either from the dimensions named on the command line, which emits one directly, or from a Triton
+kernel compiled here, which is the path a compiled kernel takes. Both end in the same testbench, so a kernel is
+checked here before it reaches hardware.
 """
 
 from __future__ import annotations
@@ -23,14 +23,15 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent
 
 sys.path.insert(0, str(_HERE.parent))
 sys.path.insert(0, str(_HERE.parent / "board_package"))
-sys.path.insert(0, str(_HERE.parent / "board_package" / "minitpu_runtime"))
 
-import asm  # noqa: E402
-import emit  # noqa: E402
 from bf16 import (_BLOCK_DEPTH, _BLOCK_TOKENS, _BLOCK_WEIGHT_BYTES, _ELEMENT_BYTES, _TILE,  # noqa: E402
                   _ZERO_TILE_WORDS, build_operands, from_bf16_words, pack_activations, pack_weights,
                   reduce_drain)
-from compiler.ir import Launch  # noqa: E402
+from codegen import (FlashLaunch, ProgramError, compile_launch, plan, read_kernel, read_program,  # noqa: E402
+                      signature_of, stage)
+from codegen import asm  # noqa: E402
+from codegen import emit  # noqa: E402
+from codegen.ir import Launch  # noqa: E402
 
 _TOLERANCE: float = 0.02
 """Relative error the BF16 accumulate chain is allowed, which the board check also holds to."""
@@ -82,13 +83,76 @@ def simulate(*, launch: Launch, reduction: int, build_dir: str | None = None,
     return float(np.abs(product - expected).max() / np.abs(expected).max())
 
 
-def simulate_compiled(*, image: bytes, operands: np.lib.npyio.NpzFile, build_dir: str | None = None,
+def compile_kernel(specification: str, *, left: NDArray[np.float32] | None = None,
+                   right: NDArray[np.float32] | None = None) -> tuple[bytes, dict, str]:
+    """Compiles one Triton kernel stating a single matmul and packs the operands its image runs against.
+
+    Args:
+        specification: The kernel, as the path to a Python file and, after a colon, the name it is declared under.
+        left: The activation operand, or None to draw one at the extent the plan covers.
+        right: The weight operand, or None to draw one at the extent the plan covers.
+
+    Returns:
+        The image, the packed operands and sizes `simulate_compiled` reads, and a line describing the launch.
+
+    Raises:
+        ProgramError: If the kernel states other than one plain matmul, or its plan repacks an operand.
+    """
+    kernel = read_kernel(specification)
+    constexprs = {parameter.name: parameter.default for parameter in kernel.params if parameter.is_constexpr}
+    matmuls = read_program(kernel, signature=signature_of(kernel, operands={}), constexprs=constexprs)
+    planned = plan(matmuls, strides={})
+    if len(planned.launches) != 1 or isinstance(planned.launches[0], FlashLaunch):
+        message = (
+            f"Unable to simulate {specification}, which plans {len(planned.launches)} launches. This check runs one "
+            f"GEMM launch, and tools/sim_flashattention.py checks an attention block."
+        )
+        raise ProgramError(message)
+    if planned.repack:
+        message = (
+            f"Unable to pack the operands of {specification}, whose plan repacks one. The packing lays each operand "
+            f"out where it already lies, so lay it out with a unit stride along the lane axis."
+        )
+        raise ProgramError(message)
+    launch, drain = planned.launches[0], planned.drains[0]
+    image, staging = compile_launch(launch)
+    if left is None or right is None:
+        rows, columns = launch.row_blocks * launch.block_m, launch.column_tiles * _TILE
+        depth = launch.groups * launch.loop_blocks * _BLOCK_DEPTH
+        left, right = build_operands(rows, depth, columns, kind="varying", seed=0)
+    left, right = stage(left, right, matmul=matmuls[0], launch=launch)
+    activations = np.stack([pack_activations(activations=left[token : token + staging.rows])
+                            for token in range(0, left.shape[0], staging.rows)])
+    # Packs one weight buffer per column block, which is one whole buffer where the image walks the blocks itself
+    # and one apiece where the host issues them.
+    weights = np.stack([pack_weights(weights=right[:, column : column + staging.columns])
+                        for column in range(0, right.shape[1], staging.columns)])
+    operands = dict(
+        activations=activations,
+        weights=weights,
+        issue_order=",".join(axis for axis in launch.nest if axis != "k"),
+        block_columns=staging.columns,
+        expected=(left.astype(np.float64) @ right.astype(np.float64)).astype(np.float32),
+        # The slack on each operand is the block the image prefetches past the last one.
+        activation_bytes=activations[0].nbytes + staging.activation_slack,
+        weight_bytes=weights[0].nbytes + _BLOCK_WEIGHT_BYTES,
+        drain_words=drain.words,
+        drain_bytes=drain.words * _ELEMENT_BYTES,
+        zero_tile_words=drain.zero_tile_words,
+        drain_shape=drain.shape,
+    )
+    described = (f"{left.shape[0]}x{left.shape[1]} @ {right.shape[0]}x{right.shape[1]}, nest "
+                 f"{','.join(launch.nest)}, {len(image) // asm.BUNDLE_BYTES} bundles")
+    return image, operands, described
+
+
+def simulate_compiled(*, image: bytes, operands: dict, build_dir: str | None = None,
                       max_cycles: int | None = None) -> float:
     """Runs a compiled image against the RTL once per token block and returns its error.
 
     Args:
-        image: The kernel image the entry point emitted.
-        operands: The packed operands and sizes the entry point wrote beside it.
+        image: The compiled kernel image.
+        operands: The packed operands and sizes `compile_kernel` returned beside it.
         build_dir: Directory the Verilator build is kept in, or None to build in a temporary one.
         max_cycles: Cycles one round may take before the testbench reports it timed out, or None for the bound the
             testbench carries.
@@ -214,11 +278,13 @@ def main() -> int:
         Zero when the product matched within the tolerance the BF16 accumulate chain allows.
 
     Raises:
-        ValueError: If the image and the operands are not named together.
+        ValueError: If only one of the activations and the weights is named, or either is named without a kernel.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--image", default=None, help="a .bin the entry point emitted, with --operands")
-    parser.add_argument("--operands", default=None, help="the _operands.npz packed beside that image")
+    parser.add_argument("--kernel", default=None,
+                        help="a Triton kernel to compile and run, as a Python file and its name after a colon")
+    parser.add_argument("--activations", default=None, help="npy file holding the kernel's left operand")
+    parser.add_argument("--weights", default=None, help="npy file holding the kernel's right operand")
     parser.add_argument("--rows", type=int, default=_BLOCK_TOKENS, help="token rows, being one block")
     parser.add_argument("--depth", type=int, default=192, help="the contraction, a multiple of the group depth")
     parser.add_argument("--columns", type=int, default=48, help="output columns, a multiple of the tile")
@@ -230,19 +296,21 @@ def main() -> int:
                         help="cycles one round may take, past the bound the testbench carries")
     arguments = parser.parse_args()
 
-    if (arguments.image is None) != (arguments.operands is None):
+    if (arguments.activations is None) != (arguments.weights is None) or (
+            arguments.activations is not None and arguments.kernel is None):
         message = (
-            "Unable to run one artifact alone. The image names the bundles and the operands name the sizes they "
-            "run against, so name both or neither."
+            "Unable to read one operand alone. Name --activations and --weights together, with --kernel, or omit "
+            "both to draw operands at the extent the plan covers."
         )
         raise ValueError(message)
 
-    if arguments.image is not None:
-        operands = np.load(arguments.operands)
-        error = simulate_compiled(image=pathlib.Path(arguments.image).read_bytes(), operands=operands,
-                                  build_dir=arguments.build_dir, max_cycles=arguments.max_cycles)
-        rows, columns = operands["expected"].shape
-        what = f"{rows}x{columns} product over {len(operands['activations'])} token blocks"
+    if arguments.kernel is not None:
+        named = arguments.activations is not None
+        image, operands, what = compile_kernel(arguments.kernel,
+                                               left=np.load(arguments.activations) if named else None,
+                                               right=np.load(arguments.weights) if named else None)
+        error = simulate_compiled(image=image, operands=operands, build_dir=arguments.build_dir,
+                                  max_cycles=arguments.max_cycles)
     else:
         # States the launch, since these dimensions came from a person rather than from a plan.
         launch = Launch(row_blocks=arguments.rows // arguments.block_m, column_tiles=arguments.columns // _TILE,

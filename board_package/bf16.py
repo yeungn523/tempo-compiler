@@ -17,7 +17,6 @@ HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent
 # A module that imports bf16 reaches the board runtime through it rather than inserting the roots itself, so
 # importing bf16 has to leave both of them on the path.
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE / "minitpu_runtime"))
 
 _ELEMENT_BYTES: int = 2
 """The byte width of one BF16 value in memory."""

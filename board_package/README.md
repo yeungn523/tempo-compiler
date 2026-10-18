@@ -24,9 +24,9 @@ passes and every time is about 1.8x too slow. `tools/deploy_board.sh` ships the
 Makefile under its md5 gate for exactly that reason.
 
 `sudo make minitpu` is needed after boot or whenever the PL is replaced. It
-loads `minitpu/minitpu_zcu104.bit.bin`, applies `minitpu/overlay.dtso`, and
+loads `fpga/minitpu_zcu104.bit.bin`, applies `fpga/overlay.dtso`, and
 exposes the NPU as a UIO device plus a contiguous DMA buffer, falling back
-to the bundled kernel-matched `minitpu/u-dma-buf.ko` when no in-tree module
+to the bundled kernel-matched `fpga/u-dma-buf.ko` when no in-tree module
 fits. Everything after that runs as a normal user.
 
 ## What the board checks prove
@@ -87,69 +87,18 @@ currently 64 tokens.
 
 ## Files
 
-The package is three layers. Each one only knows about the one below it.
-
 | Path | Purpose |
 | --- | --- |
-| | **The kernels** |
-| `gpt2.py` | GPT-2 small's inference: device tensors, the launches of every compiled image, the forward pass, and generation. |
+| `gpt2_inference.py` | GPT-2 small's inference on the NPU, which includes the device tensors, the launches of every compiled image, the forward pass, and generation. `make generate` runs it. |
 | `board_checks.py` | **Entry point for the checks.** The board suite `make kernels` runs. |
 | `references.py` | The host references every check holds the device to. |
 | `tokenizer.py` | GPT-2's byte-level BPE, reading the exported vocabulary and merges. |
-| `emit.py` | The templates the compiler emits every image's bundles from. |
+| `bf16.py` | Device geometry, BF16 packing, operand layouts. Touches no device, so it can be checked by inspection. |
+| `runtime/` | Board runtime: UIO, udmabuf, COPY, LAUNCH, and the hardware ABI they speak. |
 | `images/` | The compiled images and the manifest describing them, written by `tools/build_gpt2_images.py`. |
-| `bf16.py` | Device geometry, BF16 packing, operand layouts, host references. Touches no device, so it can be checked by inspection. |
-| `layout.py` | Where a tensor's elements live and what that costs: the DMEM tiling ABI and the VMEM allocator. |
-| | **The assembler** |
-| `asm.py` | Fills delay fields, and **rejects** what no delay can fix. |
-| `isa_model.py` | The per-opcode scheduling facts `asm.py` schedules against. Generated — run `tools/gen_isa_doc.py --write`, never edit by hand. |
-| | **The board** |
-| `minitpu/` | Bitstream, device-tree overlay, PL bring-up scripts. |
-| `minitpu_runtime/runtime/` | Board runtime: UIO, udmabuf, COPY, LAUNCH. |
-| `minitpu_runtime/minitpu/` | Hardware ABI, register map, launch limits. |
-| | **Tests** |
-| `tests/` | Host-only tests: assembler encodings, scheduling distances, the operand rule, and the compiler held to the hand-written images it replaced, frozen in `tests/golden/`. `make check` runs them. |
+| `weights/` | GPT-2's weights and tokenizer, written by `tools/export_gpt2_weights.py`. Not tracked. |
+| `fpga/` | Bitstream, device-tree overlay, u-dma-buf module, PL bring-up scripts. |
+| `tests/` | Host tests of the runtime, the drain, the operand rule and the tokenizer. `make check` runs them. |
 
-## Reading `asm.py` first
-
-The machine issues one bundle per cycle and holds the fetch head for exactly one
-reason: the delay field. There is no scoreboard, no replay, no stall on a full
-buffer, no arbiter that makes a loser wait. **A schedule that breaks a rule is
-not reported — it produces a number.** So the assembler is the only place a rule
-can be enforced on every image, and `schedule()` is where to look:
-
-- it models writeback-port occupancy, VREG read-port A ownership, matrix
-  controller occupancy, per-push MXU result latency, and VMEM bank conflicts;
-- it **rejects** two port-A consumers in one bundle, and a `vmatpush` burst that
-  would overflow the MXU output FIFO. Neither is fixable by spacing — one has no
-  gap to insert, the other would need reordering — so raising is the only honest
-  answer;
-- `analyze_stalls` attributes every waiting cycle to the constraint that caused
-  it, which is how the open hardware items are ranked.
-
-`compiler/minitpuisa.td` in the repo is the single source of truth for these
-numbers; `tb_isa_conformance.sv` holds the RTL to it and
-`tools/gen_isa_doc.py --check` holds this package's constants to it.
-
-## Writing a kernel
-
-The `@minitpu.asm` decorator runs a Python function as an assembler, emitting one
-128-bit VLIW bundle per `minitpu.bundle` call. Every program must end in `F:halt`.
-
-```python
-@minitpu.asm
-def my_program():
-    minitpu.bundle(f=minitpu.halt())
-```
-
-Call an assembled program with host arrays and it hides image staging, pinned
-host and device allocation, the COPY commands, argument binding, LAUNCH, the
-output COPY and cleanup:
-
-```python
-bf16_mul_add(h_src1, h_src2, h_dest)
-```
-
-Arguments are C-contiguous `numpy.uint16` arrays — the BF16 wire format. Every
-argument before the last is an input; the last is the output. On a board whose
-UIO node is named differently, use `@minitpu(uio_name="my-minitpu")`.
+The code generator that writes `images/`, with the assembler and the ISA model it schedules against, lives in
+`codegen/` at the repository root and never reaches the board.

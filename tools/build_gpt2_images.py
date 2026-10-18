@@ -18,10 +18,11 @@ sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE / "board_package"))
 
 from bf16 import _BLOCK_TOKENS, _ROW_BYTES, _TILE, pack_attention_constants  # noqa: E402
-from compiler import (ProgramError, compile_copy, compile_launch, compile_pointwise,  # noqa: E402
+from codegen import (ProgramError, compile_copy, compile_launch, compile_pointwise,  # noqa: E402
                       compile_resident_attention, compile_rows, plan, plan_pointwise, plan_rows, read_pointwise,
                       read_program, read_rows, signature_of)
-from compiler.ir import FlashLaunch, Launch  # noqa: E402
+from codegen.asm import AsmBuilder, AsmKernel  # noqa: E402
+from codegen.ir import FlashLaunch, Launch  # noqa: E402
 from gpt2_triton import (gpt2_add, gpt2_add_bias, gpt2_attention, gpt2_decode_attention,  # noqa: E402
                          gpt2_layernorm, gpt2_matmul, gpt2_matmul_gelu)
 from triton.runtime import JITFunction  # noqa: E402
@@ -57,9 +58,9 @@ _ROW_KERNELS: dict[str, JITFunction] = {"layernorm": gpt2_layernorm}
 _ATTENTION: tuple[tuple[int, int], ...] = ((64, 12),)
 """Tokens and heads of each attention image one layer launches, the key loop's length fixed by the tokens."""
 
-_DECODE_KEYS: tuple[int, ...] = tuple(range(_BLOCK_TOKENS, 1024 + 1, _BLOCK_TOKENS))
-"""Cache lengths a decode image is built for, one per token block up to GPT-2's context, a step using the shortest
-that holds its cache and masking the keys past its length."""
+_DECODE_KEYS: tuple[int, ...] = (64, 256, 1024)
+"""Cache lengths a decode image is built for, each four times the last up to GPT-2's context. A step uses the shortest
+that holds its cache and masks the keys past its length, trading attention over masked keys for fewer images."""
 
 _COPIES: tuple[tuple[int, int], ...] = (
     (2 * _MODEL // _TILE * _BLOCK_TOKENS, _ROW_BYTES),
@@ -124,6 +125,11 @@ def main() -> int:
         (written / name).write_bytes(image)
         manifest[name] = {"kind": "copy", "rows": rows, "stride": stride}
         print(f"wrote {written / name}  {len(image)} bytes")
+    # Writes the one-bundle program the board's first check launches, which proves a launch retires at all.
+    image = AsmKernel(name="halt", bundles=(AsmBuilder().halt(),)).to_bytes(pad_to=4)
+    (written / "halt.bin").write_bytes(image)
+    manifest["halt.bin"] = {"kind": "halt"}
+    print(f"wrote {written / 'halt.bin'}  {len(image)} bytes")
     (written / _MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"wrote {written / _MANIFEST}")
     return 0

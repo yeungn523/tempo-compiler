@@ -14,7 +14,7 @@ sys.path.insert(0, str(_HERE))
 
 from tokenizer import Tokenizer  # noqa: E402
 
-_EXPORTED: bool = (_HERE / "gpt2_vocab.json").exists() and (_HERE / "gpt2_merges.txt").exists()
+_EXPORTED: bool = all((_HERE / "weights" / name).exists() for name in ("gpt2_vocab.json", "gpt2_merges.txt"))
 """Whether the tokenizer has been exported, which tools/export_gpt2_weights.py does on a host."""
 
 

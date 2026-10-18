@@ -14,9 +14,8 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
 """The root directory of the deployed board package."""
 
 sys.path.insert(0, str(_HERE))
-sys.path.insert(0, str(_HERE / "minitpu_runtime"))
 
-from minitpu.abi import AXI_REG, CMD_WINDOW_WORDS  # noqa: E402
+from runtime.abi import AXI_REG, CMD_WINDOW_WORDS  # noqa: E402
 from runtime import memcpy  # noqa: E402
 from runtime.backend import MockMmio  # noqa: E402
 

@@ -222,7 +222,7 @@ docs/
 
 # FPGA bitstreams
 *.bit.bin
-!board_package/minitpu/minitpu_zcu104.bit.bin
+!board_package/fpga/minitpu_zcu104.bit.bin
 
 AGENTS.md
 CLAUDE.md
@@ -232,9 +232,7 @@ tools/check_codegen.py
 tools/golden/
 
 # GPT-2 weights and tokenizer, exported on a host and copied to the board
-board_package/gpt2_weights.npz
-board_package/gpt2_vocab.json
-board_package/gpt2_merges.txt
+board_package/weights/
 
 # Personal notes
 TODO.txt

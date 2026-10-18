@@ -18,7 +18,6 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent))
 sys.path.insert(0, str(_HERE.parent / "board_package"))
-sys.path.insert(0, str(_HERE.parent / "board_package" / "minitpu_runtime"))
 
 from bf16 import (  # noqa: E402
     _BLOCK_TOKENS,
@@ -31,7 +30,7 @@ from bf16 import (  # noqa: E402
     pack_activations,
     pack_attention_constants,
 )
-from compiler import FlashLaunch, compile_resident_attention, plan, read_program, signature_of  # noqa: E402
+from codegen import FlashLaunch, compile_resident_attention, plan, read_program, signature_of  # noqa: E402
 from gpt2_triton import gpt2_attention, gpt2_decode_attention  # noqa: E402
 from sim_gemm import _run_image  # noqa: E402
 

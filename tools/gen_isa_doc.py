@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Generates the published ISA operation table, the RTL conformance package and the assembler's scheduling model.
 
-compiler/minitpuisa.td is the single source of truth for the implemented scheduling contract, and it is read through
+codegen/minitpuisa.td is the single source of truth for the implemented scheduling contract, and it is read through
 llvm-tblgen --dump-json, so nothing here needs an MLIR build. The artifacts derived from it are the operation table
 spliced between the generated markers in docs/ISA_AND_INTERFACES.md, the localparams in tb/isa_latency_pkg.sv and the
-per-opcode facts in board_package/isa_model.py. Running this script with --write regenerates all three, and running it
-with --check exits non-zero when any of them, or any scheduling constant in board_package/asm.py, disagrees with the
+per-opcode facts in codegen/isa_model.py. Running this script with --write regenerates all three, and running it
+with --check exits non-zero when any of them, or any scheduling constant in codegen/asm.py, disagrees with the
 source.
 """
 
@@ -24,7 +24,7 @@ from typing import Any
 _REPO: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
 """Stores the path to the repository root."""
 
-_SOURCE: pathlib.Path = _REPO / "compiler" / "minitpuisa.td"
+_SOURCE: pathlib.Path = _REPO / "codegen" / "minitpuisa.td"
 """Stores the path to the TableGen contract every generated artifact derives from."""
 
 _DOC: pathlib.Path = _REPO / "docs" / "ISA_AND_INTERFACES.md"
@@ -33,10 +33,10 @@ _DOC: pathlib.Path = _REPO / "docs" / "ISA_AND_INTERFACES.md"
 _PACKAGE: pathlib.Path = _REPO / "tb" / "isa_latency_pkg.sv"
 """Stores the path to the package tb_isa_conformance.sv holds the sequencer's own localparams against."""
 
-_MODEL: pathlib.Path = _REPO / "board_package" / "isa_model.py"
+_MODEL: pathlib.Path = _REPO / "codegen" / "isa_model.py"
 """Stores the path to the module the assembler reads its per-opcode scheduling facts from."""
 
-_ASSEMBLER: pathlib.Path = _REPO / "board_package" / "asm.py"
+_ASSEMBLER: pathlib.Path = _REPO / "codegen" / "asm.py"
 """Stores the path to the assembler whose hand-written scheduling constants are checked against the source."""
 
 _BEGIN: str = "<!-- BEGIN GENERATED: tools/gen_isa_doc.py -->"

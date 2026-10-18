@@ -21,16 +21,14 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent))
 sys.path.insert(0, str(_HERE.parent / "board_package"))
-sys.path.insert(0, str(_HERE.parent / "board_package" / "minitpu_runtime"))
 
 from bf16 import (_NUM_LANES, _TILE, _VREG_ELEMENTS, as_bf16_words,  # noqa: E402
                   attention_bf16_reference, from_bf16_words, pack_attention, staged_maximum)
-from compiler import FlashLaunch, compile_launch, read_program, signature_of  # noqa: E402
-from compiler.allocation import allocate  # noqa: E402
-from compiler.dataflow import attention_trip  # noqa: E402
-from compiler.lowering import attention_body, attention_epilogue  # noqa: E402
-from kernel_entry_point import read_kernel  # noqa: E402
-from layout import flash_register_map  # noqa: E402
+from codegen import FlashLaunch, compile_launch, read_kernel, read_program, signature_of  # noqa: E402
+from codegen.allocation import allocate  # noqa: E402
+from codegen.dataflow import attention_trip  # noqa: E402
+from codegen.layout import flash_register_map  # noqa: E402
+from codegen.lowering import attention_body, attention_epilogue  # noqa: E402
 from sim_gemm import _run_image  # noqa: E402
 
 _TOLERANCE: float = 0.02
@@ -42,7 +40,7 @@ _SPREAD: float = 2.0
 _SEED: int = 0
 """Seed the operands are drawn under, so a failure is reproducible."""
 
-_KERNEL: str = str(_HERE.parent / "sample_flashattention.py") + ":flash_attention_kernel"
+_KERNEL: str = str(_HERE.parent / "tests" / "sample_triton.py") + ":flash_attention_kernel"
 """The kernel the steps are derived from, this check running the image a written kernel compiles to."""
 
 

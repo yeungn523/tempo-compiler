@@ -14,7 +14,6 @@ HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent
 """The board package's directory."""
 
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE / "minitpu_runtime"))
 
 from bf16 import (  # noqa: E402
     _BLOCK_TOKENS,
@@ -25,19 +24,7 @@ from bf16 import (  # noqa: E402
     _single_launch_operands,
     build_operands,
 )
-from asm import AsmBuilder, AsmKernel  # noqa: E402
-from runtime import (  # noqa: E402
-    MemcpyKind,
-    minitpuFree,
-    minitpuGetAddressSpace,
-    minitpuHostAlloc,
-    minitpuHostReset,
-    minitpuLaunchKernel,
-    minitpuMalloc,
-    minitpuMemcpy,
-    minitpuSetDevice,
-)
-from gpt2 import (  # noqa: E402
+from gpt2_inference import (  # noqa: E402
     UIO_NAME,
     KVCache,
     add_bias_resident,
@@ -47,6 +34,7 @@ from gpt2 import (  # noqa: E402
     download_activations,
     embed,
     full_gemm,
+    halt_image,
     layernorm_resident,
     lm_head,
     load_gpt2_weights,
@@ -59,6 +47,17 @@ from gpt2 import (  # noqa: E402
     upload_layernorm_constants,
 )
 from references import layernorm_reference, transformer_block_reference  # noqa: E402
+from runtime import (  # noqa: E402
+    MemcpyKind,
+    minitpuFree,
+    minitpuGetAddressSpace,
+    minitpuHostAlloc,
+    minitpuHostReset,
+    minitpuLaunchKernel,
+    minitpuMalloc,
+    minitpuMemcpy,
+    minitpuSetDevice,
+)
 
 
 _GEMM_ERROR_LIMIT: float = 0.01
@@ -181,7 +180,7 @@ def check_halt() -> str:
         RuntimeError: If the loader flags an error and the command processor abandons the launch.
         TimeoutError: If a command fails to retire, which is how a core that never halts presents.
     """
-    check_kernel_launch(image_bytes=AsmKernel(name="halt", bundles=(AsmBuilder().halt(),)).to_bytes(pad_to=4))
+    check_kernel_launch(image_bytes=halt_image())
     return f"staged and launched {_LAUNCH_REPEATS} times"
 
 

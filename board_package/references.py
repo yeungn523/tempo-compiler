@@ -13,7 +13,6 @@ HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent
 """The board package's directory."""
 
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE / "minitpu_runtime"))
 
 from bf16 import (  # noqa: E402
     _BLOCK_DEPTH,

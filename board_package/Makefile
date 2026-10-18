@@ -27,20 +27,20 @@ help:
 PL_CLK_MHZ ?= 187
 
 minitpu:
-	@$(HERE)minitpu/scripts/quiesce_pl.sh
-	@$(HERE)minitpu/scripts/set_pl_clock.sh $(PL_CLK_MHZ)
-	@$(HERE)minitpu/scripts/program_pl.sh
-	@$(HERE)minitpu/scripts/provision.sh
+	@$(HERE)fpga/scripts/quiesce_pl.sh
+	@$(HERE)fpga/scripts/set_pl_clock.sh $(PL_CLK_MHZ)
+	@$(HERE)fpga/scripts/program_pl.sh
+	@$(HERE)fpga/scripts/provision.sh
 
 provision:
-	@$(HERE)minitpu/scripts/provision.sh
+	@$(HERE)fpga/scripts/provision.sh
 
 check:
-	@$(PYTHON) $(HERE)minitpu/scripts/check_package.py
+	@$(PYTHON) $(HERE)fpga/scripts/check_package.py
 	@$(PYTHON) -m unittest discover -s $(HERE)tests -q
 
 identity:
-	@$(PYTHON) $(HERE)minitpu/scripts/read_build_id.py
+	@$(PYTHON) $(HERE)fpga/scripts/read_build_id.py
 
 kernels:
 	@$(PYTHON) $(HERE)board_checks.py
@@ -50,4 +50,4 @@ PROMPT ?= The capital of France is
 TOKENS ?= 8
 
 generate:
-	@$(PYTHON) $(HERE)gpt2.py --prompt "$(PROMPT)" --tokens $(TOKENS)
+	@$(PYTHON) $(HERE)gpt2_inference.py --prompt "$(PROMPT)" --tokens $(TOKENS)

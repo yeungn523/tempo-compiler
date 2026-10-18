@@ -14,15 +14,15 @@ into a launch, and emits the 128-bit VLIW bundles the board fetches. The board c
 built on a host and run there from `board_package/`, which holds the assembler, the runtime, and the layer drivers.
 
 The NPU's RTL lives in a separate repository. This repository ships its synthesized design as the bitstream
-`board_package/minitpu/minitpu_zcu104.bit.bin`, which `sudo make minitpu` loads onto the board, so running on the
+`board_package/fpga/minitpu_zcu104.bit.bin`, which `sudo make minitpu` loads onto the board, so running on the
 board needs no RTL checkout. Only the simulation tools read the RTL itself.
 
 ## Features
 
 - Compiles every launch of a GPT-2 small layer: the four projections, the bias and residual adds, both LayerNorms,
   and causal flash attention covering every head and token block in one launch.
-- Compiles decode attention over a KV cache that fills on the device, one image per 32-key bucket up to 1024 keys.
-- Derives every placement constant from `compiler/minitpuisa.td`, the implemented scheduling contract.
+- Compiles decode attention over a KV cache that fills on the device, with images for 64, 256 and 1024 keys.
+- Derives every placement constant from `codegen/minitpuisa.td`, the implemented scheduling contract.
 - Checks each image against the RTL in simulation and against a host reference on the board.
 - Apache 2.0 License.
 
@@ -52,7 +52,7 @@ ___
 
 ## Installation
 
-The repository runs from a checkout. Every tool extends `sys.path` to reach `compiler/` and `board_package/` itself, so
+The repository runs from a checkout. Every tool extends `sys.path` to reach `codegen/` and `board_package/` itself, so
 each one runs from the repository root once Triton is installed.
 
 ___
@@ -80,13 +80,15 @@ without it runs at 99.999 MHz, where every check still passes and every launch i
 | `tools/sim_layernorm.py`          | The compiled LayerNorm against the hand-written image it replaced            |
 | `tools/sim_resident_attention.py` | The compiled attention over a sequence, or one decode step with `--decode`   |
 
-Pass `--build-dir` to keep the Verilator build across runs. `kernel_entry_point.py` compiles any Triton kernel in
-`sample_triton.py` into an image and its packed operands for `tools/sim_gemm.py` to run.
+Pass `--build-dir` to keep the Verilator build across runs.
+`tools/sim_gemm.py --kernel tests/sample_triton.py:matmul_kernel` compiles a Triton kernel and runs its image in one
+step.
 
 ### Running the Tests
 
-`python3 -m unittest discover -s board_package/tests -t board_package/tests -q` runs the host tests, which cover the
-assembler, the emitter, and the compiler from a Triton kernel through to the image its plan emits.
+`python3 -m unittest discover -s tests -t . -q` runs the code generator's tests, which cover the assembler, the
+emitter, and the path from a Triton kernel through to the image its plan emits. `python3 -m unittest discover -s
+board_package/tests -q` runs the board package's own tests, which `make check` also runs on the board.
 
 ___
 

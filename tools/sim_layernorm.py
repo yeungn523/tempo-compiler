@@ -17,8 +17,6 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent))
 sys.path.insert(0, str(_HERE.parent / "board_package"))
-sys.path.insert(0, str(_HERE.parent / "board_package" / "minitpu_runtime"))
-sys.path.insert(0, str(_HERE.parent / "board_package" / "tests"))
 
 from bf16 import (  # noqa: E402
     _BLOCK_TOKENS,
@@ -32,7 +30,7 @@ from bf16 import (  # noqa: E402
     pack_activations,
 )
 from build_gpt2_images import _compile_rows  # noqa: E402
-from compiler_tests.hand_images import layernorm_rows  # noqa: E402
+from tests.hand_images import layernorm_rows  # noqa: E402
 from references import layernorm_reference  # noqa: E402
 from sim_gemm import _run_image  # noqa: E402
 

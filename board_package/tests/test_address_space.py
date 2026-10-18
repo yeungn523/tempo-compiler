@@ -15,7 +15,7 @@ import unittest
 _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
 """The root directory of the deployed board package."""
 
-sys.path.insert(0, str(_HERE / "minitpu_runtime"))
+sys.path.insert(0, str(_HERE))
 
 from runtime.address_space import ZCU102_ADDRESS_SPACE, ZCU104_ADDRESS_SPACE  # noqa: E402
 

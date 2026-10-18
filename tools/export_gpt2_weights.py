@@ -145,7 +145,7 @@ def main() -> int:
         Zero once every file is written.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--output", default=str(_HERE / "board_package"),
+    parser.add_argument("--output", default=str(_HERE / "board_package" / "weights"),
                         help="directory the weights and the tokenizer files are written into")
     parser.add_argument("--cache", default=str(pathlib.Path.home() / ".cache" / "minitpu" / "gpt2"),
                         help="directory the downloads are kept in, so a second export downloads nothing")

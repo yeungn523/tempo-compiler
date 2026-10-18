@@ -7,7 +7,7 @@ import pathlib
 import re
 
 _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent
-"""The board package's directory, where the exported vocabulary and merges lie."""
+"""The board package's directory, whose weights directory holds the exported vocabulary and merges."""
 
 _PATTERN: re.Pattern[str] = re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?[^\W\d_]+| ?\d+| ?(?:[^\s\w]|_)+|\s+(?!\S)|\s+""")
 """GPT-2's pre-tokenizer, splitting text into contractions, letter runs, digit runs, symbol runs and whitespace. The
@@ -19,8 +19,9 @@ class Tokenizer:
 
     Args:
         vocabulary: The exported `vocab.json`, mapping each token's byte-level string to its identifier, or None for
-            the one beside this package.
-        merges: The exported `merges.txt`, listing BPE merges by priority, or None for the one beside this package.
+            the one in this package's weights directory.
+        merges: The exported `merges.txt`, listing BPE merges by priority, or None for the one in
+            this package's weights directory.
 
     Attributes:
         _encoder: Identifier of each token's byte-level string.
@@ -32,8 +33,8 @@ class Tokenizer:
     """
 
     def __init__(self, vocabulary: pathlib.Path | None = None, merges: pathlib.Path | None = None) -> None:
-        vocabulary = _HERE / "gpt2_vocab.json" if vocabulary is None else vocabulary
-        merges = _HERE / "gpt2_merges.txt" if merges is None else merges
+        vocabulary = _HERE / "weights" / "gpt2_vocab.json" if vocabulary is None else vocabulary
+        merges = _HERE / "weights" / "gpt2_merges.txt" if merges is None else merges
         for path in (vocabulary, merges):
             if not path.exists():
                 message = (

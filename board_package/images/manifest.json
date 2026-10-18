@@ -82,13 +82,6 @@
     "key_blocks": 4,
     "constants": "attention_64_constants.bin"
   },
-  "decode_attention_32.bin": {
-    "kind": "decode_attention",
-    "keys": 32,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
   "decode_attention_64.bin": {
     "kind": "decode_attention",
     "keys": 64,
@@ -96,205 +89,9 @@
     "entering": -10000.0,
     "stated": []
   },
-  "decode_attention_96.bin": {
-    "kind": "decode_attention",
-    "keys": 96,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_128.bin": {
-    "kind": "decode_attention",
-    "keys": 128,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_160.bin": {
-    "kind": "decode_attention",
-    "keys": 160,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_192.bin": {
-    "kind": "decode_attention",
-    "keys": 192,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_224.bin": {
-    "kind": "decode_attention",
-    "keys": 224,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
   "decode_attention_256.bin": {
     "kind": "decode_attention",
     "keys": 256,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_288.bin": {
-    "kind": "decode_attention",
-    "keys": 288,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_320.bin": {
-    "kind": "decode_attention",
-    "keys": 320,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_352.bin": {
-    "kind": "decode_attention",
-    "keys": 352,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_384.bin": {
-    "kind": "decode_attention",
-    "keys": 384,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_416.bin": {
-    "kind": "decode_attention",
-    "keys": 416,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_448.bin": {
-    "kind": "decode_attention",
-    "keys": 448,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_480.bin": {
-    "kind": "decode_attention",
-    "keys": 480,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_512.bin": {
-    "kind": "decode_attention",
-    "keys": 512,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_544.bin": {
-    "kind": "decode_attention",
-    "keys": 544,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_576.bin": {
-    "kind": "decode_attention",
-    "keys": 576,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_608.bin": {
-    "kind": "decode_attention",
-    "keys": 608,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_640.bin": {
-    "kind": "decode_attention",
-    "keys": 640,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_672.bin": {
-    "kind": "decode_attention",
-    "keys": 672,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_704.bin": {
-    "kind": "decode_attention",
-    "keys": 704,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_736.bin": {
-    "kind": "decode_attention",
-    "keys": 736,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_768.bin": {
-    "kind": "decode_attention",
-    "keys": 768,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_800.bin": {
-    "kind": "decode_attention",
-    "keys": 800,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_832.bin": {
-    "kind": "decode_attention",
-    "keys": 832,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_864.bin": {
-    "kind": "decode_attention",
-    "keys": 864,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_896.bin": {
-    "kind": "decode_attention",
-    "keys": 896,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_928.bin": {
-    "kind": "decode_attention",
-    "keys": 928,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_960.bin": {
-    "kind": "decode_attention",
-    "keys": 960,
-    "heads": 12,
-    "entering": -10000.0,
-    "stated": []
-  },
-  "decode_attention_992.bin": {
-    "kind": "decode_attention",
-    "keys": 992,
     "heads": 12,
     "entering": -10000.0,
     "stated": []
@@ -315,5 +112,8 @@
     "kind": "copy",
     "rows": 96,
     "stride": 1024
+  },
+  "halt.bin": {
+    "kind": "halt"
   }
 }

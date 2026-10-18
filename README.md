@@ -46,7 +46,7 @@ ___
   (see `mlir/README.md`).
 - A checkout of the separate RTL repository, named by `minitpu_rtl`, for the simulation tools alone. The tools fall
   back to a sibling directory named `minitpu-tmp` when the variable is unset.
-- [LLVM](https://llvm.org/) 17 through 20, supplying the `llvm-tblgen` that `tools/gen_isa_doc.py` reads the ISA
+- [LLVM](https://llvm.org/) 17 through 20, supplying the `llvm-tblgen` that `tools/toolchain/gen_isa_doc.py` reads the ISA
   source through.
 - A ZCU104 running PetaLinux, for everything under `board_package/` that launches.
 
@@ -63,7 +63,7 @@ ___
 
 ### Running on the Board
 
-Hold a session open on the board, then run `tools/prepare_board.sh <account> <board-id>` on the host. The script
+Hold a session open on the board, then run `tools/board/prepare_board.sh <account> <board-id>` on the host. The script
 downloads GPT-2 small's weights and tokenizer, compiles every image the layers launch, and deploys them with the board
 package. The board erases the home directory whenever no session holds it, so run the script after every login.
 
@@ -78,12 +78,12 @@ without it runs at 99.999 MHz, where every check still passes and every launch i
 
 | Tool                              | Checks                                                                       |
 |-----------------------------------|------------------------------------------------------------------------------|
-| `tools/sim_gemm.py`               | An emitted GEMM image against a float64 reference                            |
-| `tools/sim_layernorm.py`          | The compiled LayerNorm against the hand-written image it replaced            |
-| `tools/sim_resident_attention.py` | The compiled attention over a sequence, or one decode step with `--decode`   |
+| `tools/simulations/sim_gemm.py`               | An emitted GEMM image against a float64 reference                            |
+| `tools/simulations/sim_layernorm.py`          | The compiled LayerNorm against the hand-written image it replaced            |
+| `tools/simulations/sim_resident_attention.py` | The compiled attention over a sequence, or one decode step with `--decode`   |
 
 Pass `--build-dir` to keep the Verilator build across runs.
-`tools/sim_gemm.py --kernel tests/sample_triton.py:matmul_kernel` compiles a Triton kernel and runs its image in one
+`tools/simulations/sim_gemm.py --kernel tests/sample_triton.py:matmul_kernel` compiles a Triton kernel and runs its image in one
 step.
 
 ### Running the Tests

@@ -38,7 +38,7 @@ class Tokenizer:
         for path in (vocabulary, merges):
             if not path.exists():
                 message = (
-                    f"Unable to read GPT-2's tokenizer from {path}. Run tools/export_gpt2_weights.py on a host, which "
+                    f"Unable to read GPT-2's tokenizer from {path}. Run tools/board/export_gpt2_weights.py on a host, which "
                     f"writes it there, and deploy the package again."
                 )
                 raise FileNotFoundError(message)

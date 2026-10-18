@@ -1,7 +1,7 @@
 # The MLIR pipeline: Triton's tt dialect in, MiniTPU images out.
 #
 # Builds against the LLVM Triton pins and compiles Triton's tt dialect from that release's source, so minitpu-opt parses
-# exactly what the Triton wheel prints. pyproject.toml's [tool.minitpu.toolchain] pins both, tools/setup_toolchain.py
+# exactly what the Triton wheel prints. pyproject.toml's [tool.minitpu.toolchain] pins both, tools/toolchain/setup_toolchain.py
 # fetches them, and configuring refuses an LLVM built from any other commit.
 cmake_minimum_required(VERSION 3.20)
 project(minitpu-mlir LANGUAGES CXX C)
@@ -28,7 +28,7 @@ string(REGEX REPLACE "^v" "" _triton_version "${MINITPU_TRITON_TAG}")
 
 set(TRITON_SOURCE_DIR "$ENV{HOME}/toolchains/triton-${_triton_version}" CACHE PATH "Triton source at the pinned tag")
 if(NOT EXISTS "${TRITON_SOURCE_DIR}/include/triton/Dialect/Triton/IR/TritonOps.td")
-  message(FATAL_ERROR "TRITON_SOURCE_DIR (${TRITON_SOURCE_DIR}) holds no Triton source. Run tools/setup_toolchain.py.")
+  message(FATAL_ERROR "TRITON_SOURCE_DIR (${TRITON_SOURCE_DIR}) holds no Triton source. Run tools/toolchain/setup_toolchain.py.")
 endif()
 
 find_package(MLIR REQUIRED CONFIG)
@@ -38,7 +38,7 @@ message(STATUS "Using MLIR from ${MLIR_DIR} (LLVM ${LLVM_PACKAGE_VERSION})")
 file(STRINGS "${LLVM_INCLUDE_DIRS}/llvm/Support/VCSRevision.h" _llvm_revision REGEX "LLVM_REVISION")
 if(NOT _llvm_revision MATCHES "${MINITPU_LLVM_COMMIT}")
   message(FATAL_ERROR "The LLVM at ${LLVM_DIR} records '${_llvm_revision}', but pyproject.toml pins "
-                      "${MINITPU_LLVM_COMMIT}. Run tools/setup_toolchain.py and configure with the LLVM it names.")
+                      "${MINITPU_LLVM_COMMIT}. Run tools/toolchain/setup_toolchain.py and configure with the LLVM it names.")
 endif()
 
 list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}" "${LLVM_CMAKE_DIR}")

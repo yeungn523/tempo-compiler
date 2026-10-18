@@ -16,12 +16,12 @@ import sys
 import tempfile
 from dataclasses import dataclass
 
-_HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent.parent
+_HERE: pathlib.Path = pathlib.Path(__file__).resolve().parents[2]
 """Stores the path to the repository's root directory."""
 
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE / "board_package"))
-sys.path.insert(0, str(_HERE / "tools"))
+sys.path.insert(0, str(_HERE / "tools" / "board"))
 
 from codegen import asm  # noqa: E402
 

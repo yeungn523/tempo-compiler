@@ -20,7 +20,7 @@ import tempfile
 import tomllib
 import urllib.request
 
-_HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent.parent
+_HERE: pathlib.Path = pathlib.Path(__file__).resolve().parents[2]
 """Stores the path to the repository's root directory."""
 
 _LLVM_BUILDS: str = "https://oaitriton.blob.core.windows.net/public/llvm-builds"

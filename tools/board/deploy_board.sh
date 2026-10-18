@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deploy the board package and program the PL, with the copies gated on md5.
 #
-#   tools/deploy_board.sh <account> <board-id> [--program]
+#   tools/board/deploy_board.sh <account> <board-id> [--program]
 #
 # The account is the caller's own login on the board, which the board authorises
 # a key for. It is not baked in, because each board carries its own accounts.
@@ -11,7 +11,7 @@
 # already there. Nothing is trusted to have arrived until its digest matches.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ACCOUNT="${1:?usage: deploy_board.sh <account> <board-id> [--program]}"
 IP="132.236.59.${2:?usage: deploy_board.sh <account> <board-id> [--program]}"
 PROGRAM="${3:-}"
@@ -43,10 +43,10 @@ while IFS= read -r f; do FILES+=("$f"); done < <(files_in '*' board_package/fpga
 FILES+=("board_package/fpga/overlay.dtso" "board_package/fpga/u-dma-buf.ko")
 
 # The compiled images the layer drivers launch. The board carries no
-# compiler, so tools/build_gpt2_images.py writes them here and they travel as data.
+# compiler, so tools/board/build_gpt2_images.py writes them here and they travel as data.
 while IFS= read -r f; do FILES+=("$f"); done < <(files_in '*' board_package/images)
 
-# GPT-2's weights and tokenizer, which tools/export_gpt2_weights.py writes into weights/
+# GPT-2's weights and tokenizer, which tools/board/export_gpt2_weights.py writes into weights/
 # on a host. A board that never ran the export carries none.
 for f in board_package/weights/gpt2_weights.npz board_package/weights/gpt2_vocab.json board_package/weights/gpt2_merges.txt; do
   [ -f "$HERE/$f" ] && FILES+=("$f")

@@ -32,6 +32,24 @@ namespace mlir::minitpu::isa
         int64_t last             = 0;  ///< The last cycle the write port is held.
     };
 
+    /// Stores the address fields of one vld or vst, which the scheduler resolves to rows against the enclosing loops.
+    struct VmemAccess
+    {
+        uint32_t row   = 0;      ///< The static row.
+        bool agu       = false;  ///< Determines whether a loop's induction variable is added to the row.
+        uint32_t level = 0;      ///< The loop whose induction variable is added, 0 being the outermost.
+        uint32_t shift = 0;      ///< The left shift applied to that induction variable.
+        uint32_t mask  = 0;      ///< The sublanes taking part, sublane i touching the row plus i.
+    };
+
+    /// Stores the bounds of a hardware loop, whose induction variable runs from low by step while below high.
+    struct LoopBounds
+    {
+        uint32_t low  = 0;  ///< The induction variable's first value.
+        uint32_t high = 0;  ///< The bound it stops at.
+        uint32_t step = 1;  ///< The amount it advances by.
+    };
+
     /// Stores what one bundle reads, writes and occupies, which is everything the timeline prices it by.
     struct BundleTraffic
     {
@@ -44,12 +62,18 @@ namespace mlir::minitpu::isa
         uint32_t port_a_readers = 0;      ///< The instructions claiming port A on the bundle's own issue cycle.
         bool accesses_vmem      = false;  ///< Determines whether the bundle holds the VMEM compute port.
         const schedule::MatrixCommandFacts* matrix = nullptr;  ///< The matrix command issued, or nullptr.
-        bool pushes_results = false;       ///< Determines whether the matrix command produces results.
-        bool drains_results = false;       ///< Determines whether the matrix command drains results.
-        std::optional<uint32_t> dma_slot;  ///< The DMA slot the descriptor issues on.
-        uint32_t flush_mask = 0;           ///< The DMA slots the bundle waits on, one bit each.
-        bool stores_vmem    = false;       ///< Determines whether the bundle's VMEM access writes VMEM.
-        uint32_t slots      = 0;           ///< The slots the bundle occupies, one bit per kSlot.
+        bool pushes_results = false;             ///< Determines whether the matrix command produces results.
+        bool drains_results = false;             ///< Determines whether the matrix command drains results.
+        std::optional<uint32_t> dma_slot;        ///< The DMA slot the descriptor issues on.
+        uint32_t flush_mask = 0;                 ///< The DMA slots the bundle waits on, one bit each.
+        bool stores_vmem    = false;             ///< Determines whether the bundle's VMEM access writes VMEM.
+        uint32_t slots      = 0;                 ///< The slots the bundle occupies, one bit per kSlot.
+        std::optional<VmemAccess> vmem_written;  ///< The access of a vst, which writes VMEM rows.
+        std::optional<VmemAccess> vmem_read;     ///< The access of a vld, which reads VMEM rows.
+        std::optional<LoopBounds> opens_loop;    ///< The bounds of the loop an lbegin opens.
+        bool closes_loop      = false;           ///< Determines whether the bundle issues loop_end.
+        bool stages_transpose = false;           ///< Determines whether the bundle issues a vtxin.
+        bool drains_transpose = false;           ///< Determines whether the bundle issues a vtxout.
     };
 
     /// Returns what one bundle reads, writes and occupies, or failure for an instruction the records do not name.

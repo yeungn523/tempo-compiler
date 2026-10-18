@@ -12,7 +12,7 @@ import argparse
 import pathlib
 import sys
 
-_HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent.parent
+_HERE: pathlib.Path = pathlib.Path(__file__).resolve().parents[2]
 """Stores the path to the repository's root directory."""
 
 sys.path.insert(0, str(_HERE))
@@ -39,7 +39,7 @@ _KERNELS: tuple[tuple[str, JITFunction, dict[str, int]], ...] = (
     ("decode_attention_256", gpt2_decode_attention, {"N": 256, "LENGTH": 256}),
 )
 """Name each module is written under, the kernel, and the constexprs the layer binds past the kernel's defaults,
-matching tools/build_gpt2_images.py."""
+matching tools/board/build_gpt2_images.py."""
 
 
 def main() -> int:

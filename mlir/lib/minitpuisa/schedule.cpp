@@ -36,6 +36,51 @@ namespace
     /// Stores the passes the scheduler makes before it refuses a stream whose fillers never settle.
     constexpr uint32_t kMaxPasses = 256;
 
+    /// Stores the inclusive range of VMEM rows one access may touch over every iteration of its loops.
+    struct RowRange
+    {
+        int64_t first = 0;  ///< The lowest row.
+        int64_t last  = 0;  ///< The highest row.
+    };
+
+    /// Stores one vst still inside its turnaround, which a later vld reading its rows waits out.
+    struct RecentStore
+    {
+        int64_t issue = 0;  ///< The cycle the vst issued at.
+        RowRange rows;      ///< The rows it may have written.
+    };
+
+    /**
+     * @brief Returns the rows an access may touch, its induction term ranging over every value the loop at its level
+     * takes.
+     *
+     * @param access the access's address fields.
+     * @param loops the loops enclosing the access, outermost first.
+     * @returns the range, which spans every row when the access names a loop no lbegin encloses it in.
+     */
+    RowRange RowsOf(const VmemAccess& access, const llvm::ArrayRef<LoopBounds> loops)
+    {
+        int64_t lowest_sublane  = -1;
+        int64_t highest_sublane = -1;
+        for (uint32_t sublane = 0; sublane <= kXMask.Mask(); ++sublane)
+        {
+            if (((access.mask >> sublane) & 1) == 0) continue;
+            if (lowest_sublane < 0) lowest_sublane = sublane;
+            highest_sublane = sublane;
+        }
+        RowRange rows {.first = access.row + lowest_sublane, .last = access.row + highest_sublane};
+        if (!access.agu) return rows;
+        if (access.level >= loops.size()) return {.first = INT64_MIN, .last = INT64_MAX};
+
+        // Spans the induction variable from its first value to the last one below the bound.
+        const LoopBounds& loop = loops[access.level];
+        const int64_t step     = std::max<int64_t>(loop.step, 1);
+        const int64_t last     = loop.high > loop.low ? loop.low + (loop.high - 1 - loop.low) / step * step : loop.low;
+        rows.first += int64_t {loop.low} << access.shift;
+        rows.last += last << access.shift;
+        return rows;
+    }
+
     /// Stores one bundle of the stream being scheduled, or a filler the scheduler inserted.
     struct StreamEntry
     {
@@ -149,6 +194,10 @@ namespace
             std::array<int64_t, kVectorRegisterCount> vector_ready {};
             std::array<int64_t, kScalarRegisterCount> scalar_ready {};
             std::array<int64_t, kVectorRegisterCount> streamed_until {};
+            std::vector<RecentStore> recent_stores;
+            llvm::SmallVector<LoopBounds, 4> loops;
+            std::optional<int64_t> last_stage;
+            std::optional<int64_t> last_drain;
             llvm::DenseSet<int64_t> write_port;
             std::deque<int64_t> results_ready;
             int64_t matrix_free = 0;
@@ -194,6 +243,28 @@ namespace
                     while (port_taken(issue)) ++issue;
                 }
 
+                // Holds what the register model does not reach: VMEM rows a vst wrote, and the transpose staging array.
+                if (traffic.vmem_read)
+                {
+                    const RowRange read = RowsOf(*traffic.vmem_read, loops);
+                    for (const RecentStore& store : recent_stores)
+                    {
+                        if (store.rows.first <= read.last && read.first <= store.rows.last)
+                        {
+                            issue = std::max(issue, store.issue + schedule::kVmemTurnaroundCycles);
+                        }
+                    }
+                }
+                if (traffic.stages_transpose && last_stage)
+                {
+                    issue = std::max(issue, *last_stage + schedule::kTransposeInIntervalCycles);
+                }
+                if (traffic.drains_transpose)
+                {
+                    if (last_stage) issue = std::max(issue, *last_stage + schedule::kTransposeInToOutCycles);
+                    if (last_drain) issue = std::max(issue, *last_drain + schedule::kTransposeOutIntervalCycles);
+                }
+
                 if (index > 0 && issue - previous - 1 > kMaxDelay)
                 {
                     insertion = {index, CountFillers(issue - previous - 1)};
@@ -231,6 +302,14 @@ namespace
                     }
                 }
                 for (const uint32_t scalar : traffic.scalar_writes) scalar_ready[scalar] = issue + kScalarWriteback + 1;
+                if (traffic.vmem_written) recent_stores.push_back({issue, RowsOf(*traffic.vmem_written, loops)});
+                if (traffic.opens_loop) loops.push_back(*traffic.opens_loop);
+                if (traffic.closes_loop && !loops.empty()) loops.pop_back();
+                if (traffic.stages_transpose) last_stage = issue;
+                if (traffic.drains_transpose) last_drain = issue;
+                llvm::erase_if(recent_stores, [&](const RecentStore& store) {
+                    return store.issue + schedule::kVmemTurnaroundCycles <= issue;
+                });
                 if (index > 0)
                 {
                     uint32_t& delay = stream[index - 1].delay;

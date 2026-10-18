@@ -4,8 +4,9 @@
  * @brief Provides minitpu-tblgen, the TableGen driver carrying the MiniTPU's own backends over codegen/minitpuisa.td.
  *
  * -gen-minitpu-sched writes the scheduling facts every pass prices bundles against: each mnemonic's slot, opcode,
- * writeback window, register roles and read-port claim, each matrix command's occupancy and result latency, and every
- * hardware capacity. The output is a self-contained header, so a fact moves in codegen/minitpuisa.td alone.
+ * writeback window, register roles and read-port claim, each matrix command's occupancy and result latency, every
+ * hardware capacity, and every issue distance no register dependence carries. The output is a self-contained header, so
+ * a fact moves in codegen/minitpuisa.td alone.
  */
 
 #include <llvm/ADT/StringExtras.h>
@@ -159,6 +160,17 @@ namespace
         }
     }
 
+    /// Writes one constant per issue distance the schedule keeps, named after the rule.
+    void EmitSpacingRules(const Record& order, raw_ostream& output)
+    {
+        for (const Record* rule : order.getValueAsListOfDefs("spacing_rules"))
+        {
+            output << "    /// Stores " << rule->getValueAsString("name") << ", in cycles between two issues.\n"
+                   << "    static constexpr int32_t k" << CamelCase(rule->getValueAsString("name"))
+                   << "Cycles = " << rule->getValueAsInt("cycles") << ";\n\n";
+        }
+    }
+
     /// Writes the lookups every consumer reaches the tables through.
     void EmitLookups(raw_ostream& output)
     {
@@ -186,11 +198,12 @@ namespace
         EmitOperations(order, output);
         EmitMatrixCommands(order, output);
         EmitResources(order, output);
+        EmitSpacingRules(order, output);
         EmitLookups(output);
         output << "}  // namespace mlir::minitpu::isa::schedule\n";
     }
 
-    /// Registers -dump-json, LLVM's own record dump, which tools/gen_isa_doc.py renders its artifacts from.
+    /// Registers -dump-json, LLVM's own record dump, which tools/toolchain/gen_isa_doc.py renders its artifacts from.
     const llvm::TableGen::Emitter::Opt
         kJsonEmitter("dump-json", llvm::EmitJSON, "Dump all records as machine-readable JSON");
 

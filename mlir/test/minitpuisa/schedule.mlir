@@ -58,3 +58,51 @@ minitpuisa.program @write_under_a_stream {
   minitpuisa.bundle { minitpuisa.vld v4, row 0 }
   minitpuisa.bundle { minitpuisa.halt }
 }
+
+// -----
+
+// A vld reading rows a vst wrote issues 9 cycles after the vst, the VMEM turnaround, while one reading other rows
+// issues at once. A row a loop walks covers every value its induction variable takes, so a store across rows 64
+// through 115 holds a load of row 100.
+
+// CHECK-LABEL: minitpuisa.program @vmem_turnaround
+minitpuisa.program @vmem_turnaround {
+  // CHECK: minitpuisa.bundle delay 8 {
+  // CHECK-NEXT: minitpuisa.vst v1, row 0
+  minitpuisa.bundle { minitpuisa.vst v1, row 0 }
+  // CHECK: minitpuisa.bundle {
+  // CHECK-NEXT: minitpuisa.vld v2, row 0
+  minitpuisa.bundle { minitpuisa.vld v2, row 0 }
+  // CHECK: minitpuisa.bundle {
+  // CHECK-NEXT: minitpuisa.vst v3, row 0
+  minitpuisa.bundle { minitpuisa.vst v3, row 0 }
+  // CHECK: minitpuisa.bundle {
+  // CHECK-NEXT: minitpuisa.vld v4, row 8
+  minitpuisa.bundle { minitpuisa.vld v4, row 8 }
+  minitpuisa.bundle { minitpuisa.lbegin 4 }
+  // CHECK: minitpuisa.bundle delay 8 {
+  // CHECK-NEXT: minitpuisa.vst v5, row 64 agu shift 4
+  minitpuisa.bundle { minitpuisa.vst v5, row 64 agu shift 4 }
+  minitpuisa.bundle { minitpuisa.vld v6, row 100 }
+  minitpuisa.bundle { minitpuisa.loop_end }
+  minitpuisa.bundle { minitpuisa.halt }
+}
+
+// -----
+
+// The transpose array is staged 2 cycles apart, drained 6 cycles after the last stage, and drained 6 cycles apart.
+
+// CHECK-LABEL: minitpuisa.program @transpose
+minitpuisa.program @transpose {
+  // CHECK: minitpuisa.bundle delay 1 {
+  // CHECK-NEXT: minitpuisa.vtxin v1, quarter 0
+  // CHECK: minitpuisa.bundle delay 5 {
+  // CHECK-NEXT: minitpuisa.vtxin v2, quarter 1
+  // CHECK: minitpuisa.bundle delay 5 {
+  // CHECK-NEXT: minitpuisa.vtxout v3, quarter 0
+  minitpuisa.bundle { minitpuisa.vtxin v1, quarter 0 }
+  minitpuisa.bundle { minitpuisa.vtxin v2, quarter 1 }
+  minitpuisa.bundle { minitpuisa.vtxout v3, quarter 0 }
+  minitpuisa.bundle { minitpuisa.vtxout v4, quarter 1 }
+  minitpuisa.bundle { minitpuisa.halt }
+}

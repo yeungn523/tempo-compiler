@@ -14,6 +14,19 @@ namespace
     /// Stores the base a register role's offset range is written in, as in reg_idx+0..3.
     constexpr uint32_t kRoleRadix = 10;
 
+    /// Returns the address fields of a vld or vst.
+    template <typename AccessOp>
+    VmemAccess AccessOf(AccessOp access)
+    {
+        return {
+            .row   = access.getRow(),
+            .agu   = access.getAgu(),
+            .level = access.getLevel(),
+            .shift = access.getShift(),
+            .mask  = access.getMask(),
+        };
+    }
+
     /// Returns the value of the operand `role` names, or 0 where the instruction carries no such operand.
     uint32_t ReadOperand(Operation& operation, const llvm::StringRef role)
     {
@@ -88,6 +101,8 @@ FailureOr<BundleTraffic> mlir::minitpu::isa::CollectTraffic(BundleOp bundle)
                 }
                 traffic.claims_port_a = true;
                 ++traffic.port_a_readers;
+                traffic.stages_transpose = llvm::isa<VtxinOp>(operation);
+                traffic.drains_transpose = llvm::isa<VtxoutOp>(operation);
                 if (facts->writeback_first >= 0)
                 {
                     traffic.vector_writes.push_back(
@@ -112,6 +127,8 @@ FailureOr<BundleTraffic> mlir::minitpu::isa::CollectTraffic(BundleOp bundle)
                 {
                     traffic.accesses_vmem = true;
                     traffic.stores_vmem   = facts->register_write.empty();
+                    if (auto load = dyn_cast<VldOp>(operation)) traffic.vmem_read = AccessOf(load);
+                    if (auto store = dyn_cast<VstOp>(operation)) traffic.vmem_written = AccessOf(store);
                     if (facts->claims_read_port_a) ++traffic.port_a_readers;
                     break;
                 }
@@ -128,6 +145,11 @@ FailureOr<BundleTraffic> mlir::minitpu::isa::CollectTraffic(BundleOp bundle)
                 break;
             case kSlot::kF:
                 if (auto flush = dyn_cast<FlushSlotOp>(operation)) traffic.flush_mask = flush.getMask();
+                if (auto loop = dyn_cast<LbeginOp>(operation))
+                {
+                    traffic.opens_loop = LoopBounds {.low = loop.getLo(), .high = loop.getHi(), .step = loop.getStep()};
+                }
+                traffic.closes_loop = traffic.closes_loop || llvm::isa<LoopEndOp>(operation);
                 break;
             case kSlot::kD:
                 traffic.is_dma   = true;

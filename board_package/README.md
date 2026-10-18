@@ -13,14 +13,14 @@ make generate        # continue a prompt with GPT-2 small
 ```
 
 A board erases the home directory whenever no session holds it, so after every
-login run `tools/prepare_board.sh <account> <board-id>` on the host with a session held
+login run `tools/board/prepare_board.sh <account> <board-id>` on the host with a session held
 open on the board. It exports GPT-2's weights and tokenizer, builds every image
 and deploys them with this package.
 
 **Run `sudo make minitpu` from THIS package, not a copy already on the board.**
 The clock is set by this Makefile's `minitpu` target and a board that programs
 the PL without it runs the fabric at 99.999 MHz — where every check still
-passes and every time is about 1.8x too slow. `tools/deploy_board.sh` ships the
+passes and every time is about 1.8x too slow. `tools/board/deploy_board.sh` ships the
 Makefile under its md5 gate for exactly that reason.
 
 `sudo make minitpu` is needed after boot or whenever the PL is replaced. It
@@ -82,7 +82,7 @@ while the final LayerNorm runs on the NPU through the compiled LayerNorm image.
 prompt's continuation.
 
 The compiled attention image fixes its sequence length when it is built, so the
-transformer block runs only at the lengths `tools/build_gpt2_images.py` lists,
+transformer block runs only at the lengths `tools/board/build_gpt2_images.py` lists,
 currently 64 tokens.
 
 ## Files
@@ -95,8 +95,8 @@ currently 64 tokens.
 | `tokenizer.py` | GPT-2's byte-level BPE, reading the exported vocabulary and merges. |
 | `bf16.py` | Device geometry, BF16 packing, operand layouts. Touches no device, so it can be checked by inspection. |
 | `runtime/` | Board runtime: UIO, udmabuf, COPY, LAUNCH, and the hardware ABI they speak. |
-| `images/` | The compiled images and the manifest describing them, written by `tools/build_gpt2_images.py`. |
-| `weights/` | GPT-2's weights and tokenizer, written by `tools/export_gpt2_weights.py`. Not tracked. |
+| `images/` | The compiled images and the manifest describing them, written by `tools/board/build_gpt2_images.py`. |
+| `weights/` | GPT-2's weights and tokenizer, written by `tools/board/export_gpt2_weights.py`. Not tracked. |
 | `fpga/` | Bitstream, device-tree overlay, u-dma-buf module, PL bring-up scripts. |
 | `tests/` | Host tests of the runtime, the drain, the operand rule and the tokenizer. `make check` runs them. |
 

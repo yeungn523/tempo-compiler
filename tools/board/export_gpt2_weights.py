@@ -16,7 +16,7 @@ import urllib.request
 import numpy as np
 from numpy.typing import NDArray
 
-_HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent.parent
+_HERE: pathlib.Path = pathlib.Path(__file__).resolve().parents[2]
 """The repository's root directory."""
 
 sys.path.insert(0, str(_HERE / "board_package"))

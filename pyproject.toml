@@ -18,7 +18,7 @@ mlir = [
     "clang-tidy==18.1.8",
 ]
 
-# Pins the C++ toolchain mlir/ builds against, which no Python package carries. tools/setup_toolchain.py fetches and
+# Pins the C++ toolchain mlir/ builds against, which no Python package carries. tools/toolchain/setup_toolchain.py fetches and
 # verifies it, and mlir/CMakeLists.txt refuses an LLVM built from any other commit.
 [tool.minitpu.toolchain]
 triton-tag = "v3.8.0"                                      # Must name the release the compiler group pins

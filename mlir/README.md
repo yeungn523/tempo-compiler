@@ -12,12 +12,12 @@ that release pins (commit `5f07f818`), which Triton publishes prebuilt and no Py
 
 ```sh
 pip install --group compiler --group mlir      # Triton, numpy, lit, clang-format, clang-tidy
-python3 tools/setup_toolchain.py               # fetches and verifies the Triton source and LLVM, prints the cmake line
+python3 tools/toolchain/setup_toolchain.py               # fetches and verifies the Triton source and LLVM, prints the cmake line
 <the cmake line it prints>
 ninja -C mlir/build check-minitpu
 ```
 
-`tools/setup_toolchain.py` checksums the LLVM package, checks the revision it records, and checks that the pinned commit
+`tools/toolchain/setup_toolchain.py` checksums the LLVM package, checks the revision it records, and checks that the pinned commit
 is the one Triton's own `cmake/llvm-info.json` names. Configuring refuses an LLVM built from any other commit, so the
 pin changes in `pyproject.toml` alone.
 
@@ -36,5 +36,5 @@ C++ is formatted by `.clang-format` and linted by `.clang-tidy`, both in this di
 | `tools/minitpu-tblgen/`       | The TableGen driver whose `-gen-minitpu-sched` writes the scheduling facts from `codegen/minitpuisa.td` |
 | `tools/minitpu-translate/`    | `--import-minitpu-image` reads a `.bin` into minitpuisa, `--export-minitpu-image` writes it back |
 | `test/`                       | lit/FileCheck tests, one pass per file, including a byte-for-byte round trip of every board image |
-| `test/Inputs/`                | Every GPT-2 small kernel's tt module, written by `tools/dump_gpt2_ttir.py`          |
-| `test/Inputs/schedule/`       | The streams `asm.py` scheduled for every GPT-2 image, written by `tools/dump_schedule_streams.py` |
+| `test/Inputs/`                | Every GPT-2 small kernel's tt module, written by `tools/dumps/dump_gpt2_ttir.py`          |
+| `test/Inputs/schedule/`       | The streams `asm.py` scheduled for every GPT-2 image, written by `tools/dumps/dump_schedule_streams.py` |

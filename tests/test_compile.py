@@ -14,7 +14,7 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
 """The repository's root directory."""
 
 sys.path.insert(0, str(_HERE))
-sys.path.insert(0, str(_HERE / "tools"))
+sys.path.insert(0, str(_HERE / "tools" / "board"))
 sys.path.insert(0, str(_HERE / "board_package"))
 
 import triton  # noqa: E402

@@ -21,8 +21,8 @@ from numpy.typing import NDArray
 _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent
 """The repository's tools directory."""
 
-sys.path.insert(0, str(_HERE.parent))
-sys.path.insert(0, str(_HERE.parent / "board_package"))
+sys.path.insert(0, str(_HERE.parents[1]))
+sys.path.insert(0, str(_HERE.parents[1] / "board_package"))
 
 from bf16 import (_BLOCK_DEPTH, _BLOCK_TOKENS, _BLOCK_WEIGHT_BYTES, _ELEMENT_BYTES, _TILE,  # noqa: E402
                   _ZERO_TILE_WORDS, build_operands, from_bf16_words, pack_activations, pack_weights,
@@ -36,7 +36,7 @@ from codegen.ir import Launch  # noqa: E402
 _TOLERANCE: float = 0.02
 """Relative error the BF16 accumulate chain is allowed, which the board check also holds to."""
 
-_DEFAULT_RTL: pathlib.Path = _HERE.parent.parent / "minitpu-tmp"
+_DEFAULT_RTL: pathlib.Path = _HERE.parents[2] / "minitpu-tmp"
 """Checkout `minitpu_rtl` falls back to, being a sibling of this repository."""
 
 _PASS_MARKER: str = "=== TB_KERNEL_IMAGE PASS ==="
@@ -105,7 +105,7 @@ def compile_kernel(specification: str, *, left: NDArray[np.float32] | None = Non
     if len(planned.launches) != 1 or isinstance(planned.launches[0], FlashLaunch):
         message = (
             f"Unable to simulate {specification}, which plans {len(planned.launches)} launches. This check runs one "
-            f"GEMM launch, and tools/sim_flashattention.py checks an attention block."
+            f"GEMM launch, and tools/simulations/sim_flashattention.py checks an attention block."
         )
         raise ProgramError(message)
     if planned.repack:

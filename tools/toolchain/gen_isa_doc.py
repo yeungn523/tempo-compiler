@@ -21,7 +21,7 @@ import subprocess
 import sys
 from typing import Any
 
-_REPO: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
+_REPO: pathlib.Path = pathlib.Path(__file__).resolve().parents[2]
 """Stores the path to the repository root."""
 
 _SOURCE: pathlib.Path = _REPO / "codegen" / "minitpuisa.td"
@@ -39,13 +39,13 @@ _MODEL: pathlib.Path = _REPO / "codegen" / "isa_model.py"
 _ASSEMBLER: pathlib.Path = _REPO / "codegen" / "asm.py"
 """Stores the path to the assembler whose hand-written scheduling constants are checked against the source."""
 
-_BEGIN: str = "<!-- BEGIN GENERATED: tools/gen_isa_doc.py -->"
+_BEGIN: str = "<!-- BEGIN GENERATED: tools/toolchain/gen_isa_doc.py -->"
 """Stores the marker opening the generated region of the markdown page."""
 
 _END: str = "<!-- END GENERATED -->"
 """Stores the marker closing the generated region of the markdown page."""
 
-_HEADER: str = "Run `python3 tools/gen_isa_doc.py --write` to generate."
+_HEADER: str = "Run `python3 tools/toolchain/gen_isa_doc.py --write` to generate."
 """Stores the line the generated SystemVerilog package and Python module open with."""
 
 _COLUMNS: tuple[str, ...] = (
@@ -490,7 +490,7 @@ def main() -> int:
     if stale:
         for path in stale:
             print(f"STALE: {path} does not match {_SOURCE.relative_to(_REPO)}", file=sys.stderr)
-        print("run: python3 tools/gen_isa_doc.py --write", file=sys.stderr)
+        print("run: python3 tools/toolchain/gen_isa_doc.py --write", file=sys.stderr)
         return 1
 
     drift = _check_assembler_constants(data)

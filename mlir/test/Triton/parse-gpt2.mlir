@@ -1,5 +1,5 @@
 // Every kernel a GPT-2 small layer launches parses, verifies, and prints back unchanged: minitpu-opt reads what the
-// Triton 3.8.0 wheel prints. Regenerate the inputs with tools/dump_gpt2_ttir.py.
+// Triton 3.8.0 wheel prints. Regenerate the inputs with tools/dumps/dump_gpt2_ttir.py.
 
 // RUN: minitpu-opt %S/../Inputs/gemm_768x2304.ttir -o %t.gemm_768x2304 && diff -I '^$' %S/../Inputs/gemm_768x2304.ttir %t.gemm_768x2304
 // RUN: minitpu-opt %S/../Inputs/gemm_3072x768_gelu.ttir -o %t.gemm_3072x768_gelu && diff -I '^$' %S/../Inputs/gemm_3072x768_gelu.ttir %t.gemm_3072x768_gelu

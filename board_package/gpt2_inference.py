@@ -71,7 +71,7 @@ would not, and the cache would then belong in the runtime instead."""
 
 _IMAGE_DIRECTORY: pathlib.Path = HERE / "images"
 """Directory holding the compiled images and the manifest describing them, which a host writes through
-`tools/build_gpt2_images.py`."""
+`tools/board/build_gpt2_images.py`."""
 
 
 UIO_NAME: str = "minitpu"
@@ -313,7 +313,7 @@ def halt_image() -> bytes:
 
 
 def load_gpt2_weights(path: pathlib.Path | None = None) -> tuple[list[dict], dict]:
-    """Reads the weights `tools/export_gpt2_weights.py` wrote, as float32 arrays.
+    """Reads the weights `tools/board/export_gpt2_weights.py` wrote, as float32 arrays.
 
     Args:
         path: The exported weights file, or None for the one in this package's weights directory.
@@ -328,7 +328,7 @@ def load_gpt2_weights(path: pathlib.Path | None = None) -> tuple[list[dict], dic
     path = HERE / "weights" / "gpt2_weights.npz" if path is None else path
     if not path.exists():
         message = (
-            f"Unable to read GPT-2's weights from {path}. Run tools/export_gpt2_weights.py on a host, which writes "
+            f"Unable to read GPT-2's weights from {path}. Run tools/board/export_gpt2_weights.py on a host, which writes "
             f"them there, and deploy the package again."
         )
         raise FileNotFoundError(message)
@@ -829,7 +829,7 @@ def prefill(token_ids: NDArray[np.int64], layers: list[dict], shared: dict, *, h
         message = (
             f"Unable to prefill a prompt of {tokens} tokens. A compiled attention image covers "
             f"{', '.join(map(str, lengths))} tokens and the caches hold {capacity}, so add a longer length to "
-            f"tools/build_gpt2_images.py or shorten the prompt."
+            f"tools/board/build_gpt2_images.py or shorten the prompt."
         )
         raise ValueError(message)
     padding = np.full(padded - tokens, _END_OF_TEXT, dtype=np.int64)
@@ -1078,7 +1078,7 @@ def _compiled_image(*, kind: str, **shape: int | bool) -> tuple[bytes, dict]:
         stated = ", ".join(f"{field}={value}" for field, value in shape.items())
         message = (
             f"Unable to launch the {kind} image with {stated}. No image in {_IMAGE_DIRECTORY} covers that shape, so "
-            f"add it to tools/build_gpt2_images.py and rerun that tool on a host."
+            f"add it to tools/board/build_gpt2_images.py and rerun that tool on a host."
         )
         raise ValueError(message)
     cached = ((_IMAGE_DIRECTORY / found).read_bytes(), manifest[found])

@@ -16,8 +16,8 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent
 """The repository's tools directory."""
 
 sys.path.insert(0, str(_HERE))
-sys.path.insert(0, str(_HERE.parent))
-sys.path.insert(0, str(_HERE.parent / "board_package"))
+sys.path.insert(0, str(_HERE.parents[1]))
+sys.path.insert(0, str(_HERE.parents[1] / "board_package"))
 
 from bf16 import (  # noqa: E402
     _BLOCK_TOKENS,

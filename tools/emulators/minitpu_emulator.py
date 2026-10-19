@@ -88,6 +88,8 @@ class Machine:
         results: The MXU results pushed and not yet popped, oldest first.
         transpose: The transpose staging array.
         bundles: Bundles issued so far.
+        cycles: Cycles the issued bundles span, each taking one cycle plus its delay field, which counts the scheduled
+            timing and leaves out any stall the hardware's own interlocks add.
     """
 
     def __init__(self, dram: NDArray[np.uint8], *, arguments: tuple[int, ...]) -> None:
@@ -101,6 +103,7 @@ class Machine:
         self.results: deque[NDArray[np.float64]] = deque()
         self.transpose = np.full((_LANES, _LANES), np.nan, dtype=np.float32)
         self.bundles = 0
+        self.cycles = 0
 
     def write_words(self, address: int, words: NDArray[np.uint16]) -> None:
         """Stages BF16 words in DRAM at a byte address."""
@@ -128,6 +131,7 @@ class Machine:
                 message = f"Unable to reach a halt. The image must halt within {_STEP_LIMIT} bundles."
                 raise EmulationError(message)
             word = words[pc]
+            self.cycles += 1 + asm._delay_of(word)
             if word == asm.HALT_BUNDLE:
                 if self.results:
                     message = f"Unable to halt with {len(self.results)} MXU results never popped."

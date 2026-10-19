@@ -21,6 +21,10 @@ ninja -C mlir/build check-minitpu
 is the one Triton's own `cmake/llvm-info.json` names. Configuring refuses an LLVM built from any other commit, so the
 pin changes in `pyproject.toml` alone.
 
+`tools/board/build_mlir_images.py --output <dir>` writes the board's image set with every kernel this pipeline covers
+built by it, currently the four GEMMs, and `tools/emulators/emulate_board_checks.py --images <dir>` runs the board's
+checks against that set.
+
 C++ is formatted by `.clang-format` and linted by `.clang-tidy`, both in this directory.
 
 ## Layout
@@ -29,7 +33,7 @@ C++ is formatted by `.clang-format` and linted by `.clang-tidy`, both in this di
 |-------------------------------|-------------------------------------------------------------------------------------|
 | `third_party/triton/`         | Triton's tt dialect, compiled from `TRITON_SOURCE_DIR` without the rest of Triton    |
 | `include/minitpu/minitpu/`    | The minitpu dialect: machine operations over virtual registers (`!minitpu.vreg`), VMEM buffers and `scf.for` loops, and its passes |
-| `lib/minitpu/`                | The dialect's verifiers, the VMEM and register allocators (`allocate.cpp`), and the lowering into minitpuisa (`to_isa.cpp`) |
+| `lib/minitpu/`                | The dialect's verifiers, the expansion of tile ops such as `minitpu.matmul` (`tile_to_vector.cpp`), the VMEM and register allocators (`allocate.cpp`), and the lowering into minitpuisa (`to_isa.cpp`) |
 | `include/minitpu/minitpuisa/` | The minitpuisa dialect: one op per instruction, its slots and opcodes read from `codegen/minitpuisa.td`, and the bundle bit layout (`encoding.h`) |
 | `lib/minitpuisa/`             | The dialect's verifiers, the image import and export (`image.cpp`), and the `-minitpuisa-pack` and `-minitpuisa-schedule` passes over the traffic model they share (`traffic.h`) |
 | `tools/minitpu-opt/`          | The `mlir-opt`-style driver every lit test runs                                     |

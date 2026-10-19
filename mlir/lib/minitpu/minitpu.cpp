@@ -12,6 +12,7 @@
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/IR/DialectImplementation.h>
 #include <mlir/IR/Matchers.h>
+#include "matmul_layout.h"
 
 using namespace mlir;
 using namespace mlir::minitpu;
@@ -90,6 +91,30 @@ LogicalResult MinitpuDialect::verifyOperationAttribute(Operation* operation, con
         return operation->emitOpError() << "is unable to live in " << (is_vector ? 'v' : 's') << index.getInt()
                                         << ". It must name one of the " << registers << " "
                                         << (is_vector ? "vector" : "scalar") << " registers.";
+    }
+    return success();
+}
+
+/// Verifies that the product's shape is one the lowering covers and that its staged rows fit one VMEM bank.
+LogicalResult MatmulOp::verify()
+{
+    if (getTokens() != matmul::kTokens)
+    {
+        return emitOpError() << "is unable to cover " << getTokens() << " tokens. One launch covers " << matmul::kTokens
+                             << ", whose pushes fill the MXU output FIFO exactly.";
+    }
+    if (getDepth() % matmul::kChunkRows != 0 || getColumns() % matmul::kTile != 0)
+    {
+        return emitOpError() << "is unable to cover a depth of " << getDepth() << " by " << getColumns()
+                             << " columns. The depth must be a whole number of " << matmul::kChunkRows
+                             << "-row weight chunks and the columns a whole number of " << matmul::kTile
+                             << "-wide tiles.";
+    }
+    if (matmul::StagedRows(getDepth()) > matmul::kBankRows)
+    {
+        return emitOpError() << "is unable to stage a depth of " << getDepth() << ". Its buffers take "
+                             << matmul::StagedRows(getDepth()) << " VMEM rows, where one bank holds "
+                             << matmul::kBankRows << ".";
     }
     return success();
 }

@@ -1,22 +1,28 @@
-#!/usr/bin/env bash
-# Puts everything a board runs back on it: the package, the compiled images, and GPT-2's weights and tokenizer.
-#
-#   tools/board/prepare_board.sh <account> <board-id> [--program]
-#
-# A board erases the home directory whenever no session holds it, so this is the one command to run after
-# every login. Hold a session open on the board while it runs, or the board erases the copies as they land.
-# The export reuses its cached download and the image build is deterministic, so a rerun only costs the copy.
+
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ACCOUNT="${1:?usage: prepare_board.sh <account> <board-id> [--program]}"
-BOARD="${2:?usage: prepare_board.sh <account> <board-id> [--program]}"
+ACCOUNT="${1:?usage: prepare_board.sh <account> <board-id> [--program] [--mlir]}"
+BOARD="${2:?usage: prepare_board.sh <account> <board-id> [--program] [--mlir]}"
 PYTHON="${PYTHON:-python3}"
+PROGRAM=""
+MLIR=""
+for flag in "${@:3}"; do
+  case "$flag" in
+    --program) PROGRAM="--program" ;;
+    --mlir) MLIR="--mlir" ;;
+    *) echo "unknown flag $flag, expected --program or --mlir"; exit 1 ;;
+  esac
+done
 
 echo "exporting GPT-2's weights and tokenizer"
 "$PYTHON" "$HERE/tools/board/export_gpt2_weights.py"
 
 echo "building the compiled images"
 "$PYTHON" "$HERE/tools/board/build_gpt2_images.py" > /dev/null
+if [ -n "$MLIR" ]; then
+  echo "rebuilding the images mlir/ covers"
+  "$PYTHON" "$HERE/tools/board/build_mlir_images.py" --output "$HERE/board_package/images"
+fi
 
-"$HERE/tools/board/deploy_board.sh" "$ACCOUNT" "$BOARD" "${3:-}"
+"$HERE/tools/board/deploy_board.sh" "$ACCOUNT" "$BOARD" "$PROGRAM"

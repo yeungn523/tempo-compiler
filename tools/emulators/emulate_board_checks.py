@@ -23,6 +23,7 @@ import emulated_runtime  # noqa: E402
 sys.modules["runtime"] = emulated_runtime
 
 import board_checks  # noqa: E402
+import gpt2_inference  # noqa: E402
 
 _CHECKS: dict[str, str] = {
     "gemm": "check_full_gemm",
@@ -44,7 +45,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checks", nargs="*", default=list(_CHECKS), choices=list(_CHECKS),
                         help="Checks to run, every one when none is named.")
+    parser.add_argument("--images", help="Image set to launch, board_package/images when omitted.")
     arguments = parser.parse_args()
+    if arguments.images:
+        gpt2_inference._IMAGE_DIRECTORY = pathlib.Path(arguments.images).expanduser().resolve()
 
     passed = True
     for name in arguments.checks:

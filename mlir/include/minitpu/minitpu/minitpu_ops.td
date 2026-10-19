@@ -226,6 +226,27 @@ def Minitpu_AllocOp : Minitpu_Op<"alloc", [MemoryEffects<[MemAlloc]>]>
 }
 
 /**
+ * @brief Provides a product of one block of tokens by a weight matrix, staged from and drained to host memory.
+ *
+ * @details The tile op names what is computed and the host layout it is computed over, leaving the instructions, the
+ * buffers and the loops to -minitpu-tile-to-vector. The activations are packed as `[depth / 16][tokens][16]`, the
+ * weights as `[columns / 16][depth][16]`, and the drain buffer holds a zeroed 16x16 tile followed by the product as
+ * `[columns / 16][tokens][16]`, which is the layout board_package/bf16.py's pack_activations and pack_weights write and
+ * the board runtime reads back. With activate set, the activations pass through the GELU before they enter the array.
+ */
+def Minitpu_MatmulOp : Minitpu_Op<"matmul", [MemoryEffects<[MemRead, MemWrite]>]>
+{
+    let summary = "A block of tokens multiplied by a weight matrix in host memory";
+    let arguments = (ins I32:$activations, I32:$weights, I32:$drain, Minitpu_Field<1, 65535>:$tokens,
+                         Minitpu_Field<1, 65535>:$depth, Minitpu_Field<1, 1048560>:$columns, UnitAttr:$activate);
+    let assemblyFormat = [{
+        $activations `,` $weights `->` $drain `tokens` $tokens `depth` $depth `columns` $columns
+        (`activate` $activate^)? attr-dict
+    }];
+    let hasVerifier = 1;
+}
+
+/**
  * @brief Provides one image: its operations in program order, which the machine runs once per launch and ends with
  * halt.
  */

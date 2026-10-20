@@ -88,3 +88,32 @@ minitpu.kernel @copy_partial_row {
   // expected-error @below {{is unable to step 48 bytes between rows}}
   minitpu.copy %s -> %d rows 8 stride 48
 }
+
+// -----
+
+minitpu.kernel @attention_keys_twice {
+  %c = minitpu.arg 0
+  %k = minitpu.arg 1
+  %q = minitpu.arg 2
+  // expected-error @below {{is unable to tell where its keys lie}}
+  minitpu.attention %c, %q cache %k heads 12 head 64 keys 64 causal
+}
+
+// -----
+
+minitpu.kernel @attention_partial_tile {
+  %c = minitpu.arg 0
+  %q = minitpu.arg 2
+  // expected-error @below {{is unable to cover a head of 24 over 64 keys}}
+  minitpu.attention %c, %q heads 12 head 24 keys 64 causal
+}
+
+// -----
+
+minitpu.kernel @attention_past_one_bank {
+  %c = minitpu.arg 0
+  %k = minitpu.arg 1
+  %q = minitpu.arg 2
+  // expected-error @below {{is unable to stage 8192 keys}}
+  minitpu.attention %c, %q cache %k heads 12 head 64 keys 8192
+}

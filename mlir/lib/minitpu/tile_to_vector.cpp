@@ -62,13 +62,12 @@ namespace
         /// Returns a scalar register advanced by `bytes`, in as many additions as saddi's immediate takes.
         Value Advance(Value pointer, int64_t bytes)
         {
-            do
+            while (bytes != 0)
             {
                 const int64_t step = std::clamp<int64_t>(bytes, -kAddReach, kAddReach);
                 pointer            = arith::AddIOp::create(_builder, _location, pointer, Scalar(step));
                 bytes -= step;
             }
-            while (bytes != 0);
             return pointer;
         }
 
@@ -528,6 +527,617 @@ namespace
         sum.erase();
     }
 
+    /// Stores the constants block's row holding the tile of the entering maximum.
+    constexpr int64_t kInitialRow = 0;
+
+    /// Stores the constants block's row holding the tile of zeros.
+    constexpr int64_t kZeroRow = kTile;
+
+    /// Stores the constants block's row holding the first mask tile.
+    constexpr int64_t kMaskRow = int64_t {kAttentionStatedTiles} * kTile;
+
+    /// Stores the sublane mask naming sublane zero alone.
+    constexpr uint32_t kFirstSublane = 1;
+
+    /// Stores the tiles one batch of value pushes covers, which together fill the MXU output FIFO's 32 entries.
+    constexpr uint32_t kPushTiles = kTokenGroups / kSublanes;
+
+    /// Stores the bytes one half of a token block's tile takes, being one query block's rows.
+    constexpr int64_t kHalfTileBytes = int64_t {kQueryBlock} * kRowBytes;
+
+    /// Returns the result of a vector operation of two operands.
+    template <typename BinaryOp>
+    Value Binary(Expansion& expansion, Value left, Value right)
+    {
+        return BinaryOp::create(expansion.get_builder(), expansion.get_location(), left.getType(), left, right);
+    }
+
+    /// Returns the result of a vector operation of one operand.
+    template <typename UnaryOp>
+    Value Unary(Expansion& expansion, Value operand)
+    {
+        return UnaryOp::create(expansion.get_builder(), expansion.get_location(), operand.getType(), operand);
+    }
+
+    /// Returns the tile held in four registers, register r carrying rows 4r through 4r + 3, transposed.
+    std::array<Value, kSublanes> Transpose(Expansion& expansion, const std::array<Value, kSublanes>& quarters)
+    {
+        OpBuilder& builder      = expansion.get_builder();
+        const Location location = expansion.get_location();
+        for (uint32_t quarter = 0; quarter < kSublanes; ++quarter)
+        {
+            VtxinOp::create(builder, location, quarters[quarter], quarter);
+        }
+        std::array<Value, kSublanes> columns {};
+        for (uint32_t quarter = 0; quarter < kSublanes; ++quarter)
+        {
+            columns[quarter] = VtxoutOp::create(builder, location, VRegType::get(builder.getContext()), quarter);
+        }
+        return columns;
+    }
+
+    /// Issues descriptors on alternating slots, waiting on a slot before it carries another and on both at the end.
+    class DescriptorQueue
+    {
+      public:
+        /// Prepares to issue through `expansion`.
+        explicit DescriptorQueue(Expansion& expansion) : _expansion(expansion)
+        {}
+
+        /**
+         * @brief Moves `count` tiles of `rows` rows each, `byte_step` bytes apart in host memory and `row_step` rows
+         * apart in `buffer`, advancing `pointer` in place onto the last tile.
+         *
+         * @param drain determines whether the tiles move from the buffer to host memory rather than into it.
+         * @param buffer the VMEM buffer.
+         * @param first_row the buffer row the first tile moves to or from.
+         * @param row_step the buffer rows between consecutive tiles.
+         * @param pointer the host address of the first tile.
+         * @param byte_step the host bytes between consecutive tiles.
+         * @param count the tiles moved.
+         * @param rows the rows each tile spans.
+         * @param stride the scalar holding the bytes between consecutive rows.
+         * @returns the host address of the last tile.
+         */
+        Value Move(
+            const bool drain,
+            Value buffer,
+            const int64_t first_row,
+            const int64_t row_step,
+            Value pointer,
+            const int64_t byte_step,
+            const uint32_t count,
+            const uint32_t rows,
+            Value stride
+        )
+        {
+            for (uint32_t tile = 0; tile < count; ++tile)
+            {
+                const uint32_t slot = _issued_count % 2;
+                if (_issued_count >= 2) _expansion.Flush(1U << slot);
+                const int64_t row = first_row + int64_t {tile} * row_step;
+                if (drain) _expansion.Drain(buffer, row, pointer, stride, rows, slot);
+                else _expansion.Load(buffer, row, pointer, stride, rows, slot);
+                _used |= 1U << slot;
+                ++_issued_count;
+                if (tile + 1 < count) pointer = _expansion.Advance(pointer, byte_step);
+            }
+            return pointer;
+        }
+
+        /// Waits for every slot a descriptor was issued on.
+        void Finish()
+        {
+            if (_used != 0) _expansion.Flush(_used);
+        }
+
+      private:
+        /// Stores the expansion the descriptors are built through.
+        Expansion& _expansion;
+
+        /// Stores the descriptors issued so far.
+        uint32_t _issued_count = 0;
+
+        /// Stores the slots a descriptor was issued on, one bit each.
+        uint32_t _used = 0;
+    };
+
+    /// Stores the host layout one attention walks, in bytes.
+    struct AttentionLayout
+    {
+        uint32_t tiles;             ///< The tiles one head spans.
+        uint32_t heads;             ///< The heads the tensors carry.
+        uint32_t keys;              ///< The keys each query attends over at most.
+        bool causal;                ///< Whether the keys are the queries tensor's own, each query reading up to itself.
+        int64_t query_block_bytes;  ///< The bytes one token block of the queries tensor spans.
+        int64_t key_block_bytes;    ///< The bytes one token block of the tensor holding the keys spans.
+        int64_t model_bytes;        ///< The bytes from one head's keys to its values, and from its queries to its keys.
+        int64_t head_bytes;         ///< The bytes from one head's tiles to the next head's.
+    };
+
+    /// Stores the VMEM buffers and the stride one attention shares across its heads and query blocks.
+    struct AttentionBuffers
+    {
+        Value constants;   ///< The entering maximum, zeros and the mask tiles.
+        Value queries;     ///< One query block's queries, a tile per 16 head features.
+        Value transposed;  ///< The same queries transposed, each tile the stationary operand of a score product.
+        Value operands;    ///< One key token block's keys and then its values, a tile per 16 head features.
+        Value scratch;     ///< The rows the per-query folds turn through.
+        Value output;      ///< One query block's output, staged for its drain.
+        Value stride;      ///< The scalar holding the bytes between consecutive rows.
+    };
+
+    /// Stores what one query block carries across its keys.
+    struct AttentionState
+    {
+        llvm::SmallVector<Value>
+            output;     ///< The output's registers, transposed: four head features each, tile after tile.
+        Value maximum;  ///< The running maximum, one query per lane, every sublane the same.
+        Value total;    ///< The running sum, laid out as the maximum.
+
+        /// Returns every carried value, in the order a loop carries them.
+        [[nodiscard]]
+        llvm::SmallVector<Value> Values() const
+        {
+            llvm::SmallVector<Value> values(output);
+            values.push_back(maximum);
+            values.push_back(total);
+            return values;
+        }
+
+        /// Takes every carried value from `values`, in the order Values() lists them.
+        void Assign(const ValueRange values)
+        {
+            for (size_t index = 0; index < output.size(); ++index) output[index] = values[index];
+            maximum = values[output.size()];
+            total   = values[output.size() + 1];
+        }
+    };
+
+    /// Stores the scratch rows one fold turns through: two partials, each read back past itself, and the spread.
+    constexpr int64_t kFoldRows = 24;
+
+    /**
+     * @brief Returns the four registers' elements combined across registers and sublanes into every sublane, one
+     * query per lane, turning the partials through VMEM, whose consecutive rows are the only path between sublanes.
+     *
+     * @param expansion the expansion building the fold.
+     * @param scratch the buffer the fold turns through.
+     * @param first_row the first of the `kFoldRows` scratch rows the fold owns.
+     * @param quarters the registers combined.
+     * @returns the combined register, every sublane the same.
+     */
+    template <typename CombineOp>
+    Value FoldSublanes(
+        Expansion& expansion,
+        Value scratch,
+        const int64_t first_row,
+        const std::array<Value, kSublanes>& quarters
+    )
+    {
+        OpBuilder& builder      = expansion.get_builder();
+        const Location location = expansion.get_location();
+        Value value             = Binary<CombineOp>(
+            expansion,
+            Binary<CombineOp>(expansion, quarters[0], quarters[1]),
+            Binary<CombineOp>(expansion, quarters[2], quarters[3])
+        );
+
+        // Halves the sublanes twice, reading each partial back two and then one rows on. The rows read past each
+        // partial are stale, so only sublane zero carries the whole fold.
+        constexpr std::array<std::pair<int64_t, int64_t>, 2> kFolds {
+            {{0, 2}, {8, 1}}
+        };
+        for (const auto& [row, distance] : kFolds)
+        {
+            VstOp::create(builder, location, value, scratch, expansion.Index(first_row + row), kEverySublane);
+            Value shifted = expansion.LoadRegister(scratch, expansion.Index(first_row + row + distance));
+            value         = Binary<CombineOp>(expansion, value, shifted);
+        }
+
+        // Spreads sublane zero over four consecutive rows, which one load reads back as agreeing sublanes.
+        constexpr int64_t kSpread = 16;
+        for (uint32_t sublane = 0; sublane < kSublanes; ++sublane)
+        {
+            VstOp::create(
+                builder,
+                location,
+                value,
+                scratch,
+                expansion.Index(first_row + kSpread + sublane),
+                kFirstSublane
+            );
+        }
+        return expansion.LoadRegister(scratch, expansion.Index(first_row + kSpread));
+    }
+
+    /**
+     * @brief Builds one block of 16 keys attended by one block of 16 queries under the online softmax.
+     *
+     * @details Everything a query block carries is held transposed, one query per lane: the scores, register r holding
+     * keys 4r through 4r + 3, come from pushing the keys against the transposed queries, and the output, register r
+     * of a tile holding head features 4r through 4r + 3, from pushing the transposed values against the probabilities.
+     * Each query's maximum and sum over the keys then combine across registers and sublanes rather than across lanes,
+     * and the rescale and the normalisation multiply by one register. Every trip through the array waits out its
+     * result latency, so the probabilities stay stationary for every value tile.
+     *
+     * @param expansion the expansion building the block.
+     * @param buffers the attention's buffers.
+     * @param tiles the tiles one head spans.
+     * @param state the query block's carried values, updated past the block.
+     * @param half the half of the staged key token block the block reads.
+     * @param counter the key loop's counter the mask tile is walked by, or a null value for a fixed mask tile.
+     * @param mask_row the constants row of the block's mask tile, the counter's walk aside, or a negative row for none.
+     */
+    void BuildKeyBlock(
+        Expansion& expansion,
+        const AttentionBuffers& buffers,
+        const uint32_t tiles,
+        AttentionState& state,
+        const uint32_t half,
+        Value counter,
+        const int64_t mask_row
+    )
+    {
+        OpBuilder& builder      = expansion.get_builder();
+        const Location location = expansion.get_location();
+        const Type vector       = VRegType::get(builder.getContext());
+        const int64_t key_row   = int64_t {half} * kQueryBlock;
+        auto tile_at            = [&](Value buffer, const int64_t first_row) {
+            std::array<Value, kSublanes> quarters {};
+            for (uint32_t quarter = 0; quarter < kSublanes; ++quarter)
+            {
+                quarters[quarter] = expansion.LoadRegister(buffer, expansion.Index(first_row + quarter * kSublanes));
+            }
+            return quarters;
+        };
+        auto stationary = [&](const std::array<Value, kSublanes>& quarters) {
+            VmatloadOp::create(builder, location, quarters[0], quarters[1], quarters[2], quarters[3]);
+        };
+
+        std::array<Value, kSublanes> scores {};
+        for (uint32_t tile = 0; tile < tiles; ++tile)
+        {
+            stationary(tile_at(buffers.transposed, int64_t {tile} * kQueryBlock));
+            for (uint32_t group = 0; group < kSublanes; ++group)
+            {
+                const int64_t row = int64_t {tile} * kTokens + key_row + group * kSublanes;
+                VmatpushOp::create(builder, location, expansion.LoadRegister(buffers.operands, expansion.Index(row)));
+            }
+            for (uint32_t group = 0; group < kSublanes; ++group)
+            {
+                Value product = VmatpopOp::create(builder, location, vector);
+                scores[group] = tile == 0 ? product : Binary<VaddOp>(expansion, scores[group], product);
+            }
+        }
+        if (mask_row >= 0)
+        {
+            for (uint32_t group = 0; group < kSublanes; ++group)
+            {
+                const int64_t row = mask_row + group * kSublanes;
+                Value at          = counter ? expansion.Row(counter, 2 * kTile, row) : expansion.Index(row);
+                scores[group] = Binary<VaddOp>(expansion, scores[group], expansion.LoadRegister(buffers.constants, at));
+            }
+        }
+
+        // Takes the running maximum past the block's, and the rescale factor, the probabilities and their sum against
+        // it.
+        Value block   = FoldSublanes<VmaxOp>(expansion, buffers.scratch, 0, scores);
+        Value maximum = Binary<VmaxOp>(expansion, state.maximum, block);
+        Value rescale = Unary<VexpOp>(expansion, Binary<VsubOp>(expansion, state.maximum, maximum));
+        for (Value& held : state.output) held = Binary<VmulOp>(expansion, held, rescale);
+        std::array<Value, kSublanes> probabilities {};
+        for (uint32_t group = 0; group < kSublanes; ++group)
+        {
+            probabilities[group] = Unary<VexpOp>(expansion, Binary<VsubOp>(expansion, scores[group], maximum));
+        }
+        Value sum     = FoldSublanes<VaddOp>(expansion, buffers.scratch, kFoldRows, probabilities);
+        state.total   = Binary<VaddOp>(expansion, Binary<VmulOp>(expansion, state.total, rescale), sum);
+        state.maximum = maximum;
+
+        // Holds the probabilities stationary and pushes every value tile against them, transposed, in batches the
+        // output FIFO holds without a pop between.
+        stationary(probabilities);
+        for (uint32_t first = 0; first < tiles; first += kPushTiles)
+        {
+            const uint32_t batch = std::min(kPushTiles, tiles - first);
+            for (uint32_t tile = first; tile < first + batch; ++tile)
+            {
+                const std::array<Value, kSublanes> values =
+                    Transpose(expansion, tile_at(buffers.operands, int64_t {tiles + tile} * kTokens + key_row));
+                for (uint32_t group = 0; group < kSublanes; ++group)
+                {
+                    VmatpushOp::create(builder, location, values[group]);
+                }
+            }
+            for (uint32_t tile = first; tile < first + batch; ++tile)
+            {
+                for (uint32_t group = 0; group < kSublanes; ++group)
+                {
+                    Value& held = state.output[tile * kSublanes + group];
+                    held        = Binary<VaddOp>(expansion, held, VmatpopOp::create(builder, location, vector));
+                }
+            }
+        }
+    }
+
+    /**
+     * @brief Stages one key token block's keys and then its values.
+     *
+     * @param expansion the expansion building the descriptors.
+     * @param buffers the attention's buffers.
+     * @param layout the host layout.
+     * @param pointer the host address of the token block's first key tile of the head.
+     * @param advance determines whether the pointer moves on to the next token block's, which another stage reads.
+     * @returns the pointer, moved on when `advance` is set.
+     */
+    Value StageKeys(
+        Expansion& expansion,
+        const AttentionBuffers& buffers,
+        const AttentionLayout& layout,
+        Value pointer,
+        const bool advance
+    )
+    {
+        const int64_t walked = int64_t {layout.tiles - 1} * kTokenTileBytes;
+        DescriptorQueue queue(expansion);
+        pointer = queue.Move(
+            false,
+            buffers.operands,
+            0,
+            kTokens,
+            pointer,
+            kTokenTileBytes,
+            layout.tiles,
+            kTokens,
+            buffers.stride
+        );
+        pointer = expansion.Advance(pointer, layout.model_bytes - walked);
+        pointer = queue.Move(
+            false,
+            buffers.operands,
+            int64_t {layout.tiles} * kTokens,
+            kTokens,
+            pointer,
+            kTokenTileBytes,
+            layout.tiles,
+            kTokens,
+            buffers.stride
+        );
+        queue.Finish();
+        return advance ? expansion.Advance(pointer, layout.key_block_bytes - layout.model_bytes - walked) : pointer;
+    }
+
+    /**
+     * @brief Builds a loop over `count` key token blocks, each staging its keys and values and attending both halves.
+     *
+     * @param expansion the expansion building the loop.
+     * @param buffers the attention's buffers.
+     * @param layout the host layout.
+     * @param state the query block's carried values, updated past the loop.
+     * @param pointer the host address of the first token block's first key tile of the head, moved past the last.
+     * @param count the token blocks the loop walks.
+     * @param masked determines whether each key block adds the mask tile the constants block holds for it.
+     */
+    void BuildKeyLoop(
+        Expansion& expansion,
+        const AttentionBuffers& buffers,
+        const AttentionLayout& layout,
+        AttentionState& state,
+        Value& pointer,
+        const uint32_t count,
+        const bool masked
+    )
+    {
+        OpBuilder& builder      = expansion.get_builder();
+        const Location location = expansion.get_location();
+        llvm::SmallVector<Value> carried {pointer};
+        llvm::append_range(carried, state.Values());
+        auto loop = scf::ForOp::create(
+            builder,
+            location,
+            expansion.Index(0),      // lower bound
+            expansion.Index(count),  // upper bound
+            expansion.Index(1),      // step
+            ValueRange(carried)
+        );
+        {
+            OpBuilder::InsertionGuard guard(builder);
+            builder.setInsertionPointToStart(loop.getBody());
+            AttentionState walked = state;
+            walked.Assign(loop.getRegionIterArgs().drop_front());
+            Value next = StageKeys(expansion, buffers, layout, loop.getRegionIterArgs()[0], true);
+            for (uint32_t half = 0; half < 2; ++half)
+            {
+                const int64_t mask_row = masked ? kMaskRow + int64_t {half} * kTile : -1;
+                BuildKeyBlock(expansion, buffers, layout.tiles, walked, half, loop.getInductionVar(), mask_row);
+            }
+            llvm::SmallVector<Value> yielded {next};
+            llvm::append_range(yielded, walked.Values());
+            scf::YieldOp::create(builder, location, yielded);
+        }
+        pointer = loop.getResult(0);
+        state.Assign(loop.getResults().drop_front());
+    }
+
+    /**
+     * @brief Builds one query block: its queries staged and transposed, its keys attended, and its output normalised
+     * and drained over its queries.
+     *
+     * @param expansion the expansion building the block.
+     * @param buffers the attention's buffers.
+     * @param layout the host layout.
+     * @param queries the host address of the head's first query tile.
+     * @param keys the host address of the head's first cached key tile, unused by a causal attention.
+     * @param block the query block's index, two per token block.
+     */
+    void BuildQueryBlock(
+        Expansion& expansion,
+        const AttentionBuffers& buffers,
+        const AttentionLayout& layout,
+        Value queries,
+        Value keys,
+        const uint32_t block
+    )
+    {
+        OpBuilder& builder      = expansion.get_builder();
+        const Location location = expansion.get_location();
+        const uint32_t token    = block / 2;
+        const uint32_t half     = block % 2;
+        const int64_t offset    = int64_t {token} * layout.query_block_bytes + int64_t {half} * kHalfTileBytes;
+
+        DescriptorQueue loads(expansion);
+        loads.Move(
+            false,
+            buffers.queries,
+            0,
+            kQueryBlock,
+            expansion.Advance(queries, offset),
+            kTokenTileBytes,
+            layout.tiles,
+            kQueryBlock,
+            buffers.stride
+        );
+        loads.Finish();
+        for (uint32_t tile = 0; tile < layout.tiles; ++tile)
+        {
+            std::array<Value, kSublanes> quarters {};
+            for (uint32_t group = 0; group < kSublanes; ++group)
+            {
+                const int64_t row = int64_t {tile} * kQueryBlock + group * kSublanes;
+                quarters[group]   = expansion.LoadRegister(buffers.queries, expansion.Index(row));
+            }
+            const std::array<Value, kSublanes> transposed = Transpose(expansion, quarters);
+            for (uint32_t group = 0; group < kSublanes; ++group)
+            {
+                const int64_t row = int64_t {tile} * kQueryBlock + group * kSublanes;
+                VstOp::create(
+                    builder,
+                    location,
+                    transposed[group],
+                    buffers.transposed,
+                    expansion.Index(row),
+                    kEverySublane
+                );
+            }
+        }
+
+        AttentionState state;
+        state.maximum = expansion.LoadRegister(buffers.constants, expansion.Index(kInitialRow));
+        state.total   = expansion.LoadRegister(buffers.constants, expansion.Index(kZeroRow));
+        for (uint32_t index = 0; index < layout.tiles * kSublanes; ++index)
+        {
+            state.output.push_back(expansion.LoadRegister(buffers.constants, expansion.Index(kZeroRow)));
+        }
+
+        // Attends a causal block's full token blocks, then the token block holding its own queries, whose keys past
+        // each query are masked by the diagonal tile and whose second half the first query half never reads.
+        if (layout.causal)
+        {
+            Value pointer = expansion.Advance(queries, layout.model_bytes);
+            if (token > 0) BuildKeyLoop(expansion, buffers, layout, state, pointer, token, false);
+            StageKeys(expansion, buffers, layout, pointer, false);
+            if (half == 1) BuildKeyBlock(expansion, buffers, layout.tiles, state, 0, Value {}, -1);
+            BuildKeyBlock(expansion, buffers, layout.tiles, state, half, Value {}, kMaskRow);
+        }
+        else
+        {
+            Value pointer = keys;
+            BuildKeyLoop(expansion, buffers, layout, state, pointer, layout.keys / kTokens, true);
+        }
+
+        // Normalises each query's output by its sum, transposes it back to one query per row, and drains it over the
+        // queries.
+        Value reciprocal = Unary<VrecipOp>(expansion, state.total);
+        for (uint32_t tile = 0; tile < layout.tiles; ++tile)
+        {
+            std::array<Value, kSublanes> normalised {};
+            for (uint32_t group = 0; group < kSublanes; ++group)
+            {
+                normalised[group] = Binary<VmulOp>(expansion, state.output[tile * kSublanes + group], reciprocal);
+            }
+            const std::array<Value, kSublanes> rows = Transpose(expansion, normalised);
+            for (uint32_t group = 0; group < kSublanes; ++group)
+            {
+                const int64_t row = int64_t {tile} * kQueryBlock + group * kSublanes;
+                VstOp::create(builder, location, rows[group], buffers.output, expansion.Index(row), kEverySublane);
+            }
+        }
+        DescriptorQueue drains(expansion);
+        drains.Move(
+            true,
+            buffers.output,
+            0,
+            kQueryBlock,
+            expansion.Advance(queries, offset),
+            kTokenTileBytes,
+            layout.tiles,
+            kQueryBlock,
+            buffers.stride
+        );
+        drains.Finish();
+    }
+
+    /// Expands one minitpu.attention into the machine operations that compute it, then erases it.
+    void ExpandAttention(AttentionOp attention)
+    {
+        OpBuilder builder(attention);
+        Expansion expansion(builder, attention.getLoc());
+        const Location location = attention.getLoc();
+        const uint32_t tiles    = attention.getHead() / kTile;
+        const uint32_t heads    = attention.getHeads();
+        const bool causal       = attention.getCausal();
+        const int64_t model     = int64_t {heads} * tiles * kTokenTileBytes;
+        const AttentionLayout layout {
+            .tiles             = tiles,
+            .heads             = heads,
+            .keys              = attention.getKeys(),
+            .causal            = causal,
+            .query_block_bytes = kZeroTileBytes + 3 * model,
+            .key_block_bytes   = kZeroTileBytes + (causal ? 3 : 2) * model,
+            .model_bytes       = model,
+            .head_bytes        = int64_t {tiles} * kTokenTileBytes,
+        };
+        const uint32_t constant_rows = AttentionConstantRows(layout.keys, causal);
+        AttentionBuffers buffers {
+            .constants  = expansion.Buffer(constant_rows),
+            .queries    = expansion.Buffer(tiles * kQueryBlock),
+            .transposed = expansion.Buffer(tiles * kQueryBlock),
+            .operands   = expansion.Buffer(2 * tiles * kTokens),
+            .scratch    = expansion.Buffer(kAttentionScratchRows),
+            .output     = expansion.Buffer(tiles * kQueryBlock),
+            .stride     = expansion.Scalar(kRowBytes),
+        };
+        expansion.Stage(buffers.constants, attention.getConstants(), buffers.stride, constant_rows);
+
+        // Walks the heads, each one head's tiles past the last in every tensor.
+        llvm::SmallVector<Value> carried {attention.getQueries()};
+        if (!causal) carried.push_back(attention.getCache());
+        auto walk = scf::ForOp::create(
+            builder,
+            location,
+            expansion.Index(0),      // lower bound
+            expansion.Index(heads),  // upper bound
+            expansion.Index(1),      // step
+            ValueRange(carried)
+        );
+        {
+            OpBuilder::InsertionGuard guard(builder);
+            builder.setInsertionPointToStart(walk.getBody());
+            Value queries         = walk.getRegionIterArgs()[0];
+            Value keys            = causal ? Value {} : walk.getRegionIterArgs()[1];
+            const uint32_t blocks = causal ? layout.keys / kQueryBlock : 1;
+            for (uint32_t block = 0; block < blocks; ++block)
+            {
+                BuildQueryBlock(expansion, buffers, layout, queries, keys, block);
+            }
+            llvm::SmallVector<Value> next {expansion.Advance(queries, layout.head_bytes)};
+            if (!causal) next.push_back(expansion.Advance(keys, layout.head_bytes));
+            scf::YieldOp::create(builder, location, next);
+        }
+        attention.erase();
+    }
+
     /// Stores the two buffers a copy alternates between and the stride its descriptors share.
     struct CopyBuffers
     {
@@ -893,6 +1503,11 @@ namespace
                 norms.push_back(norm);
             });
             for (LayernormOp norm : norms) ExpandLayernorm(norm);
+            llvm::SmallVector<AttentionOp> attentions;
+            getOperation().walk([&](AttentionOp attention) {
+                attentions.push_back(attention);
+            });
+            for (AttentionOp attention : attentions) ExpandAttention(attention);
             llvm::SmallVector<CopyOp> copies;
             getOperation().walk([&](CopyOp copy) {
                 copies.push_back(copy);

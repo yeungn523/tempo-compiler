@@ -81,6 +81,40 @@ namespace mlir::minitpu::tile
         const uint32_t streamed = broadcast ? 2 : 4;
         return streamed * kChunkRows + kChunkRows + (broadcast ? kBroadcastRows * (features / kTile) : 0);
     }
+
+    /// Stores the queries one attention block covers, being the transpose array's width.
+    static constexpr uint32_t kQueryBlock = kTile;
+
+    /// Stores the bytes the zeroed tile heading each token block of a resident tensor takes.
+    static constexpr uint32_t kZeroTileBytes = kTile * kRowBytes;
+
+    /// Stores the bytes one feature tile of a resident token block takes, one row per token.
+    static constexpr uint32_t kTokenTileBytes = kTokens * kRowBytes;
+
+    /// Stores the tiles an attention constants block opens with: the entering maximum and zeros.
+    static constexpr uint32_t kAttentionStatedTiles = 2;
+
+    /// Stores the most head tiles an attention block accumulates, the registers its output holds across the keys.
+    static constexpr uint32_t kMaxHeadTiles = 4;
+
+    /// Stores the VMEM rows an attention block turns its per-query maximum and sum folds through.
+    static constexpr uint32_t kAttentionScratchRows = 48;
+
+    /// Returns the rows an attention constants block takes: its stated tiles, then one mask tile per key block, or
+    /// the one diagonal tile a causal attention reads.
+    constexpr uint32_t AttentionConstantRows(const uint32_t keys, const bool causal)
+    {
+        return (kAttentionStatedTiles + (causal ? 1 : keys / kTile)) * kTile;
+    }
+
+    /// Returns the VMEM rows an attention stages: its constants, a query block's queries, their transpose and its
+    /// output, one key token block's keys and values, and the fold scratch.
+    constexpr uint32_t AttentionStagedRows(const uint32_t head, const uint32_t keys, const bool causal)
+    {
+        const uint32_t tiles = head / kTile;
+        return AttentionConstantRows(keys, causal) + 3 * tiles * kQueryBlock + 2 * tiles * kTokens +
+               kAttentionScratchRows;
+    }
 }  // namespace mlir::minitpu::tile
 
 #endif  // MINITPU_LIB_MINITPU_TILE_LAYOUT_H

@@ -288,6 +288,30 @@ def Minitpu_LayernormOp : Minitpu_Op<"layernorm", [MemoryEffects<[MemRead, MemWr
 }
 
 /**
+ * @brief Provides attention over every head of a fused QKV tensor in host memory, its output written over the queries.
+ *
+ * @details The queries tensor is the QKV projection's drain, packed per token block as a zeroed 16x16 tile and then
+ * `[3 * heads * head / 16][32][16]`: every head's queries, then its keys, then its values. A causal attention attends
+ * its `keys` tokens to each other, each query to the keys up to its own. Otherwise one block of 16 queries, opening
+ * the tensor's first token block, attends over `keys` cached keys, the cache packed per token block as a zeroed tile
+ * and then `[2 * heads * head / 16][32][16]`, keys then values. The constants block holds a tile of the entering
+ * maximum and one of zeros, then the mask tiles added to the scores, each laid out keys by queries: the one
+ * diagonal tile a causal attention reads, or one per 16 cached keys. The queries arrive scaled by the reciprocal root
+ * of the head width.
+ */
+def Minitpu_AttentionOp : Minitpu_Op<"attention", [MemoryEffects<[MemRead, MemWrite]>]>
+{
+    let summary = "Attention over every head of a fused QKV tensor in host memory";
+    let arguments = (ins I32:$constants, I32:$queries, Optional<I32>:$cache, Minitpu_Field<1, 255>:$heads,
+                         Minitpu_Field<16, 64>:$head, Minitpu_Field<32, 65535>:$keys, UnitAttr:$causal);
+    let assemblyFormat = [{
+        $constants `,` $queries (`cache` $cache^)? `heads` $heads `head` $head `keys` $keys (`causal` $causal^)?
+        attr-dict
+    }];
+    let hasVerifier = 1;
+}
+
+/**
  * @brief Provides a copy of rows from one place in host memory to another, staged through VMEM.
  *
  * @details The copy moves `rows` rows of 32 bytes, consecutive rows `stride` bytes apart at both ends, which is how

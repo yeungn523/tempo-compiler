@@ -171,6 +171,32 @@ LogicalResult LayernormOp::verify()
     return success();
 }
 
+/// Verifies that the attention's shape is one the lowering covers and that its staged rows fit one VMEM bank.
+LogicalResult AttentionOp::verify()
+{
+    const bool causal = getCausal();
+    if (causal == (getCache() != nullptr))
+    {
+        return emitOpError() << "is unable to tell where its keys lie. A causal attention reads them from the queries "
+                             << "tensor and any other reads them from a cache, so exactly one of causal and a cache "
+                             << "must be given.";
+    }
+    if (getHead() % tile::kTile != 0 || getKeys() % tile::kTokens != 0)
+    {
+        return emitOpError() << "is unable to cover a head of " << getHead() << " over " << getKeys() << " keys. The "
+                             << "head must be a whole number of " << tile::kTile << "-wide tiles, at most "
+                             << tile::kMaxHeadTiles * tile::kTile << ", and the keys a whole number of "
+                             << tile::kTokens << "-token blocks.";
+    }
+    const uint32_t staged = tile::AttentionStagedRows(getHead(), getKeys(), causal);
+    if (staged > tile::kBankRows)
+    {
+        return emitOpError() << "is unable to stage " << getKeys() << " keys. Its buffers take " << staged
+                             << " VMEM rows, where one bank holds " << tile::kBankRows << ".";
+    }
+    return success();
+}
+
 /// Verifies that the copy's stride is a whole number of rows, which the descriptors it issues step by.
 LogicalResult CopyOp::verify()
 {

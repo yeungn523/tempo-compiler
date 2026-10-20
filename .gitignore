@@ -239,3 +239,6 @@ TODO.txt
 
 # The MLIR pipeline keeps its C++ under mlir/lib, which the Python "lib/" rule above would otherwise hide
 !mlir/lib/
+
+# The AddressSanitizer build tox -e memcheck configures beside mlir/build
+mlir/build-asan/

@@ -13,6 +13,7 @@ import hashlib
 import json
 import pathlib
 import shlex
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -34,16 +35,23 @@ _CHUNK_BYTES: int = 1 << 20
 
 
 def main() -> int:
-    """Fetches whatever part of the pinned toolchain is missing, verifies all of it, and prints mlir/'s configure line.
+    """Fetches whatever part of the pinned toolchain is missing, verifies all of it, and prints or runs mlir/'s configure
+    line.
 
     Returns:
-        Zero once the toolchain matches every pin.
+        Zero once the toolchain matches every pin and, with --configure, once cmake configures the build directory.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--toolchains", default=str(pathlib.Path.home() / "toolchains"),
                         help="Directory the Triton source is cloned into.")
     parser.add_argument("--llvm-root", default=str(pathlib.Path.home() / ".triton" / "llvm"),
                         help="Directory the LLVM package is unpacked into, Triton's own default.")
+    parser.add_argument("--build-dir", default=str(_HERE / "mlir" / "build"),
+                        help="Directory mlir/ is configured into.")
+    parser.add_argument("--sanitize", action="store_true",
+                        help="Instruments the build with AddressSanitizer, which also checks for leaks at exit.")
+    parser.add_argument("--configure", action="store_true",
+                        help="Runs the configure line instead of printing it.")
     arguments = parser.parse_args()
 
     pins = tomllib.loads((_HERE / "pyproject.toml").read_text())["tool"]["minitpu"]["toolchain"]
@@ -54,13 +62,22 @@ def main() -> int:
     _check_llvm_revision(llvm, commit=pins["llvm-commit"])
 
     configure = [
-        "cmake", "-G", "Ninja", "-S", str(_HERE / "mlir"), "-B", str(_HERE / "mlir" / "build"),
+        "cmake", "-G", "Ninja", "-S", str(_HERE / "mlir"), "-B", str(pathlib.Path(arguments.build_dir).resolve()),
         "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++",
+        "-DLLVM_USE_LINKER=lld",
         f"-DMLIR_DIR={llvm / 'lib' / 'cmake' / 'mlir'}", f"-DLLVM_DIR={llvm / 'lib' / 'cmake' / 'llvm'}",
         f"-DTRITON_SOURCE_DIR={triton}",
     ]
+    if arguments.sanitize:
+        configure.append("-DLLVM_USE_SANITIZER=Address")
+    # The prebuilt LLVM package ships no llvm-lit, so check-minitpu runs the lit the mlir dependency group installs.
+    if lit := shutil.which("lit"):
+        configure.append(f"-DLLVM_EXTERNAL_LIT={lit}")
     print(f"toolchain matches pyproject.toml: Triton {pins['triton-tag']}, LLVM {pins['llvm-commit'][:12]}")
-    print("configure mlir/ with:\n  " + shlex.join(configure))
+    if arguments.configure:
+        subprocess.run(configure, check=True)
+    else:
+        print("configure mlir/ with:\n  " + shlex.join(configure))
     return 0
 
 

@@ -21,7 +21,7 @@ sys.path.insert(0, str(_HERE / "board_package"))
 from codegen import signature_of  # noqa: E402
 from codegen.frontend import compile_to_ttir  # noqa: E402
 from gpt2_triton import (gpt2_add, gpt2_add_bias, gpt2_attention, gpt2_decode_attention,  # noqa: E402
-                         gpt2_layernorm, gpt2_matmul, gpt2_matmul_gelu)
+                         gpt2_layernorm, gpt2_matmul, gpt2_matmul_bias, gpt2_matmul_gelu)
 from triton.runtime import JITFunction  # noqa: E402
 
 _MODEL: int = 768
@@ -32,6 +32,9 @@ _KERNELS: tuple[tuple[str, JITFunction, dict[str, int]], ...] = (
      {"N": 3 * _MODEL, "K": _MODEL, "stride_am": _MODEL, "stride_bk": 3 * _MODEL, "stride_cm": 3 * _MODEL}),
     ("gemm_3072x768_gelu", gpt2_matmul_gelu,
      {"N": _MODEL, "K": 4 * _MODEL, "stride_am": 4 * _MODEL, "stride_bk": _MODEL, "stride_cm": _MODEL}),
+    ("gemm_3072x768_gelu_bias", gpt2_matmul_bias,
+     {"N": _MODEL, "K": 4 * _MODEL, "stride_am": 4 * _MODEL, "stride_bk": _MODEL, "stride_cm": _MODEL,
+      "ACTIVATE": True}),
     ("add_768", gpt2_add, {"N": _MODEL}),
     ("add_bias_768", gpt2_add_bias, {"N": _MODEL}),
     ("layernorm_768", gpt2_layernorm, {"N": _MODEL}),

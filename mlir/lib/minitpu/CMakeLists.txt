@@ -3,6 +3,7 @@ add_mlir_library(MinitpuDialect
   minitpu.cpp
   tile_to_vector.cpp
   to_isa.cpp
+  tt_to_minitpu.cpp
 
   DEPENDS
   MinitpuIncGen
@@ -11,7 +12,9 @@ add_mlir_library(MinitpuDialect
   LINK_LIBS PUBLIC
   MinitpuIsa
   MLIRIR
+  MinitpuTritonIR
   MLIRArithDialect
+  MLIRMathDialect
   MLIRBytecodeOpInterface
   MLIRPass
   MLIRSCFDialect

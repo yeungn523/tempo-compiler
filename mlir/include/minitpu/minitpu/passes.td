@@ -9,6 +9,15 @@
 include "mlir/Pass/PassBase.td"
 
 /**
+ * @brief Provides the conversion of every Triton kernel into a minitpu kernel holding the one tile op that computes it.
+ */
+def ConvertTritonToMinitpu : Pass<"convert-tt-to-minitpu", "::mlir::ModuleOp">
+{
+    let summary = "Convert every Triton kernel into a minitpu kernel of one tile op";
+    let dependentDialects = ["::mlir::minitpu::MinitpuDialect"];
+}
+
+/**
  * @brief Provides the lowering of every minitpu kernel into a minitpuisa program, one bundle per machine operation.
  */
 def ConvertMinitpuToIsa : Pass<"convert-minitpu-to-isa", "::mlir::ModuleOp">

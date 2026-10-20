@@ -104,6 +104,49 @@ def gpt2_matmul_gelu(
 
 
 @triton.jit
+def gpt2_matmul_bias(
+    activation_pointer: "*bf16",
+    weight_pointer: "*bf16",
+    output_pointer: "*fp32",
+    bias_pointer: "*bf16",
+    stride_am: tl.constexpr = _MODEL,
+    stride_ak: tl.constexpr = 1,
+    stride_bk: tl.constexpr = _MODEL,
+    stride_bn: tl.constexpr = 1,
+    stride_cm: tl.constexpr = _MODEL,
+    stride_cn: tl.constexpr = 1,
+    M: tl.constexpr = _TOKENS,
+    N: tl.constexpr = _MODEL,
+    K: tl.constexpr = _MODEL,
+    BLOCK_M: tl.constexpr = 32,
+    BLOCK_N: tl.constexpr = 16,
+    BLOCK_K: tl.constexpr = 256,
+    ACTIVATE: tl.constexpr = False,
+):
+    """Multiplies the activations, optionally through the exact GELU, by the weights and adds one bias row to every
+    product row, being a projection with its bias."""
+    offs_k = tl.arange(0, BLOCK_K)
+    for block in range(0, M, BLOCK_M):
+        offs_m = block + tl.arange(0, BLOCK_M)
+        for tile in range(0, N, BLOCK_N):
+            offs_n = tile + tl.arange(0, BLOCK_N)
+            activation_pointers = activation_pointer + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+            weight_pointers = weight_pointer + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+            accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for _ in range(0, K, BLOCK_K):
+                activations = tl.load(activation_pointers)
+                if ACTIVATE:
+                    widened = activations.to(tl.float32)
+                    activations = (0.5 * widened * (1.0 + tl.math.erf(widened / _ROOT_TWO))).to(tl.bfloat16)
+                accumulator += tl.dot(activations, tl.load(weight_pointers))
+                activation_pointers += BLOCK_K * stride_ak
+                weight_pointers += BLOCK_K * stride_bk
+            bias = tl.load(bias_pointer + offs_n).to(tl.float32)
+            tl.store(output_pointer + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+                     accumulator + bias[None, :])
+
+
+@triton.jit
 def gpt2_add(
     left_pointer: "*bf16",
     right_pointer: "*bf16",

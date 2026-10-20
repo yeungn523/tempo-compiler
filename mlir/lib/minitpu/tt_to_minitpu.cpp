@@ -1,0 +1,1043 @@
+/**
+ * @file
+ *
+ * @brief Implements the conversion of Triton kernels into minitpu kernels, each kernel becoming the one tile op that
+ * computes it.
+ *
+ * A kernel is read as the host launches its image: once per block of tokens, so the loop over token blocks is the
+ * host's and the tile op covers one block. Each loop is identified by what it walks, the rows or the columns of an
+ * operand, since the canonicalizer folds away a loop the kernel's shape gives one iteration. Every address the kernel
+ * computes is resolved into an affine form over the tensor's indices and the enclosing loops' counters, and is held to
+ * the dense row-major layout the host packs each operand from. A kernel the conversion does not recognise, or one that
+ * addresses an operand any other way, is refused with a diagnostic naming what differs.
+ */
+
+#include <llvm/ADT/StringExtras.h>
+#include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/Dialect/Math/IR/Math.h>
+#include <mlir/Dialect/SCF/IR/SCF.h>
+#include <mlir/Dialect/Utils/StaticValueUtils.h>
+#include <mlir/IR/Matchers.h>
+#include <triton/Dialect/Triton/IR/Dialect.h>
+#include <cmath>
+#include <optional>
+#include <utility>
+#include "minitpu/minitpu/passes.h"
+
+namespace mlir::minitpu
+{
+#define GEN_PASS_DEF_CONVERTTRITONTOMINITPU
+#include "minitpu/minitpu/passes.h.inc"
+}  // namespace mlir::minitpu
+
+using namespace mlir;
+using namespace mlir::minitpu;
+namespace tt = mlir::triton;
+
+namespace
+{
+    /// Stores the tolerance a recognised float constant is matched to, relative to its value.
+    constexpr double kConstantTolerance = 1e-6;
+
+    /// Stores the factor the exact GELU scales its argument by outside the error function.
+    constexpr double kGeluHalf = 0.5;
+
+    /// Stores the divisor the exact GELU scales its argument by.
+    constexpr double kRootTwo = 1.4142135623730951;
+
+    /// Stores the dimension a broadcast feature row is repeated along, being the tokens.
+    constexpr int32_t kTokenAxis = 0;
+
+    /// Stores the dimension a broadcast per-token value is repeated along, being the features.
+    constexpr int32_t kFeatureAxis = 1;
+
+    /// Stores a loop counter and the elements an address advances per unit of it.
+    using Counter = std::pair<Value, int64_t>;
+
+    /// Stores an address or an offset as an affine form, in elements, over its tensor's indices and the loop counters
+    /// it depends on.
+    struct Affine
+    {
+        Value base;                     ///< The pointer argument the address is based on, or null for an offset.
+        int64_t constant = 0;           ///< The constant term.
+        SmallVector<int64_t> strides;   ///< The elements one index along each tensor dimension advances.
+        SmallVector<Counter> counters;  ///< The elements one unit of each loop counter advances.
+
+        /// Returns the elements one unit of `counter` advances, zero when the form does not depend on it.
+        [[nodiscard]]
+        int64_t Step(Value counter) const
+        {
+            for (const auto& [known, step] : counters)
+            {
+                if (known == counter) return step;
+            }
+            return 0;
+        }
+
+        /// Adds `step` elements per unit of `counter`.
+        void AddStep(Value counter, const int64_t step)
+        {
+            for (auto* it = counters.begin(); it != counters.end(); ++it)
+            {
+                if (it->first != counter) continue;
+                it->second += step;
+                if (it->second == 0) counters.erase(it);
+                return;
+            }
+            if (step != 0) counters.emplace_back(counter, step);
+        }
+    };
+
+    /// Stores a loop's constant bounds, which the conversion holds to start at zero and to step evenly to its end.
+    struct Loop
+    {
+        scf::ForOp op;      ///< The loop.
+        Value counter;      ///< The loop's counter.
+        int64_t upper = 0;  ///< The bound its counter stops before.
+        int64_t step  = 0;  ///< The amount its counter advances per iteration.
+    };
+
+    /// Returns `value`'s tensor rank, zero for a scalar.
+    int64_t Rank(Value value)
+    {
+        const auto tensor = dyn_cast<RankedTensorType>(value.getType());
+        return tensor ? tensor.getRank() : 0;
+    }
+
+    /// Returns `value`'s tensor shape, empty for a scalar.
+    ArrayRef<int64_t> Shape(Value value)
+    {
+        const auto tensor = dyn_cast<RankedTensorType>(value.getType());
+        return tensor ? tensor.getShape() : ArrayRef<int64_t> {};
+    }
+
+    /// Returns the element type a pointer or a tensor of pointers points to.
+    Type Pointee(Value pointer)
+    {
+        Type type          = getElementTypeOrSelf(pointer.getType());
+        const auto pointee = dyn_cast<tt::PointerType>(type);
+        return pointee ? pointee.getPointeeType() : Type {};
+    }
+
+    /**
+     * @brief Resolves `operation`'s bounds, holding them to constants that start at zero and step evenly to the end.
+     *
+     * @param operation the loop.
+     * @returns the bounds, or failure with a diagnostic on the loop.
+     */
+    FailureOr<Loop> Bounds(scf::ForOp operation)
+    {
+        const std::optional<int64_t> lower = getConstantIntValue(operation.getLowerBound());
+        const std::optional<int64_t> upper = getConstantIntValue(operation.getUpperBound());
+        const std::optional<int64_t> step  = getConstantIntValue(operation.getStep());
+        if (!lower || !upper || !step || *lower != 0 || *step <= 0 || *upper % *step != 0)
+        {
+            return operation.emitError()
+                << "is a loop the conversion is unable to read. Each loop must run from 0 to a "
+                << "constant bound in a constant step dividing it, which fixes the shape the "
+                << "image covers.";
+        }
+        return Loop {.op = operation, .counter = operation.getInductionVar(), .upper = *upper, .step = *step};
+    }
+
+    /// Resolves the addresses and offsets a kernel computes into affine forms.
+    class AddressAnalysis
+    {
+      public:
+        /**
+         * @brief Resolves `value` into an affine form.
+         *
+         * @param value the address or offset.
+         * @returns the form, or failure with a diagnostic on the step the resolution is unable to follow.
+         */
+        // NOLINTNEXTLINE(misc-no-recursion): recurses once per operation computing the address, a short chain.
+        FailureOr<Affine> Of(Value value)
+        {
+            if (const auto known = _known.find(value); known != _known.end()) return known->second;
+            FailureOr<Affine> form = Compute(value);
+            if (failed(form)) return failure();
+
+            // Drops the stride of every dimension one index wide, whose only index is zero.
+            for (const auto [dimension, extent] : llvm::enumerate(Shape(value)))
+            {
+                if (extent == 1) form->strides[dimension] = 0;
+            }
+            _known.try_emplace(value, *form);
+            return form;
+        }
+
+      private:
+        /// Stores every form resolved so far.
+        llvm::DenseMap<Value, Affine> _known;
+
+        /// Returns the sum of two forms, at most one of which is based on a pointer.
+        static FailureOr<Affine> Sum(Operation* operation, const Affine& left, const Affine& right)
+        {
+            if (left.base && right.base)
+            {
+                return operation->emitError() << "adds two pointers, which no address the conversion reads does.";
+            }
+            Affine sum   = left;
+            sum.base     = left.base ? left.base : right.base;
+            sum.constant = left.constant + right.constant;
+            for (const auto [dimension, stride] : llvm::enumerate(right.strides)) sum.strides[dimension] += stride;
+            for (const auto& [counter, step] : right.counters) sum.AddStep(counter, step);
+            return sum;
+        }
+
+        /// Returns whether `form` is a constant alone.
+        static bool IsConstant(const Affine& form)
+        {
+            return !form.base && form.counters.empty() && llvm::all_of(form.strides, [](int64_t s) {
+                return s == 0;
+            });
+        }
+
+        /// Resolves a value carried around `loop`, which must advance by a constant each iteration.
+        // NOLINTNEXTLINE(misc-no-recursion): recurses once per operation computing the address, a short chain.
+        FailureOr<Affine> Carried(scf::ForOp loop, BlockArgument argument)
+        {
+            const unsigned index = argument.getArgNumber() - loop.getNumInductionVars();
+            auto advance         = loop.getYieldedValues()[index].getDefiningOp<tt::AddPtrOp>();
+            if (!advance || advance.getPtr() != argument)
+            {
+                return loop.emitError() << "carries an address that advances by something other than a constant "
+                                        << "each iteration, which the conversion is unable to follow.";
+            }
+            const FailureOr<Affine> delta = Of(advance.getOffset());
+            const FailureOr<Loop> bounds  = Bounds(loop);
+            if (failed(delta) || failed(bounds)) return failure();
+            if (!IsConstant(*delta) || delta->constant % bounds->step != 0)
+            {
+                return advance.emitError() << "advances a carried address by something other than a whole multiple "
+                                           << "of the loop's step, which the conversion is unable to follow.";
+            }
+            FailureOr<Affine> form = Of(loop.getInitArgs()[index]);
+            if (failed(form)) return failure();
+            form->AddStep(loop.getInductionVar(), delta->constant / bounds->step);
+            return form;
+        }
+
+        /// Resolves `value` from its definition.
+        // NOLINTNEXTLINE(misc-no-recursion): recurses once per operation computing the address, a short chain.
+        FailureOr<Affine> Compute(Value value)
+        {
+            Affine form;
+            form.strides.assign(Rank(value), 0);
+
+            if (const auto argument = dyn_cast<BlockArgument>(value))
+            {
+                Operation* owner = argument.getOwner()->getParentOp();
+                if (llvm::isa<tt::FuncOp>(owner) && llvm::isa<tt::PointerType>(value.getType()))
+                {
+                    form.base = value;
+                    return form;
+                }
+                if (auto loop = dyn_cast<scf::ForOp>(owner))
+                {
+                    if (value != loop.getInductionVar()) return Carried(loop, argument);
+                    form.counters.emplace_back(value, 1);
+                    return form;
+                }
+                return owner->emitError() << "passes an address through a block argument the conversion is unable "
+                                          << "to follow.";
+            }
+
+            APInt integer;
+            if (matchPattern(value, m_ConstantInt(&integer)))
+            {
+                form.constant = integer.getSExtValue();
+                return form;
+            }
+
+            Operation* operation = value.getDefiningOp();
+            if (auto range = dyn_cast<tt::MakeRangeOp>(operation))
+            {
+                form.constant   = range.getStart();
+                form.strides[0] = 1;
+                return form;
+            }
+            if (auto splat = dyn_cast<tt::SplatOp>(operation))
+            {
+                FailureOr<Affine> scalar = Of(splat.getSrc());
+                if (failed(scalar)) return failure();
+                scalar->strides.assign(Rank(value), 0);
+                return scalar;
+            }
+            if (auto expand = dyn_cast<tt::ExpandDimsOp>(operation))
+            {
+                FailureOr<Affine> source = Of(expand.getSrc());
+                if (failed(source)) return failure();
+                source->strides.insert(source->strides.begin() + expand.getAxis(), 0);
+                return source;
+            }
+            if (auto broadcast = dyn_cast<tt::BroadcastOp>(operation)) return Of(broadcast.getSrc());
+            if (auto advance = dyn_cast<tt::AddPtrOp>(operation))
+            {
+                const FailureOr<Affine> pointer = Of(advance.getPtr());
+                const FailureOr<Affine> offset  = Of(advance.getOffset());
+                if (failed(pointer) || failed(offset)) return failure();
+                return Sum(operation, *pointer, *offset);
+            }
+            if (auto addition = dyn_cast<arith::AddIOp>(operation))
+            {
+                const FailureOr<Affine> left  = Of(addition.getLhs());
+                const FailureOr<Affine> right = Of(addition.getRhs());
+                if (failed(left) || failed(right)) return failure();
+                return Sum(operation, *left, *right);
+            }
+            if (auto product = dyn_cast<arith::MulIOp>(operation))
+            {
+                FailureOr<Affine> left  = Of(product.getLhs());
+                FailureOr<Affine> right = Of(product.getRhs());
+                if (failed(left) || failed(right)) return failure();
+                if (!IsConstant(*right)) std::swap(left, right);
+                if (!IsConstant(*right) || left->base)
+                {
+                    return operation->emitError() << "multiplies an address by something other than a constant, "
+                                                  << "which leaves it outside the affine forms the conversion reads.";
+                }
+                const int64_t scale = right->constant;
+                left->constant *= scale;
+                for (int64_t& stride : left->strides) stride *= scale;
+                for (auto& [counter, step] : left->counters) step *= scale;
+                return left;
+            }
+            return operation->emitError() << "computes an address in a way the conversion is unable to follow. An "
+                                          << "address must be a pointer argument plus sums and constant multiples of "
+                                          << "ranges, loop counters and constants.";
+        }
+    };
+
+    /// Returns the constant value `value` holds or splats, if it is a float constant.
+    std::optional<double> FloatConstant(Value value)
+    {
+        APFloat bound(0.0);
+        if (!matchPattern(value, m_ConstantFloat(&bound))) return std::nullopt;
+        bool lost = false;
+        bound.convert(APFloat::IEEEdouble(), APFloat::rmNearestTiesToEven, &lost);
+        return bound.convertToDouble();
+    }
+
+    /// Returns whether `value` is a float constant within the matching tolerance of `expected`.
+    bool IsFloat(Value value, const double expected)
+    {
+        const std::optional<double> constant = FloatConstant(value);
+        return constant && std::abs(*constant - expected) <= kConstantTolerance * std::abs(expected);
+    }
+
+    /// Returns the operands of `value`'s definition when it is a `BinaryOp`, in both orders, or an empty list.
+    template <typename BinaryOp>
+    SmallVector<std::pair<Value, Value>, 2> Orders(Value value)
+    {
+        auto operation = value ? value.getDefiningOp<BinaryOp>() : BinaryOp {};
+        if (!operation) return {};
+        return {
+            {operation.getLhs(), operation.getRhs()},
+            {operation.getRhs(), operation.getLhs()}
+        };
+    }
+
+    /// Returns the value `value` broadcasts along a new dimension `axis`, or null when it is no such broadcast.
+    Value Broadcasted(Value value, const int32_t axis)
+    {
+        if (!value) return {};
+        auto broadcast = value.getDefiningOp<tt::BroadcastOp>();
+        auto expand    = (broadcast ? broadcast.getSrc() : value).getDefiningOp<tt::ExpandDimsOp>();
+        return expand && static_cast<int32_t>(expand.getAxis()) == axis ? expand.getSrc() : Value {};
+    }
+
+    /// Returns the value `value` widens from, or `value` itself when it is no widening.
+    Value Narrow(Value value)
+    {
+        auto widened = value ? value.getDefiningOp<arith::ExtFOp>() : arith::ExtFOp {};
+        return widened ? widened.getIn() : value;
+    }
+
+    /// Returns the unmasked load defining `value`, or a null op.
+    tt::LoadOp Load(Value value)
+    {
+        auto load = value ? value.getDefiningOp<tt::LoadOp>() : tt::LoadOp {};
+        return load && !load.getMask() ? load : tt::LoadOp {};
+    }
+
+    /// Returns the load the exact GELU in `value` activates, or a null op when `value` is no GELU of a widened load.
+    tt::LoadOp Gelu(Value value)
+    {
+        auto narrowed = value.getDefiningOp<arith::TruncFOp>();
+        if (!narrowed) return {};
+        for (const auto& [half, error] : Orders<arith::MulFOp>(narrowed.getIn()))
+        {
+            for (const auto& [argument, factor] : Orders<arith::MulFOp>(half))
+            {
+                if (!IsFloat(factor, kGeluHalf)) continue;
+                for (const auto& [function, one] : Orders<arith::AddFOp>(error))
+                {
+                    auto erf = function.getDefiningOp<math::ErfOp>();
+                    if (!erf || !IsFloat(one, 1.0)) continue;
+                    auto quotient = erf.getOperand().getDefiningOp<arith::DivFOp>();
+                    if (!quotient || quotient.getLhs() != argument || !IsFloat(quotient.getRhs(), kRootTwo)) continue;
+                    if (auto load = Load(Narrow(argument)); load && Narrow(argument) != argument) return load;
+                }
+            }
+        }
+        return {};
+    }
+
+    /// Returns the term `value`'s loop adds into a zeroed accumulator each iteration, or null, and the loop.
+    Value Accumulated(Value value, scf::ForOp& loop)
+    {
+        const auto result = dyn_cast_if_present<OpResult>(value);
+        loop              = result ? dyn_cast<scf::ForOp>(result.getOwner()) : scf::ForOp {};
+        if (!loop) return {};
+        const unsigned index = result.getResultNumber();
+        if (!IsFloat(loop.getInitArgs()[index], 0.0)) return {};
+        Value carried = loop.getRegionIterArgs()[index];
+        for (const auto& [accumulator, term] : Orders<arith::AddFOp>(loop.getYieldedValues()[index]))
+        {
+            if (accumulator == carried) return term;
+        }
+        return {};
+    }
+
+    /// Returns the tensor `value` sums along its features, or null when it is no such sum.
+    Value FeatureSum(Value value)
+    {
+        auto reduce = value ? value.getDefiningOp<tt::ReduceOp>() : tt::ReduceOp {};
+        if (!reduce || reduce.getSrcs().size() != 1 || reduce.getAxis() != kFeatureAxis) return {};
+        return isa_and_nonnull<arith::AddFOp>(reduce.getSingleCombiner()) ? reduce.getSrcs()[0] : Value {};
+    }
+
+    /// Stores the loops walking one operand's rows and columns, each absent when the kernel's shape gives it one
+    /// iteration and the canonicalizer folds it away.
+    struct Walk
+    {
+        std::optional<Loop> rows;     ///< The loop advancing the operand one row per unit of its counter.
+        std::optional<Loop> columns;  ///< The loop advancing the operand one column per unit of its counter.
+    };
+
+    /// Returns whether two optional loops are the same loop or both absent.
+    bool Same(const std::optional<Loop>& left, const std::optional<Loop>& right)
+    {
+        return left.has_value() == right.has_value() && (!left || left->op == right->op);
+    }
+
+    /// Appends `loop`'s counter advancing `step` elements to `counters`, when the loop is present.
+    void AddCounter(SmallVector<Counter>& counters, const std::optional<Loop>& loop, const int64_t step)
+    {
+        if (loop) counters.emplace_back(loop->counter, step);
+    }
+
+    /// Returns the term a zeroed accumulator `value` sums, through the loop accumulating it in `scope` when there is
+    /// one, or null when `value` is no such sum.
+    Value Summand(Value value, Operation* scope)
+    {
+        scf::ForOp loop;
+        Value term = Accumulated(value, loop);
+        if (loop) return term && loop->getParentOp() == scope ? term : Value {};
+
+        // Reads a loop of one iteration, which the canonicalizer folds into the zeroed accumulator plus its one term.
+        for (const auto& [zero, single] : Orders<arith::AddFOp>(value))
+        {
+            if (IsFloat(zero, 0.0)) return single;
+        }
+        return value;
+    }
+
+    /// Converts one Triton kernel into the minitpu kernel computing one of its token blocks.
+    class KernelConversion
+    {
+      public:
+        /// Prepares to convert `function`.
+        explicit KernelConversion(tt::FuncOp function) : _function(function)
+        {}
+
+        /**
+         * @brief Converts the kernel, whose one store `store` writes its result, replacing it with a minitpu kernel.
+         *
+         * @param store the kernel's only store.
+         * @returns success once the kernel is replaced, failure with a diagnostic otherwise.
+         */
+        LogicalResult Convert(tt::StoreOp store)
+        {
+            SmallVector<tt::DotOp> products;
+            bool reduces = false;
+            _function.walk([&](Operation* operation) {
+                if (auto dot = dyn_cast<tt::DotOp>(operation)) products.push_back(dot);
+                if (llvm::isa<tt::ReduceOp>(operation)) reduces = true;
+            });
+            if (products.size() > 1)
+            {
+                return _function.emitError() << "takes " << products.size() << " dot products. A product converts "
+                                             << "into minitpu.matmul when one dot product accumulates its result.";
+            }
+            if (!products.empty()) return ConvertMatmul(products.front(), store);
+            if (reduces) return ConvertLayernorm(store);
+            return ConvertAdd(store);
+        }
+
+      private:
+        /// Stores the kernel being converted.
+        tt::FuncOp _function;
+
+        /// Stores the addresses resolved so far.
+        AddressAnalysis _addresses;
+
+        /// Returns the loops enclosing `operation`, innermost first, below `scope` or else the kernel.
+        FailureOr<SmallVector<Loop>> Enclosing(Operation* operation, Operation* scope = nullptr)
+        {
+            SmallVector<Loop> loops;
+            for (Operation* parent = operation->getParentOp(); parent && parent != scope && parent != _function;
+                 parent            = parent->getParentOp())
+            {
+                auto loop = dyn_cast<scf::ForOp>(parent);
+                if (!loop)
+                {
+                    return parent->emitError() << "is control flow the conversion is unable to read. A kernel's "
+                                               << "tiles may sit only in counted scf.for loops.";
+                }
+                const FailureOr<Loop> bounds = Bounds(loop);
+                if (failed(bounds)) return failure();
+                loops.push_back(*bounds);
+            }
+            return loops;
+        }
+
+        /**
+         * @brief Finds the loops among `loops` walking the rows and the columns of the two-dimensional operand
+         * `pointer` addresses.
+         *
+         * @param access the load or store reading it, which carries the diagnostic.
+         * @param role the operand's name, as the diagnostic names it.
+         * @param pointer the address.
+         * @param loops the loops that may walk it.
+         * @returns the loops found, or failure with a diagnostic when a loop walks it any other way.
+         */
+        FailureOr<Walk> Classify(Operation* access, StringRef role, Value pointer, ArrayRef<Loop> loops)
+        {
+            const FailureOr<Affine> form = _addresses.Of(pointer);
+            if (failed(form)) return failure();
+            if (form->strides.size() != 2)
+            {
+                return access->emitError() << "addresses the " << role << " as a tensor of " << form->strides.size()
+                                           << " dimensions. A tile op's operands are tiles of rows and columns.";
+            }
+            Walk walk;
+            for (const Loop& loop : loops)
+            {
+                const int64_t step = form->Step(loop.counter);
+                if (step == 0) continue;
+                std::optional<Loop>& slot = step == form->strides[0] ? walk.rows : walk.columns;
+                if ((step != form->strides[0] && step != form->strides[1]) || slot)
+                {
+                    return loop.op->emitError() << "walks the " << role << " " << step << " elements per unit of its "
+                                                << "counter, which is neither one row nor one column of it.";
+                }
+                slot = loop;
+            }
+            return walk;
+        }
+
+        /**
+         * @brief Holds the address `pointer` resolves to to a dense row-major operand.
+         *
+         * @param access the load or store reading it, which carries the diagnostic.
+         * @param role the operand's name, as the diagnostic names it.
+         * @param pointer the address.
+         * @param strides the elements each tensor dimension must advance.
+         * @param counters the elements each loop counter must advance.
+         * @returns the pointer argument it is based on, or failure with a diagnostic.
+         */
+        FailureOr<Value>
+        Expect(Operation* access, StringRef role, Value pointer, ArrayRef<int64_t> strides, ArrayRef<Counter> counters)
+        {
+            const FailureOr<Affine> form = _addresses.Of(pointer);
+            if (failed(form)) return failure();
+            bool matches = form->base && form->constant == 0 && ArrayRef<int64_t>(form->strides) == strides &&
+                           form->counters.size() == counters.size();
+            for (const auto& [counter, step] : counters) matches = matches && form->Step(counter) == step;
+            if (matches) return form->base;
+
+            InFlightDiagnostic error = access->emitError()
+                                    << "addresses the " << role << " in a layout the host does not pack it in. "
+                                    << "Each operand must be a dense row-major tensor read from its pointer argument, "
+                                    << "one launch per block of tokens.";
+            error.attachNote() << "expected element strides [" << strides << "] and found [" << form->strides
+                               << "] with " << form->counters.size() << " loop step(s) and offset " << form->constant;
+            return failure();
+        }
+
+        /**
+         * @brief Holds the operands' pointer arguments to the kernel's arguments, in order and with nothing else, the
+         * order the image's launch arguments follow.
+         *
+         * @param bases the pointer argument each operand is based on, in launch order.
+         * @param roles the operands' names, as the diagnostic names them.
+         * @returns success when they match, failure with a diagnostic otherwise.
+         */
+        LogicalResult Arguments(ArrayRef<Value> bases, ArrayRef<StringRef> roles)
+        {
+            bool ordered = _function.getNumArguments() == bases.size();
+            for (const auto [position, base] : llvm::enumerate(bases))
+            {
+                ordered = ordered && cast<BlockArgument>(base).getArgNumber() == position;
+            }
+            if (ordered) return success();
+            return _function.emitError() << "must take exactly its " << llvm::join(roles, ", ")
+                                         << " pointers, in that order, which is the order its launch passes them.";
+        }
+
+        /// Opens the minitpu kernel that replaces the Triton kernel and returns a builder at its start.
+        OpBuilder Open()
+        {
+            OpBuilder builder(_function);
+            auto kernel = KernelOp::create(builder, _function.getLoc(), _function.getSymName());
+            builder.setInsertionPointToStart(&kernel.getBody().emplaceBlock());
+            return builder;
+        }
+
+        /// Returns the launch argument `index`.
+        Value Argument(OpBuilder& builder, const uint32_t index)
+        {
+            return ArgOp::create(builder, _function.getLoc(), builder.getI32Type(), index).getResult();
+        }
+
+        /// Refuses the kernel with `message`, naming the family it was read as.
+        static LogicalResult Refuse(Operation* operation, StringRef family, StringRef message)
+        {
+            return operation->emitError() << "is unable to be read as a " << family << ": " << message;
+        }
+
+        /// Refuses a tile whose rows differ from the block loop's step, which the host launches the image once per.
+        static LogicalResult
+        CheckBlock(Operation* operation, StringRef family, const std::optional<Loop>& block, const int64_t tokens)
+        {
+            if (!block || block->step == tokens) return success();
+            return Refuse(operation, family, "the loop over token blocks must step by the tile's rows.");
+        }
+
+        /// Converts a kernel whose one dot product accumulates its result into minitpu.matmul.
+        LogicalResult ConvertMatmul(tt::DotOp product, tt::StoreOp store)
+        {
+            constexpr StringRef kFamily = "matrix product";
+            const bool activate         = static_cast<bool>(Gelu(product.getA()));
+            tt::LoadOp activation       = activate ? Gelu(product.getA()) : Load(product.getA());
+            tt::LoadOp weight           = Load(product.getB());
+            if (!activation || !weight || store.getMask())
+            {
+                return Refuse(
+                    product,
+                    kFamily,
+                    "both operands must be unmasked loads, the left one optionally through the exact GELU, "
+                    "and the store must be unmasked."
+                );
+            }
+
+            // Finds each loop by what it walks: the token blocks walk the activations' rows, the contraction their
+            // columns and the weights' rows, and the column loop the weights' columns.
+            const FailureOr<SmallVector<Loop>> loops = Enclosing(product);
+            if (failed(loops)) return failure();
+            const FailureOr<Walk> left  = Classify(activation, "activations", activation.getPtr(), *loops);
+            const FailureOr<Walk> right = Classify(weight, "weights", weight.getPtr(), *loops);
+            if (failed(left) || failed(right)) return failure();
+            const std::optional<Loop>& block       = left->rows;
+            const std::optional<Loop>& contraction = left->columns;
+            const std::optional<Loop>& columns     = right->columns;
+            const size_t walked                    = (block ? 1 : 0) + (contraction ? 1 : 0) + (columns ? 1 : 0);
+            if (!Same(contraction, right->rows) || walked != loops->size())
+            {
+                return Refuse(
+                    product,
+                    kFamily,
+                    "each loop must walk the token blocks, the contraction or the output columns, the "
+                    "contraction stepping the activations' columns and the weights' rows together."
+                );
+            }
+
+            // Holds the accumulator to one carried around the contraction, or to the dot product's own when the
+            // contraction takes one step, starting from zero or from a bias row.
+            Value start  = product.getC();
+            Value result = product.getResult();
+            if (contraction)
+            {
+                scf::ForOp loop      = contraction->op;
+                const auto carried   = dyn_cast<BlockArgument>(product.getC());
+                const unsigned first = loop.getNumInductionVars();
+                if (!carried || carried.getOwner()->getParentOp() != loop || carried.getArgNumber() < first ||
+                    loop.getYieldedValues()[carried.getArgNumber() - first] != product.getResult())
+                {
+                    return Refuse(product, kFamily, "its accumulator must be carried around the contraction loop.");
+                }
+                start  = loop.getInitArgs()[carried.getArgNumber() - first];
+                result = loop.getResult(carried.getArgNumber() - first);
+            }
+            tt::LoadOp bias;
+            if (!IsFloat(start, 0.0)) bias = Load(Narrow(Broadcasted(start, kTokenAxis)));
+            if (!IsFloat(start, 0.0) && !bias)
+            {
+                return Refuse(product, kFamily, "its accumulator must start from zero or from a broadcast bias row.");
+            }
+
+            // Reads a bias the kernel adds once the contraction ends the same as one the accumulator starts from.
+            Value stored = store.getValue();
+            if (!bias)
+            {
+                for (const auto& [total, row] : Orders<arith::AddFOp>(stored))
+                {
+                    tt::LoadOp added = Load(Narrow(Broadcasted(row, kTokenAxis)));
+                    if (total != result || !added) continue;
+                    bias   = added;
+                    stored = total;
+                }
+            }
+            if (stored != result) return Refuse(store, kFamily, "the kernel must store the accumulated product.");
+
+            const ArrayRef<int64_t> tile = Shape(product.getA());
+            const int64_t tokens         = tile[0];
+            const int64_t k              = contraction ? contraction->upper : tile[1];
+            const int64_t n              = columns ? columns->upper : Shape(product.getB())[1];
+            if ((contraction && contraction->step != tile[1]) || (columns && columns->step != Shape(product.getB())[1]))
+            {
+                return Refuse(
+                    product,
+                    kFamily,
+                    "the contraction and column loops must step by the tile's depth and width."
+                );
+            }
+            if (failed(CheckBlock(product, kFamily, block, tokens))) return failure();
+            Type bf16 = BFloat16Type::get(product.getContext());
+            if (Pointee(activation.getPtr()) != bf16 || Pointee(weight.getPtr()) != bf16 ||
+                Pointee(store.getPtr()) != Float32Type::get(product.getContext()) ||
+                (bias && Pointee(bias.getPtr()) != bf16))
+            {
+                return Refuse(
+                    product,
+                    kFamily,
+                    "the operands and the bias must be BF16 and the result FP32, the types the array reads "
+                    "and drains."
+                );
+            }
+
+            SmallVector<Counter> reads;
+            AddCounter(reads, block, k);
+            AddCounter(reads, contraction, 1);
+            SmallVector<Counter> weighs;
+            AddCounter(weighs, columns, 1);
+            AddCounter(weighs, contraction, n);
+            SmallVector<Counter> drains;
+            AddCounter(drains, block, n);
+            AddCounter(drains, columns, 1);
+            SmallVector<Counter> biases;
+            AddCounter(biases, columns, 1);
+            const FailureOr<Value> activations = Expect(activation, "activations", activation.getPtr(), {k, 1}, reads);
+            const FailureOr<Value> weights     = Expect(weight, "weights", weight.getPtr(), {n, 1}, weighs);
+            const FailureOr<Value> drain       = Expect(store, "result", store.getPtr(), {n, 1}, drains);
+            const FailureOr<Value> offsets =
+                bias ? Expect(bias, "bias", bias.getPtr(), {1}, biases) : FailureOr<Value>(Value {});
+            if (failed(activations) || failed(weights) || failed(drain) || failed(offsets)) return failure();
+            if (failed(
+                    bias ? Arguments(
+                               {*activations, *weights, *drain, *offsets},
+                               {"activations", "weights", "result", "bias"}
+                           )
+                         : Arguments({*activations, *weights, *drain}, {"activations", "weights", "result"})
+                ))
+            {
+                return failure();
+            }
+
+            OpBuilder builder = Open();
+            Value first       = Argument(builder, 0);
+            Value second      = Argument(builder, 1);
+            Value third       = Argument(builder, 2);
+            Value fourth      = bias ? Argument(builder, 3) : Value {};
+            MatmulOp::create(
+                builder,
+                _function.getLoc(),
+                first,
+                second,
+                third,
+                fourth,
+                static_cast<uint32_t>(tokens),
+                static_cast<uint32_t>(k),
+                static_cast<uint32_t>(n),
+                activate
+            );
+            return success();
+        }
+
+        /// Converts a kernel storing the elementwise sum of two operands, one optionally a broadcast feature row, into
+        /// minitpu.add.
+        LogicalResult ConvertAdd(tt::StoreOp store)
+        {
+            constexpr StringRef kFamily = "sum";
+            tt::LoadOp left;
+            tt::LoadOp right;
+            bool broadcast = false;
+            for (const auto& [streamed, other] : Orders<arith::AddFOp>(store.getValue()))
+            {
+                if (!Load(streamed)) continue;
+                left      = Load(streamed);
+                right     = Load(other);
+                broadcast = !right;
+                if (broadcast) right = Load(Broadcasted(other, kTokenAxis));
+                if (right) break;
+            }
+            if (!left || !right || store.getMask())
+            {
+                return Refuse(
+                    store,
+                    kFamily,
+                    "the kernel must store the sum of two unmasked loads, the right one optionally a feature "
+                    "row broadcast over the tokens, through an unmasked store. The conversion recognises no "
+                    "other kernel without a dot product or a reduction."
+                );
+            }
+
+            const FailureOr<SmallVector<Loop>> loops = Enclosing(store);
+            if (failed(loops)) return failure();
+            const FailureOr<Walk> walk = Classify(store, "result", store.getPtr(), *loops);
+            if (failed(walk)) return failure();
+            const size_t walked = (walk->rows ? 1 : 0) + (walk->columns ? 1 : 0);
+            if (walked != loops->size())
+            {
+                return Refuse(store, kFamily, "each loop must walk the token blocks or the features.");
+            }
+            const ArrayRef<int64_t> tile = Shape(store.getValue());
+            const int64_t features       = walk->columns ? walk->columns->upper : tile[1];
+            if (walk->columns && walk->columns->step != tile[1])
+            {
+                return Refuse(store, kFamily, "the feature loop must step by the tile's width.");
+            }
+            if (failed(CheckBlock(store, kFamily, walk->rows, tile[0]))) return failure();
+            Type bf16 = BFloat16Type::get(store.getContext());
+            if (Pointee(left.getPtr()) != bf16 || Pointee(right.getPtr()) != bf16 || Pointee(store.getPtr()) != bf16)
+            {
+                return Refuse(store, kFamily, "the operands and the result must be BF16.");
+            }
+
+            SmallVector<Counter> streamed;
+            AddCounter(streamed, walk->rows, features);
+            AddCounter(streamed, walk->columns, 1);
+            SmallVector<Counter> row;
+            AddCounter(row, walk->columns, 1);
+            const FailureOr<Value> first  = Expect(left, "left operand", left.getPtr(), {features, 1}, streamed);
+            const FailureOr<Value> second = broadcast
+                                              ? Expect(right, "bias row", right.getPtr(), {1}, row)
+                                              : Expect(right, "right operand", right.getPtr(), {features, 1}, streamed);
+            const FailureOr<Value> output = Expect(store, "result", store.getPtr(), {features, 1}, streamed);
+            if (failed(first) || failed(second) || failed(output)) return failure();
+            if (failed(Arguments({*first, *second, *output}, {"left", "right", "result"}))) return failure();
+
+            OpBuilder builder = Open();
+            Value a           = Argument(builder, 0);
+            Value b           = Argument(builder, 1);
+            Value c           = Argument(builder, 2);
+            AddOp::create(
+                builder,
+                _function.getLoc(),
+                a,
+                b,
+                c,
+                static_cast<uint32_t>(tile[0]),
+                static_cast<uint32_t>(features),
+                broadcast
+            );
+            return success();
+        }
+
+        /// Converts a kernel normalising each token over its features, then scaling and shifting it by gamma and beta,
+        /// into minitpu.layernorm.
+        LogicalResult ConvertLayernorm(tt::StoreOp store)
+        {
+            constexpr StringRef kFamily              = "LayerNorm";
+            const FailureOr<SmallVector<Loop>> loops = Enclosing(store);
+            if (failed(loops)) return failure();
+            const FailureOr<Walk> walk = Classify(store, "result", store.getPtr(), *loops);
+            if (failed(walk)) return failure();
+            if ((walk->rows ? 1U : 0U) + (walk->columns ? 1U : 0U) != loops->size())
+            {
+                return Refuse(store, kFamily, "each loop must walk the token blocks or the features.");
+            }
+            const std::optional<Loop>& block = walk->rows;
+            const ArrayRef<int64_t> tile     = Shape(store.getValue());
+            const int64_t features           = walk->columns ? walk->columns->upper : tile[1];
+            scf::ForOp blocks                = block ? block->op : scf::ForOp {};
+            Operation* scope                 = blocks ? blocks.getOperation() : _function.getOperation();
+
+            // Holds a load of the normalised rows, in whichever feature loop it sits, to the row-major input.
+            Value input;
+            auto expect_rows = [&](tt::LoadOp load) -> bool {
+                if (!load) return false;
+                const FailureOr<SmallVector<Loop>> around = Enclosing(load);
+                if (failed(around)) return false;
+                const FailureOr<Walk> reads = Classify(load, "rows", load.getPtr(), *around);
+                if (failed(reads) || !Same(reads->rows, block)) return false;
+                const int64_t width = reads->columns ? reads->columns->upper : Shape(load)[1];
+                if (width != features || (reads->columns && reads->columns->step != Shape(load)[1])) return false;
+                SmallVector<Counter> counters;
+                AddCounter(counters, block, features);
+                AddCounter(counters, reads->columns, 1);
+                const FailureOr<Value> base = Expect(load, "rows", load.getPtr(), {features, 1}, counters);
+                if (failed(base) || (input && *base != input)) return false;
+                input = *base;
+                return true;
+            };
+            // Holds a sum along the features to one over the whole width, divided by it.
+            auto mean_of = [&](Value value) -> Value {
+                auto quotient = value ? value.getDefiningOp<arith::DivFOp>() : arith::DivFOp {};
+                if (!quotient || !IsFloat(quotient.getRhs(), static_cast<double>(features))) return {};
+                Value sum = FeatureSum(quotient.getLhs());
+                return sum ? Summand(sum, scope) : Value {};
+            };
+
+            // Reads the store as truncf(((x - mean) * scale) * gamma + beta), each operation in either order.
+            auto narrowed = store.getValue().getDefiningOp<arith::TruncFOp>();
+            Value centred;
+            Value scale;
+            tt::LoadOp gamma;
+            tt::LoadOp beta;
+            for (const auto& [scaled, shift] : Orders<arith::AddFOp>(narrowed ? narrowed.getIn() : Value {}))
+            {
+                tt::LoadOp shifts = Load(Narrow(Broadcasted(shift, kTokenAxis)));
+                for (const auto& [normalised, row] : Orders<arith::MulFOp>(shifts ? scaled : Value {}))
+                {
+                    tt::LoadOp scales = Load(Narrow(Broadcasted(row, kTokenAxis)));
+                    for (const auto& [difference, factor] : Orders<arith::MulFOp>(scales ? normalised : Value {}))
+                    {
+                        if (centred || !Broadcasted(factor, kFeatureAxis)) continue;
+                        centred = difference;
+                        scale   = Broadcasted(factor, kFeatureAxis);
+                        gamma   = scales;
+                        beta    = shifts;
+                    }
+                }
+            }
+            if (!centred || store.getMask())
+            {
+                return Refuse(
+                    store,
+                    kFamily,
+                    "the kernel must store (x - mean) * rsqrt(variance + epsilon) * gamma + beta, narrowed "
+                    "to BF16, through an unmasked store."
+                );
+            }
+
+            // Holds the centring to the mean of the same rows, and reads the mean from its own feature loop.
+            auto centring = centred.getDefiningOp<arith::SubFOp>();
+            Value mean    = centring ? Broadcasted(centring.getRhs(), kFeatureAxis) : Value {};
+            if (!mean || !expect_rows(Load(Narrow(centring.getLhs()))) || !expect_rows(Load(Narrow(mean_of(mean)))))
+            {
+                return Refuse(store, kFamily, "each token must be centred by the mean of its own features.");
+            }
+
+            // Reads the scale as rsqrt(sum((x - mean)^2) / width + epsilon), the squares centred by the same mean.
+            auto root = scale.getDefiningOp<math::RsqrtOp>();
+            std::optional<double> epsilon;
+            Value variance;
+            for (const auto& [quotient, floor] : Orders<arith::AddFOp>(root ? root.getOperand() : Value {}))
+            {
+                if (variance || !FloatConstant(floor) || !(*FloatConstant(floor) > 0.0)) continue;
+                epsilon  = FloatConstant(floor);
+                variance = mean_of(quotient);
+            }
+            auto square    = variance ? variance.getDefiningOp<arith::MulFOp>() : arith::MulFOp {};
+            auto deviation = square && square.getLhs() == square.getRhs()
+                               ? square.getLhs().getDefiningOp<arith::SubFOp>()
+                               : arith::SubFOp {};
+            if (!deviation || Broadcasted(deviation.getRhs(), kFeatureAxis) != mean ||
+                !expect_rows(Load(Narrow(deviation.getLhs()))))
+            {
+                return Refuse(
+                    store,
+                    kFamily,
+                    "each token must be scaled by rsqrt of its centred squares' mean plus a positive "
+                    "epsilon."
+                );
+            }
+
+            if (walk->columns && walk->columns->step != tile[1])
+            {
+                return Refuse(store, kFamily, "the feature loop must step by the tile's width.");
+            }
+            if (failed(CheckBlock(store, kFamily, block, tile[0]))) return failure();
+            Type bf16 = BFloat16Type::get(store.getContext());
+            if (Pointee(input) != bf16 || Pointee(gamma.getPtr()) != bf16 || Pointee(beta.getPtr()) != bf16 ||
+                Pointee(store.getPtr()) != bf16)
+            {
+                return Refuse(store, kFamily, "the rows, gamma, beta and the result must be BF16.");
+            }
+
+            SmallVector<Counter> row;
+            AddCounter(row, walk->columns, 1);
+            SmallVector<Counter> streamed;
+            AddCounter(streamed, block, features);
+            AddCounter(streamed, walk->columns, 1);
+            const FailureOr<Value> scales = Expect(gamma, "gamma row", gamma.getPtr(), {1}, row);
+            const FailureOr<Value> shifts = Expect(beta, "beta row", beta.getPtr(), {1}, row);
+            const FailureOr<Value> output = Expect(store, "result", store.getPtr(), {features, 1}, streamed);
+            if (failed(scales) || failed(shifts) || failed(output)) return failure();
+            if (failed(Arguments({input, *scales, *shifts, *output}, {"rows", "gamma", "beta", "result"})))
+            {
+                return failure();
+            }
+
+            OpBuilder builder = Open();
+            Value normalised  = Argument(builder, 0);
+            Value constants   = Argument(builder, 1);
+            Value result      = Argument(builder, 2);
+            LayernormOp::create(
+                builder,
+                _function.getLoc(),
+                normalised,
+                constants,
+                result,
+                static_cast<uint32_t>(tile[0]),
+                static_cast<uint32_t>(features),
+                APFloat(static_cast<float>(*epsilon))
+            );
+            return success();
+        }
+    };
+
+    /**
+     * @brief Converts one Triton kernel into a minitpu kernel and erases it.
+     *
+     * @param function the kernel.
+     * @returns success once it is replaced, failure with a diagnostic otherwise.
+     */
+    LogicalResult ConvertFunction(tt::FuncOp function)
+    {
+        SmallVector<tt::StoreOp> stores;
+        function.walk([&](tt::StoreOp store) {
+            stores.push_back(store);
+        });
+        if (stores.size() != 1)
+        {
+            return function.emitError() << "stores " << stores.size() << " times. A kernel converts into one tile op, "
+                                        << "which writes one result.";
+        }
+
+        KernelConversion conversion(function);
+        if (failed(conversion.Convert(stores.front()))) return failure();
+        function.erase();
+        return success();
+    }
+
+    /// Provides the pass converting every Triton kernel in a module into a minitpu kernel.
+    class ConvertTritonPass final : public mlir::minitpu::impl::ConvertTritonToMinitpuBase<ConvertTritonPass>
+    {
+      public:
+        void runOnOperation() override
+        {
+            SmallVector<tt::FuncOp> functions;
+            getOperation().walk([&](tt::FuncOp function) {
+                functions.push_back(function);
+            });
+            for (tt::FuncOp function : functions)
+            {
+                if (failed(ConvertFunction(function))) signalPassFailure();
+            }
+        }
+    };
+}  // namespace

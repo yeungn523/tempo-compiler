@@ -163,5 +163,32 @@ minitpu.kernel @layernorm {
   %rows = minitpu.arg 0
   %constants = minitpu.arg 1
   %output = minitpu.arg 2
-  minitpu.layernorm %rows, %constants -> %output tokens 32 features 128
+  minitpu.layernorm %rows, %constants -> %output tokens 32 features 128 epsilon 1.0e-05
+}
+
+// -----
+
+// A copy alternates two chunk buffers, loading each chunk on slot 0 while the previous drains on slot 1, its steady
+// chunks in a loop over pairs and its partial last chunk loaded at its own size.
+// CHECK-LABEL: minitpu.kernel @copy
+// CHECK:       minitpu.vmemld {{.*}} rows 128, slot 0
+// CHECK:       minitpu.flush_slot 1
+// CHECK:       minitpu.vmemld {{.*}} rows 128, slot 0
+// CHECK:       minitpu.vmemst {{.*}} rows 128, slot 1
+// CHECK:       scf.for
+// CHECK-COUNT-2: minitpu.flush_slot 3
+// CHECK:       scf.yield
+// CHECK:       minitpu.vmemld {{.*}} rows 64, slot 0
+// CHECK:       minitpu.vmemst {{.*}} rows 128, slot 1
+// CHECK:       minitpu.flush_slot 3
+// CHECK:       minitpu.vmemst {{.*}} rows 64, slot 1
+// CHECK:       minitpu.flush_slot 2
+// CHECK-NOT:   minitpu.copy
+// PROGRAM-LABEL: minitpuisa.program @copy
+// PROGRAM:       minitpuisa.lbegin 1
+// PROGRAM:       minitpuisa.halt
+minitpu.kernel @copy {
+  %source = minitpu.arg 0
+  %destination = minitpu.arg 2
+  minitpu.copy %source -> %destination rows 576 stride 64
 }

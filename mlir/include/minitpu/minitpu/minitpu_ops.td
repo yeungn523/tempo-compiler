@@ -274,14 +274,32 @@ def Minitpu_AddOp : Minitpu_Op<"add", [MemoryEffects<[MemRead, MemWrite]>]>
  * @details The rows and the output are packed as `[features / 16][tokens][16]`. The constants block holds gamma and then
  * beta, one row per 16 features, followed by the reciprocal of the width and then epsilon, each repeated across one
  * register's 64 elements, which is the block board_package/gpt2_inference.py's upload_layernorm_constants writes from
- * the image's manifest entry.
+ * the image's manifest entry. The epsilon the op carries is the one the host writes there.
  */
 def Minitpu_LayernormOp : Minitpu_Op<"layernorm", [MemoryEffects<[MemRead, MemWrite]>]>
 {
     let summary = "A block of tokens normalised over their features in host memory";
     let arguments = (ins I32:$rows, I32:$constants, I32:$output, Minitpu_Field<1, 65535>:$tokens,
-                         Minitpu_Field<1, 1048560>:$features);
-    let assemblyFormat = "$rows `,` $constants `->` $output `tokens` $tokens `features` $features attr-dict";
+                         Minitpu_Field<1, 1048560>:$features, F32Attr:$epsilon);
+    let assemblyFormat = [{
+        $rows `,` $constants `->` $output `tokens` $tokens `features` $features `epsilon` $epsilon attr-dict
+    }];
+    let hasVerifier = 1;
+}
+
+/**
+ * @brief Provides a copy of rows from one place in host memory to another, staged through VMEM.
+ *
+ * @details The copy moves `rows` rows of 32 bytes, consecutive rows `stride` bytes apart at both ends, which is how
+ * the board runtime fills its KV cache: a token block's keys and values as one contiguous run, or one token's as a
+ * row from each feature tile.
+ */
+def Minitpu_CopyOp : Minitpu_Op<"copy", [MemoryEffects<[MemRead, MemWrite]>]>
+{
+    let summary = "Rows copied from one place in host memory to another";
+    let arguments = (ins I32:$source, I32:$destination, Minitpu_Field<1, 65535>:$rows,
+                         Minitpu_Field<32, 65535>:$stride);
+    let assemblyFormat = "$source `->` $destination `rows` $rows `stride` $stride attr-dict";
     let hasVerifier = 1;
 }
 

@@ -50,10 +50,10 @@ include(AddLLVM)
 include(AddMLIR)
 include(HandleLLVMOptions)
 
-include_directories(SYSTEM ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
-include_directories(
+include_directories(SYSTEM ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS}
   "${TRITON_SOURCE_DIR}/include"
-  "${CMAKE_BINARY_DIR}/third_party/triton/include"
+  "${CMAKE_BINARY_DIR}/third_party/triton/include")
+include_directories(
   "${CMAKE_SOURCE_DIR}/include"
   "${CMAKE_BINARY_DIR}/include")
 link_directories(${LLVM_BUILD_LIBRARY_DIR})

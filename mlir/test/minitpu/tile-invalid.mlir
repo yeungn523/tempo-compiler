@@ -67,7 +67,7 @@ minitpu.kernel @layernorm_partial_register {
   %c = minitpu.arg 1
   %o = minitpu.arg 2
   // expected-error @below {{The width must be a whole number of 64, and at most 2048}}
-  minitpu.layernorm %r, %c -> %o tokens 32 features 96
+  minitpu.layernorm %r, %c -> %o tokens 32 features 96 epsilon 1.0e-05
 }
 
 // -----
@@ -77,5 +77,14 @@ minitpu.kernel @layernorm_past_one_descriptor {
   %c = minitpu.arg 1
   %o = minitpu.arg 2
   // expected-error @below {{is unable to cover 4096 features}}
-  minitpu.layernorm %r, %c -> %o tokens 32 features 4096
+  minitpu.layernorm %r, %c -> %o tokens 32 features 4096 epsilon 1.0e-05
+}
+
+// -----
+
+minitpu.kernel @copy_partial_row {
+  %s = minitpu.arg 0
+  %d = minitpu.arg 2
+  // expected-error @below {{is unable to step 48 bytes between rows}}
+  minitpu.copy %s -> %d rows 8 stride 48
 }

@@ -1,4 +1,5 @@
-"""Builds the board's image set with every kernel the MLIR pipeline covers compiled by it rather than by codegen/.
+"""Builds the board's image set with every kernel the MLIR pipeline covers compiled by it from its Triton source rather
+than by codegen/.
 """
 
 from __future__ import annotations
@@ -8,19 +9,29 @@ import json
 import pathlib
 import shutil
 import subprocess
+import sys
 import tempfile
+
+from triton.runtime import JITFunction
 
 _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parents[2]
 """Stores the path to the repository's root directory."""
+
+sys.path.insert(0, str(_HERE))
+
+from codegen import signature_of  # noqa: E402
+from codegen.frontend import compile_to_ttir  # noqa: E402
+from gpt2_triton import (gpt2_add, gpt2_add_bias, gpt2_layernorm, gpt2_matmul, gpt2_matmul_bias,  # noqa: E402
+                         gpt2_matmul_gelu)
 
 _TOOLS: pathlib.Path = _HERE / "mlir" / "build" / "bin"
 """Stores the directory minitpu-opt and minitpu-translate are built into."""
 
 _PIPELINE: str = (
-    "builtin.module(minitpu.kernel(minitpu-tile-to-vector,minitpu-allocate-vmem,minitpu-allocate-registers),"
+    "builtin.module(convert-tt-to-minitpu,minitpu.kernel(minitpu-tile-to-vector,minitpu-allocate-vmem,minitpu-allocate-registers),"
     "convert-minitpu-to-isa,minitpuisa.program(minitpuisa-pack,minitpuisa-schedule))"
 )
-"""Passes taking a kernel of tile ops to a scheduled program."""
+"""Passes taking a Triton kernel, or a kernel of tile ops, to a scheduled program."""
 
 _GEMMS: tuple[tuple[int, int, bool], ...] = (
     (768, 2304, False),
@@ -40,6 +51,10 @@ _ADDS: tuple[tuple[int, bool], ...] = (
 
 _LAYERNORMS: tuple[int, ...] = (768,)
 """Width of each LayerNorm a GPT-2 small layer launches."""
+
+_COPIES: tuple[tuple[int, int], ...] = ((3072, 32), (96, 1024))
+"""Rows and stride of each copy filling the KV cache, being a token block's keys and values after a prefill and one
+token's after a decode step."""
 
 
 def gemm_name(*, depth: int, columns: int, activate: bool, bias: bool = False) -> str:
@@ -108,17 +123,55 @@ def layernorm_kernel(*, features: int) -> str:
         "  %rows = minitpu.arg 0",
         "  %constants = minitpu.arg 1",
         "  %output = minitpu.arg 2",
-        f"  minitpu.layernorm %rows, %constants -> %output tokens 32 features {features}",
+        f"  minitpu.layernorm %rows, %constants -> %output tokens 32 features {features} epsilon 1.0e-05",
         "}",
         "",
     ])
+
+
+def copy_kernel(*, rows: int, stride: int) -> str:
+    """Returns the minitpu kernel stating one copy image's move as a tile op.
+
+    Notes:
+        A copy has no Triton source, the runtime moving the KV cache's rows without computing on them.
+
+    Args:
+        rows: The 32-byte rows the copy moves.
+        stride: The bytes between consecutive rows at both ends.
+
+    Returns:
+        The kernel's MLIR text.
+    """
+    return "\n".join([
+        f"minitpu.kernel @copy_{rows}x{stride} {{",
+        "  %source = minitpu.arg 0",
+        "  %destination = minitpu.arg 2",
+        f"  minitpu.copy %source -> %destination rows {rows} stride {stride}",
+        "}",
+        "",
+    ])
+
+
+def triton_kernel(kernel: JITFunction, **bound: int | bool) -> str:
+    """Returns the tt module of one Triton kernel at the shape its constexprs fix.
+
+    Args:
+        kernel: The function the triton.jit decorator returned.
+        **bound: The constexprs bound past the kernel's defaults.
+
+    Returns:
+        The module's MLIR text.
+    """
+    declared = {parameter.name: parameter.default for parameter in kernel.params if parameter.is_constexpr}
+    module = compile_to_ttir(kernel, signature=signature_of(kernel, operands={}), constexprs=declared | bound)
+    return module.str_nodebug()
 
 
 def compile_kernel(kernel: str, *, image: pathlib.Path) -> None:
     """Compiles one kernel through the MLIR pipeline and writes its image.
 
     Args:
-        kernel: The kernel's MLIR text.
+        kernel: The kernel's MLIR text, a Triton kernel's tt module or a minitpu kernel of tile ops.
         image: The path the image is written to.
 
     Raises:
@@ -149,12 +202,18 @@ def main() -> int:
 
     if output != images:
         shutil.copytree(images, output, dirs_exist_ok=True)
-    kernels = [(gemm_name(depth=depth, columns=columns, activate=activate, bias=bias),
-                gemm_kernel(depth=depth, columns=columns, activate=activate, bias=bias))
-               for depth, columns, activate in _GEMMS for bias in (False, True)]
-    kernels += [(f"add_{'bias_' if broadcast else ''}{features}", add_kernel(features=features, broadcast=broadcast))
+    kernels = []
+    for depth, columns, activate in _GEMMS:
+        shape = {"N": columns, "K": depth, "stride_am": depth, "stride_bk": columns, "stride_cm": columns}
+        kernels.append((gemm_name(depth=depth, columns=columns, activate=activate),
+                        triton_kernel(gpt2_matmul_gelu if activate else gpt2_matmul, **shape)))
+        kernels.append((gemm_name(depth=depth, columns=columns, activate=activate, bias=True),
+                        triton_kernel(gpt2_matmul_bias, **shape, ACTIVATE=activate)))
+    kernels += [(f"add_{'bias_' if broadcast else ''}{features}",
+                 triton_kernel(gpt2_add_bias if broadcast else gpt2_add, N=features))
                 for features, broadcast in _ADDS]
-    kernels += [(f"layernorm_{features}", layernorm_kernel(features=features)) for features in _LAYERNORMS]
+    kernels += [(f"layernorm_{features}", triton_kernel(gpt2_layernorm, N=features)) for features in _LAYERNORMS]
+    kernels += [(f"copy_{rows}x{stride}", copy_kernel(rows=rows, stride=stride)) for rows, stride in _COPIES]
     # Builds the shortest program the loader takes, an empty kernel lowering to its halt alone.
     kernels += [("halt", "minitpu.kernel @halt {\n}\n")]
     for name, kernel in kernels:

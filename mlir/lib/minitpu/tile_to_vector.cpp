@@ -9,6 +9,7 @@
 #include <mlir/Dialect/SCF/IR/SCF.h>
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <tuple>
 #include "minitpu/minitpu/passes.h"
 #include "tile_layout.h"
@@ -34,6 +35,9 @@ namespace
     /// Stores the width of a scalar register's value.
     constexpr uint32_t kScalarBits = 32;
 
+    /// Stores the most bytes one scalar addition advances a pointer by, the reach of saddi's signed immediate.
+    constexpr int64_t kAddReach = INT16_MAX;
+
     /// Provides the operations one expansion builds, each at the builder's insertion point.
     class Expansion
     {
@@ -55,10 +59,17 @@ namespace
             return arith::ConstantIntOp::create(_builder, _location, value, kScalarBits);
         }
 
-        /// Returns a scalar register advanced by `bytes`.
-        Value Advance(Value pointer, const int64_t bytes)
+        /// Returns a scalar register advanced by `bytes`, in as many additions as saddi's immediate takes.
+        Value Advance(Value pointer, int64_t bytes)
         {
-            return arith::AddIOp::create(_builder, _location, pointer, Scalar(bytes));
+            do
+            {
+                const int64_t step = std::clamp<int64_t>(bytes, -kAddReach, kAddReach);
+                pointer            = arith::AddIOp::create(_builder, _location, pointer, Scalar(step));
+                bytes -= step;
+            }
+            while (bytes != 0);
+            return pointer;
         }
 
         /// Returns a VMEM buffer of `rows` rows.
@@ -517,6 +528,127 @@ namespace
         sum.erase();
     }
 
+    /// Stores the two buffers a copy alternates between and the stride its descriptors share.
+    struct CopyBuffers
+    {
+        std::array<Value, 2> chunks;  ///< The two chunk buffers, one loading while the other drains.
+        Value stride;                 ///< The scalar holding the bytes between consecutive rows at both ends.
+    };
+
+    /// Stores the host pointers a copy advances by one chunk at a time.
+    struct CopyPointers
+    {
+        Value source;       ///< The next chunk to load.
+        Value destination;  ///< The next chunk to drain.
+    };
+
+    /// Stores what one step of a copy moves.
+    struct CopyStep
+    {
+        uint32_t parity;           ///< The buffer the step loads into, the drain reading the other.
+        uint32_t load_rows;        ///< The rows the step loads, zero once every chunk is loaded.
+        uint32_t drain_rows;       ///< The rows of the previous chunk the step drains.
+        bool first;                ///< Whether no drain precedes the step, whose slot then carries nothing to wait on.
+        bool advance_source;       ///< Whether another load follows, which reads past this one.
+        bool advance_destination;  ///< Whether another drain follows, which writes past this one.
+    };
+
+    /**
+     * @brief Builds one step of a copy: the wait, the next chunk's load on slot 0 and the previous chunk's drain on
+     * slot 1, so the drain runs beside the load.
+     *
+     * @param expansion the expansion building the step.
+     * @param buffers the copy's buffers.
+     * @param pointers the host pointers, each advanced past what the step moves when another step follows.
+     * @param step what the step moves.
+     * @param advance the bytes one chunk spans at both ends.
+     */
+    void BuildCopyStep(
+        Expansion& expansion,
+        const CopyBuffers& buffers,
+        CopyPointers& pointers,
+        const CopyStep& step,
+        const int64_t advance
+    )
+    {
+        expansion.Flush(step.first ? 1 : kBothSlots);
+        if (step.load_rows > 0)
+        {
+            expansion.Load(buffers.chunks[step.parity], 0, pointers.source, buffers.stride, step.load_rows, 0);
+            if (step.advance_source) pointers.source = expansion.Advance(pointers.source, advance);
+        }
+        expansion.Drain(buffers.chunks[1 - step.parity], 0, pointers.destination, buffers.stride, step.drain_rows, 1);
+        if (step.advance_destination) pointers.destination = expansion.Advance(pointers.destination, advance);
+    }
+
+    /// Expands one minitpu.copy into the descriptors that move it, then erases it.
+    void ExpandCopy(CopyOp copy)
+    {
+        OpBuilder builder(copy);
+        Expansion expansion(builder, copy.getLoc());
+        const Location location = copy.getLoc();
+        const uint32_t rows     = copy.getRows();
+        const uint32_t chunks   = (rows + kChunkRows - 1) / kChunkRows;
+        const int64_t advance   = int64_t {kChunkRows} * copy.getStride();
+        const uint32_t span     = std::min(rows, kChunkRows);
+        auto rows_of            = [&](const uint32_t chunk) {
+            return std::min(kChunkRows, rows - chunk * kChunkRows);
+        };
+
+        CopyBuffers buffers {
+            .chunks = {expansion.Buffer(span), chunks > 1 ? expansion.Buffer(span) : Value {}},
+            .stride = expansion.Scalar(copy.getStride()),
+        };
+        CopyPointers pointers {.source = copy.getSource(), .destination = copy.getDestination()};
+
+        // Step c loads chunk c, when one remains, and drains chunk c - 1. Every step is the same but its buffer
+        // parity, its load size and whether its pointers advance, so the steps past the first two whose loads are
+        // whole chunks that another load follows run as a loop over pairs.
+        auto step_of = [&](const uint32_t index) {
+            return CopyStep {
+                .parity              = index % 2,
+                .load_rows           = index < chunks ? rows_of(index) : 0,
+                .drain_rows          = rows_of(index - 1),
+                .first               = index == 1,
+                .advance_source      = index + 1 < chunks,
+                .advance_destination = index < chunks,
+            };
+        };
+        expansion.Load(buffers.chunks[0], 0, pointers.source, buffers.stride, rows_of(0), 0);
+        if (chunks > 1) pointers.source = expansion.Advance(pointers.source, advance);
+        uint32_t index = 1;
+        if (chunks > 1) BuildCopyStep(expansion, buffers, pointers, step_of(index++), advance);
+        const uint32_t pairs = chunks > 3 ? (chunks - 3) / 2 : 0;
+        if (pairs > 0)
+        {
+            auto loop = scf::ForOp::create(
+                builder,
+                location,
+                expansion.Index(0),      // lower bound
+                expansion.Index(pairs),  // upper bound
+                expansion.Index(1),      // step
+                ValueRange {pointers.source, pointers.destination}
+            );
+            {
+                OpBuilder::InsertionGuard guard(builder);
+                builder.setInsertionPointToStart(loop.getBody());
+                CopyPointers advancing {
+                    .source      = loop.getRegionIterArgs()[0],
+                    .destination = loop.getRegionIterArgs()[1],
+                };
+                BuildCopyStep(expansion, buffers, advancing, step_of(index), advance);
+                BuildCopyStep(expansion, buffers, advancing, step_of(index + 1), advance);
+                scf::YieldOp::create(builder, location, ValueRange {advancing.source, advancing.destination});
+            }
+            pointers.source      = loop.getResult(0);
+            pointers.destination = loop.getResult(1);
+            index += 2 * pairs;
+        }
+        for (; index <= chunks; ++index) BuildCopyStep(expansion, buffers, pointers, step_of(index), advance);
+        expansion.Flush(2);
+        copy.erase();
+    }
+
     /// Stores the most registers one LayerNorm token holds resident, beyond which it streams them from its buffer.
     constexpr uint32_t kResidentRegisters = 12;
 
@@ -761,6 +893,11 @@ namespace
                 norms.push_back(norm);
             });
             for (LayernormOp norm : norms) ExpandLayernorm(norm);
+            llvm::SmallVector<CopyOp> copies;
+            getOperation().walk([&](CopyOp copy) {
+                copies.push_back(copy);
+            });
+            for (CopyOp copy : copies) ExpandCopy(copy);
         }
     };
 }  // namespace

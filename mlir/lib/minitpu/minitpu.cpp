@@ -171,6 +171,14 @@ LogicalResult LayernormOp::verify()
     return success();
 }
 
+/// Verifies that the copy's stride is a whole number of rows, which the descriptors it issues step by.
+LogicalResult CopyOp::verify()
+{
+    if (getStride() % tile::kRowBytes == 0) return success();
+    return emitOpError() << "is unable to step " << getStride() << " bytes between rows. The stride must be a whole "
+                         << "number of " << tile::kRowBytes << "-byte rows.";
+}
+
 /// Verifies that the load's rows stay inside its buffer.
 LogicalResult VmemldOp::verify()
 {

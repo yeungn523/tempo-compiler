@@ -1,6 +1,6 @@
 """Provides the per-opcode scheduling facts the assembler schedules against.
 
-Run `python3 tools/gen_isa_doc.py --write` to generate.
+Run `python3 tools/toolchain/gen_isa_doc.py --write` to generate.
 """
 
 from __future__ import annotations

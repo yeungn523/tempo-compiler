@@ -3,7 +3,7 @@
  * @brief Provides the implemented ISA scheduling contract, which is the single source of truth every generated
  * artifact derives from.
  *
- * @details tools/gen_isa_doc.py reads this file through llvm-tblgen and writes the operation table published in
+ * @details tools/toolchain/gen_isa_doc.py reads this file through llvm-tblgen and writes the operation table published in
  * docs/ISA_AND_INTERFACES.md, the conformance package in tb/isa_latency_pkg.sv, and the scheduling facts the
  * assembler reads from codegen/isa_model.py. That tool regenerates all three under --write and exits non-zero
  * on a stale one under --check. Reading these records needs an llvm-tblgen on PATH, while the operation definitions
@@ -340,7 +340,7 @@ class ResourceValue<string value_name, int capacity_value>
  * @brief Binds one assembler constant to the resource value it must equal.
  *
  * @details codegen/asm.py runs without llvm-tblgen and cannot read this file at runtime, so its constants are written
- * out there and checked against these bindings by tools/gen_isa_doc.py --check.
+ * out there and checked against these bindings by tools/toolchain/gen_isa_doc.py --check.
  *
  * @param constant_name Names the constant as codegen/asm.py spells it.
  * @param value_name Names the resource value the constant must equal.
@@ -363,7 +363,7 @@ class AsmConstant<string constant_name, string value_name>
  *
  * @param group_name Names the capacity, which the published table renders with its underscores replaced by spaces.
  */
-class Resource<string group_name>
+class HardwareResource<string group_name>
 {
     /// Stores the capacity's name.
     string group = group_name;
@@ -381,7 +381,7 @@ class Resource<string group_name>
     string note = "";
 }
 
-def MatrixOutputFifo : Resource<"mxu_output_fifo">
+def MatrixOutputFifo : HardwareResource<"mxu_output_fifo">
 {
     let rtl_parameter = "MXU_OUTPUT_FIFO_DEPTH";
     let values = [ResourceValue<"depth", 32>,
@@ -393,7 +393,7 @@ def MatrixOutputFifo : Resource<"mxu_output_fifo">
     let note = "One per lane (mxu.sv gen_lane_output). A vmatpush streams NUM_SUBLANES activation rows and so produces that many entries; a vmatpop consumes the same across its masked beats. Overflow drops results silently -- vpu_fifo.sv has no replay path.";
 }
 
-def LoopBuffer : Resource<"loop_buffer">
+def LoopBuffer : HardwareResource<"loop_buffer">
 {
     let rtl_parameter = "LB_CAP";
     let values = [ResourceValue<"capacity_bundles", 24>];
@@ -401,7 +401,7 @@ def LoopBuffer : Resource<"loop_buffer">
     let note = "A body longer than this refetches from IRAM instead of replaying, which bounds replay rather than speed.";
 }
 
-def InstructionMemory : Resource<"iram">
+def InstructionMemory : HardwareResource<"iram">
 {
     let rtl_parameter = "IRAM_DEPTH";
     let values = [ResourceValue<"depth_bundles", 4096>];
@@ -409,7 +409,7 @@ def InstructionMemory : Resource<"iram">
     let note = "Bundles the loader places, being 2**IRAM_ADDR_WIDTH. A longer image is loaded up to this and its tail never runs, so the drain it ends on leaves the buffer untouched.";
 }
 
-def DelayField : Resource<"delay_field">
+def DelayField : HardwareResource<"delay_field">
 {
     let rtl_parameter = "DELAY_W";
     let values = [ResourceValue<"width_bits", 6>];
@@ -417,20 +417,52 @@ def DelayField : Resource<"delay_field">
     let note = "One bundle spaces at most 2**width-1 cycles, while a vmatpush result is 82 away, so every push-to-pop gap needs a filler bundle.";
 }
 
-def VectorMemory : Resource<"vmem">
+def VectorMemory : HardwareResource<"vmem">
 {
     let values = [ResourceValue<"rows_per_slot", 8192>,
                   ResourceValue<"slot_count", 2>];
     let note = "Rows one lane holds in one software-owned slot, and the slots `vmemswap` alternates between. Compute and DMA address opposite slots, so a staged region reaching past rows_per_slot wraps inside its own slot rather than faulting and returns whatever the wrap lands on. These are the compute-addressed VMEM slots, which are not the dma_slots a flush mask selects between. No localparam name is quoted here because this tree carries no RTL to hold one against.";
 }
 
-def DmaSlots : Resource<"dma_slots">
+def DmaSlots : HardwareResource<"dma_slots">
 {
     let rtl_parameter = "DMA_SLOT_COUNT";
     let values = [ResourceValue<"count", 2>];
     let asm_constants = [AsmConstant<"DMA_SLOT_COUNT", "count">];
     let note = "Descriptor slots a flush mask selects between. flush_slot blocks until dma_slot_done covers every bit of its mask and only a descriptor asserts that bit, so flushing a slot the kernel never issued on wedges the device until the PL is reprogrammed.";
 }
+
+/**
+ * @brief Stores one issue distance the machine leaves to the schedule that no register dependence carries.
+ *
+ * @details The scheduler prices vector and scalar registers by their writeback offsets. These distances guard state
+ * those offsets do not reach, being VMEM rows a store has written and the transpose staging array, and each was
+ * verified on the board. An access the rule names issues no earlier than its distance after the access it follows.
+ *
+ * @param rule_name Names the distance, which a generated constant spells in camel case.
+ * @param distance_cycles Sets the distance, in cycles from the first access's issue to the second's.
+ */
+class SpacingRule<string rule_name, int distance_cycles>
+{
+    /// Stores the distance's name.
+    string name = rule_name;
+
+    /// Stores the distance, in cycles between the two issues.
+    int cycles = distance_cycles;
+}
+
+/// A vld reading VMEM rows a vst wrote issues this long after the vst. A descriptor draining them needs no distance,
+/// since it reaches VMEM later than this after its own issue, which every drained image the board checks relies on.
+def VmemTurnaround : SpacingRule<"vmem_turnaround", 9>;
+
+/// Consecutive vtxin issue this far apart.
+def TransposeInInterval : SpacingRule<"transpose_in_interval", 2>;
+
+/// The first vtxout issues this long after the last vtxin.
+def TransposeInToOut : SpacingRule<"transpose_in_to_out", 6>;
+
+/// Consecutive vtxout issue this far apart.
+def TransposeOutInterval : SpacingRule<"transpose_out_interval", 6>;
 
 /// @brief Stores the order every generated artifact lists the records above in.
 class EmissionOrder
@@ -445,7 +477,10 @@ class EmissionOrder
     list<MatrixCommand> matrix_commands = [];
 
     /// Stores the hardware capacities, in publication order.
-    list<Resource> resources = [];
+    list<HardwareResource> resources = [];
+
+    /// Stores the issue distances the schedule keeps, in publication order.
+    list<SpacingRule> spacing_rules = [];
 }
 
 def IsaOrder : EmissionOrder
@@ -461,6 +496,8 @@ def IsaOrder : EmissionOrder
     let matrix_commands = [MatrixLoadCommand, MatrixPushCommand, MatrixPopCommand];
 
     let resources = [MatrixOutputFifo, LoopBuffer, InstructionMemory, DelayField, DmaSlots, VectorMemory];
+
+    let spacing_rules = [VmemTurnaround, TransposeInInterval, TransposeInToOut, TransposeOutInterval];
 }
 
 // The dialect's operation definitions belong beside the scheduling records they constrain. Adding them makes the file

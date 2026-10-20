@@ -1,0 +1,27 @@
+# Pins every dependency the compiler builds and runs against. The repository runs from a checkout rather than as an
+# installed distribution, so the Python dependencies are dependency groups pip installs directly, as in
+# 'pip install --group compiler --group mlir'.
+[dependency-groups]
+compiler = [
+    # Frontend. The pin is exact because mlir/ compiles this release's tt dialect from source.
+    "triton==3.8.0",
+
+    # Numerics
+    "numpy>=2,<3",
+]
+mlir = [
+    # Testing
+    "lit>=18",
+
+    # Formatting and linting, held to one release so every contributor formats and lints identically
+    "clang-format==18.1.8",
+    "clang-tidy==18.1.8",
+]
+
+# Pins the C++ toolchain mlir/ builds against, which no Python package carries. tools/toolchain/setup_toolchain.py fetches and
+# verifies it, and mlir/CMakeLists.txt refuses an LLVM built from any other commit.
+[tool.minitpu.toolchain]
+triton-tag = "v3.8.0"                                      # Must name the release the compiler group pins
+llvm-commit = "5f07f818b51b786b0a87b4e514882600ecba112f"   # Triton 3.8.0's cmake/llvm-info.json
+llvm-package = "llvm-5f07f818-ubuntu-x64-1"
+llvm-package-sha256 = "62dd9524eed689360882a7ae06132182b4a724ca5dfdca77667556fcef940022"

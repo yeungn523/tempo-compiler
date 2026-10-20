@@ -12,26 +12,31 @@ import subprocess
 import sys
 import tempfile
 
+import numpy as np
 from triton.runtime import JITFunction
 
 _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parents[2]
 """Stores the path to the repository's root directory."""
 
 sys.path.insert(0, str(_HERE))
+sys.path.insert(0, str(_HERE / "board_package"))
 
+from bf16 import _BLOCK_TOKENS, _TILE, as_bf16_words  # noqa: E402
 from codegen import signature_of  # noqa: E402
 from codegen.frontend import compile_to_ttir  # noqa: E402
-from gpt2_triton import (gpt2_add, gpt2_add_bias, gpt2_layernorm, gpt2_matmul, gpt2_matmul_bias,  # noqa: E402
-                         gpt2_matmul_gelu)
+from gpt2_triton import (gpt2_add, gpt2_add_bias, gpt2_attention, gpt2_decode_attention,  # noqa: E402
+                         gpt2_layernorm, gpt2_matmul_bias)
 
 _TOOLS: pathlib.Path = _HERE / "mlir" / "build" / "bin"
 """Stores the directory minitpu-opt and minitpu-translate are built into."""
 
 _PIPELINE: str = (
-    "builtin.module(convert-tt-to-minitpu,minitpu.kernel(minitpu-tile-to-vector,minitpu-allocate-vmem,minitpu-allocate-registers),"
+    "builtin.module(convert-tt-to-minitpu{{attention-heads={heads}}},"
+    "minitpu.kernel(minitpu-tile-to-vector,minitpu-allocate-vmem,minitpu-allocate-registers),"
     "convert-minitpu-to-isa,minitpuisa.program(minitpuisa-pack,minitpuisa-schedule))"
 )
-"""Passes taking a Triton kernel, or a kernel of tile ops, to a scheduled program."""
+"""Passes taking a Triton kernel, or a kernel of tile ops, to a scheduled program, given the heads an attention image
+walks."""
 
 _GEMMS: tuple[tuple[int, int, bool], ...] = (
     (768, 2304, False),
@@ -39,18 +44,36 @@ _GEMMS: tuple[tuple[int, int, bool], ...] = (
     (768, 3072, False),
     (3072, 768, True),
 )
-"""Depth, columns, and whether the activations pass through the GELU, for each GEMM a GPT-2 small layer launches."""
+"""Depth, columns, and whether the activations pass through the GELU, for each projection a GPT-2 small layer
+launches, every one adding its bias in the same image."""
 
 _ADDS: tuple[tuple[int, bool], ...] = (
     (768, False),
     (768, True),
-    (2304, True),
-    (3072, True),
 )
-"""Width, and whether the right operand is a broadcast bias row, for each sum a GPT-2 small layer launches."""
+"""Width, and whether the right operand is a broadcast bias row, for each sum the image set carries: a layer's
+residual add, and the bias sum the board's add check launches."""
+
+_DROPPED_BIAS_SUMS: tuple[int, ...] = (2304, 3072)
+"""Width of each bias sum the image set no longer carries, the projections adding their biases themselves."""
 
 _LAYERNORMS: tuple[int, ...] = (768,)
 """Width of each LayerNorm a GPT-2 small layer launches."""
+
+_ATTENTION_TOKENS: tuple[int, ...] = (64,)
+"""Sequence length of each causal attention a GPT-2 small prefill launches."""
+
+_DECODE_KEYS: tuple[int, ...] = (64, 256, 1024)
+"""Cache length each decode attention image walks, a step using the shortest that holds its cache."""
+
+_HEADS: int = 12
+"""Attention heads GPT-2 small's layers carry."""
+
+_HEAD: int = 64
+"""Width of one of GPT-2 small's attention heads."""
+
+_MASKED: float = -1.0e30
+"""Score a masked key takes, which no real score reaches, and the maximum each query enters its keys below."""
 
 _COPIES: tuple[tuple[int, int], ...] = ((3072, 32), (96, 1024))
 """Rows and stride of each copy filling the KV cache, being a token block's keys and values after a prefill and one
@@ -152,6 +175,39 @@ def copy_kernel(*, rows: int, stride: int) -> str:
     ])
 
 
+def attention_kernel(*, keys: int, causal: bool) -> str:
+    """Returns the minitpu kernel stating one attention image as a tile op.
+
+    Args:
+        keys: The tokens a causal attention attends to each other, or the cached keys a decode attention walks.
+        causal: Determines whether the keys are the queries tensor's own rather than a cache's.
+
+    Returns:
+        The kernel's MLIR text.
+    """
+    name = f"attention_{keys}" if causal else f"decode_attention_{keys}"
+    return "\n".join([
+        f"minitpu.kernel @{name} {{",
+        "  %constants = minitpu.arg 0",
+        *([] if causal else ["  %cache = minitpu.arg 1"]),
+        "  %queries = minitpu.arg 2",
+        f"  minitpu.attention %constants, %queries{'' if causal else ' cache %cache'} heads {_HEADS} head {_HEAD} "
+        f"keys {keys}{' causal' if causal else ''}",
+        "}",
+        "",
+    ])
+
+
+def attention_constants() -> bytes:
+    """Returns the constants block a causal attention image reads: tiles of the entering maximum and zeros, and the
+    diagonal mask tile laid out keys by queries, masking each key past its query."""
+    tile = (_TILE, _TILE)
+    keys, queries = np.indices(tile)
+    diagonal = np.where(keys > queries, np.float32(_MASKED), np.float32(0.0))
+    tiles = [np.full(tile, _MASKED, dtype=np.float32), np.zeros(tile, dtype=np.float32), diagonal]
+    return as_bf16_words(values=np.concatenate(tiles, axis=0)).tobytes()
+
+
 def triton_kernel(kernel: JITFunction, **bound: int | bool) -> str:
     """Returns the tt module of one Triton kernel at the shape its constexprs fix.
 
@@ -167,12 +223,13 @@ def triton_kernel(kernel: JITFunction, **bound: int | bool) -> str:
     return module.str_nodebug()
 
 
-def compile_kernel(kernel: str, *, image: pathlib.Path) -> None:
+def compile_kernel(kernel: str, *, image: pathlib.Path, heads: int = _HEADS) -> None:
     """Compiles one kernel through the MLIR pipeline and writes its image.
 
     Args:
         kernel: The kernel's MLIR text, a Triton kernel's tt module or a minitpu kernel of tile ops.
         image: The path the image is written to.
+        heads: The heads an attention image walks, its Triton kernel attending one of them.
 
     Raises:
         subprocess.CalledProcessError: If either tool refuses the kernel, carrying its diagnostic.
@@ -181,7 +238,8 @@ def compile_kernel(kernel: str, *, image: pathlib.Path) -> None:
         source = pathlib.Path(scratch) / "kernel.mlir"
         program = pathlib.Path(scratch) / "program.mlir"
         source.write_text(kernel)
-        subprocess.run([str(_TOOLS / "minitpu-opt"), str(source), f"-pass-pipeline={_PIPELINE}", "-o", str(program)],
+        pipeline = _PIPELINE.format(heads=heads)
+        subprocess.run([str(_TOOLS / "minitpu-opt"), str(source), f"-pass-pipeline={pipeline}", "-o", str(program)],
                        check=True)
         subprocess.run([str(_TOOLS / "minitpu-translate"), "--export-minitpu-image", str(program), "-o", str(image)],
                        check=True)
@@ -205,8 +263,6 @@ def main() -> int:
     kernels = []
     for depth, columns, activate in _GEMMS:
         shape = {"N": columns, "K": depth, "stride_am": depth, "stride_bk": columns, "stride_cm": columns}
-        kernels.append((gemm_name(depth=depth, columns=columns, activate=activate),
-                        triton_kernel(gpt2_matmul_gelu if activate else gpt2_matmul, **shape)))
         kernels.append((gemm_name(depth=depth, columns=columns, activate=activate, bias=True),
                         triton_kernel(gpt2_matmul_bias, **shape, ACTIVATE=activate)))
     kernels += [(f"add_{'bias_' if broadcast else ''}{features}",
@@ -214,6 +270,9 @@ def main() -> int:
                 for features, broadcast in _ADDS]
     kernels += [(f"layernorm_{features}", triton_kernel(gpt2_layernorm, N=features)) for features in _LAYERNORMS]
     kernels += [(f"copy_{rows}x{stride}", copy_kernel(rows=rows, stride=stride)) for rows, stride in _COPIES]
+    kernels += [(f"attention_{tokens}", triton_kernel(gpt2_attention, M=tokens)) for tokens in _ATTENTION_TOKENS]
+    kernels += [(f"decode_attention_{keys}", triton_kernel(gpt2_decode_attention, N=keys, LENGTH=keys))
+                for keys in _DECODE_KEYS]
     # Builds the shortest program the loader takes, an empty kernel lowering to its halt alone.
     kernels += [("halt", "minitpu.kernel @halt {\n}\n")]
     for name, kernel in kernels:
@@ -221,15 +280,30 @@ def main() -> int:
         compile_kernel(kernel, image=image)
         print(f"wrote {image}  {image.stat().st_size // 16} bundles, built by mlir/")
 
-    # Records each fused GEMM under its own kind, so a runtime asking for a plain GEMM never launches one, and a set
-    # without them leaves the runtime adding each bias in a launch of its own.
+    # Removes every image a layer no longer launches, its bias now added inside the product, and records each fused
+    # GEMM under its own kind with the drain the runtime allocates for it.
     manifest_path = output / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
+    dropped = [f"{gemm_name(depth=depth, columns=columns, activate=activate)}.bin" for depth, columns, activate in _GEMMS]
+    dropped += [f"add_bias_{features}.bin" for features in _DROPPED_BIAS_SUMS]
+    for name in dropped:
+        manifest.pop(name, None)
+        (output / name).unlink(missing_ok=True)
     for depth, columns, activate in _GEMMS:
-        plain = manifest[f"{gemm_name(depth=depth, columns=columns, activate=activate)}.bin"]
         manifest[f"{gemm_name(depth=depth, columns=columns, activate=activate, bias=True)}.bin"] = {
-            **plain, "kind": "gemm_bias",
+            "kind": "gemm_bias", "depth": depth, "columns": columns, "activate": activate,
+            "drain_words": _TILE * _TILE + columns * _BLOCK_TOKENS,
         }
+    # Writes each causal attention's constants block beside it, and records the masks a decode step writes as laid out
+    # keys by queries.
+    for tokens in _ATTENTION_TOKENS:
+        constants = f"attention_{tokens}_constants.bin"
+        (output / constants).write_bytes(attention_constants())
+        manifest[f"attention_{tokens}.bin"] = {"kind": "attention", "tokens": tokens, "heads": _HEADS,
+                                               "key_blocks": tokens // _TILE, "constants": constants}
+    for keys in _DECODE_KEYS:
+        manifest[f"decode_attention_{keys}.bin"] = {"kind": "decode_attention", "keys": keys, "heads": _HEADS,
+                                                    "entering": _MASKED, "stated": [], "transposed_masks": True}
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     return 0
 

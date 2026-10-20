@@ -110,6 +110,11 @@ namespace
         {
             gap = std::max<int64_t>(gap, 1);
         }
+
+        // Keeps every vtxin and vtxout in program order, since they share the transpose staging array, which no
+        // register names. The scheduler then spaces them by the array's own intervals.
+        const bool earlier_transposes = earlier.stages_transpose || earlier.drains_transpose;
+        if (earlier_transposes && (later.stages_transpose || later.drains_transpose)) gap = std::max<int64_t>(gap, 1);
         return gap;
     }
 

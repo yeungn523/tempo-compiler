@@ -687,14 +687,18 @@ def full_gemm(
             raise ValueError(message)
     column_tiles = columns // _TILE
 
-    image_bytes = _compiled_gemm(depth=depth, columns=columns, activate=activate)
+    # Runs the fused product over a zero bias where the image set carries only fused GEMMs.
+    fused = not _has_image(kind="gemm", depth=depth, columns=columns, activate=activate)
+    image_bytes = _compiled_gemm(depth=depth, columns=columns, activate=activate, bias=fused)
     weight_words = None if resident is not None else pack_weights(weights=weights)
     drain_words = _ZERO_TILE_WORDS + column_tiles * _BLOCK_TOKENS * _TILE
     result = np.empty((tokens, columns), dtype=np.float32)
 
     minitpuSetDevice(UIO_NAME)
+    d_bias = upload_bias(np.zeros(columns, dtype=np.float32)) if fused else None
     minitpuHostReset()
-    d_owned: list[int] = []
+    d_owned: list[int] = [] if d_bias is None else [d_bias.address]
+    bias_arguments = [] if d_bias is None else [d_bias.address]
 
     try:
         d_image = _stage_image(image_bytes)
@@ -728,8 +732,7 @@ def full_gemm(
             h_activations.view.view("<u2")[: block_words.size] = block_words
             minitpuMemcpy(d_activations, h_activations, block_words.nbytes, MemcpyKind.HostToDevice)
 
-            _launch(d_image, len(image_bytes),
-                                args=[d_activations, d_weights, d_drain])
+            _launch(d_image, len(image_bytes), args=[d_activations, d_weights, d_drain, *bias_arguments])
             minitpuMemcpy(h_drain, d_drain, drain_words * _ELEMENT_BYTES, MemcpyKind.DeviceToHost)
 
             tiles = from_bf16_words(
@@ -1217,8 +1220,12 @@ def _decode_constants(entry: dict, *, length: int) -> int:
         The device address the image binds as its constants argument.
     """
     keys = entry["keys"]
+    masks = decode_mask_tiles(keys=keys, length=length)
+    # Lays each mask tile out keys by queries for an image computing its scores transposed.
+    if entry.get("transposed_masks", False):
+        masks = np.ascontiguousarray(masks.swapaxes(-1, -2))
     h_words = pack_attention_constants(initial_maximum=entry["entering"], constants=tuple(entry["stated"]),
-                                       masks=decode_mask_tiles(keys=keys, length=length)).reshape(-1)
+                                       masks=masks).reshape(-1)
     d_address = _DECODE_CONSTANTS.get(keys)
     if d_address is None:
         d_address = minitpuMalloc(h_words.nbytes)

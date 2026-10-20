@@ -151,7 +151,10 @@ namespace
             if (failed(IsolateLoopCarriedValues())) return failure();
             Number(_kernel.getBody().front());
             if (failed(GroupValues()) || failed(GroupTiles())) return failure();
-            if (failed(Assign(true)) || failed(Assign(false))) return failure();
+            // Stacks the lone values from the top of the file when spreading them leaves no run of four for a weight
+            // tile, which a block holding many values across a loop does.
+            if (!Assign(true, false, false) && !Assign(true, true, true)) return failure();
+            if (!Assign(false, false, true)) return failure();
             Record();
             return success();
         }
@@ -447,9 +450,10 @@ namespace
             return true;
         }
 
-        /// Returns the register `unit`'s first interval takes, or nullopt when no base leaves every interval free.
+        /// Returns the register `unit`'s first interval takes, or nullopt when no base leaves every interval free. A
+        /// stacked lone value takes the highest free register.
         [[nodiscard]]
-        std::optional<uint32_t> ChooseBase(const Unit& unit, const uint32_t registers) const
+        std::optional<uint32_t> ChooseBase(const Unit& unit, const uint32_t registers, const bool stacked) const
         {
             const uint32_t span = unit.intervals.size();
             const uint32_t last = span == 1 ? registers - 1 : kHighestTileBase;
@@ -471,7 +475,7 @@ namespace
                 }
                 if (!free) continue;
                 if (span > 1) return base;
-                if (!chosen || _released[base] < _released[*chosen]) chosen = base;
+                if (!chosen || stacked || _released[base] < _released[*chosen]) chosen = base;
             }
             return chosen;
         }
@@ -491,15 +495,23 @@ namespace
             return live;
         }
 
-        /// Assigns a register to every unit of one file, pinned units holding their register.
-        LogicalResult Assign(const bool is_vector)
+        /**
+         * @brief Assigns a register to every unit of one file, pinned units holding their register.
+         *
+         * @param is_vector determines whether the vector file is assigned rather than the scalar one.
+         * @param stacked determines whether a lone value takes the highest free register rather than the one idle
+         * the longest.
+         * @param report determines whether a unit left without a register is reported as a diagnostic.
+         * @returns whether every unit got a register, every assignment of the file cleared when one did not.
+         */
+        bool Assign(const bool is_vector, const bool stacked, const bool report)
         {
             const uint32_t registers = is_vector ? kVectorRegisters : kScalarRegisters;
             _released.fill(INT64_MIN);
             for (const Unit& unit : _units)
             {
                 if (_intervals[unit.intervals.front()].is_vector != is_vector) continue;
-                const std::optional<uint32_t> base = ChooseBase(unit, registers);
+                const std::optional<uint32_t> base = ChooseBase(unit, registers, stacked);
                 const Interval& first              = _intervals[unit.intervals.front()];
                 bool fits                          = base.has_value() && *base + unit.intervals.size() <= registers;
                 for (uint32_t offset = 0; fits && offset < unit.intervals.size(); ++offset)
@@ -508,10 +520,18 @@ namespace
                 }
                 if (!fits)
                 {
-                    return first.anchor->emitOpError()
-                        << "is unable to get a " << (is_vector ? "vector" : "scalar") << " register. "
-                        << LiveAt(unit.start, is_vector) << " values are live here, where the file holds " << registers
-                        << (unit.intervals.size() > 1 ? ", and a weight tile needs 4 in a row." : ".");
+                    if (report)
+                    {
+                        first.anchor->emitOpError()
+                            << "is unable to get a " << (is_vector ? "vector" : "scalar") << " register. "
+                            << LiveAt(unit.start, is_vector) << " values are live here, where the file holds "
+                            << registers << (unit.intervals.size() > 1 ? ", and a weight tile needs 4 in a row." : ".");
+                    }
+                    for (Interval& interval : _intervals)
+                    {
+                        if (interval.is_vector == is_vector) interval.assigned.reset();
+                    }
+                    return false;
                 }
                 for (uint32_t offset = 0; offset < unit.intervals.size(); ++offset)
                 {
@@ -520,7 +540,7 @@ namespace
                     _released[*base + offset] = std::max(_released[*base + offset], interval.end);
                 }
             }
-            return success();
+            return true;
         }
 
         /// Writes every assigned register onto the operations defining the values that hold it.

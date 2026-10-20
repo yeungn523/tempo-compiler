@@ -192,3 +192,34 @@ minitpu.kernel @copy {
   %destination = minitpu.arg 2
   minitpu.copy %source -> %destination rows 576 stride 64
 }
+
+// -----
+
+// A decode attention walks the heads, staging each head's queries and transposing them, then per cached key token
+// block stages the keys and values and attends both halves: the transposed scores from the keys pushed against the
+// transposed queries, the masked maximum and sum folded through VMEM, and the transposed values pushed against the
+// probabilities held stationary. The output is normalised, transposed back and drained over the queries.
+// CHECK-LABEL: minitpu.kernel @decode_attention
+// CHECK:       scf.for
+// CHECK:       minitpu.vtxin
+// CHECK:       scf.for
+// CHECK-COUNT-2: minitpu.vmemld {{.*}} rows 32
+// CHECK:       minitpu.vmatload
+// CHECK:       minitpu.vmatpush
+// CHECK:       minitpu.vmatpop
+// CHECK:       minitpu.vst {{.*}} mask 1
+// CHECK:       minitpu.vexp
+// CHECK:       minitpu.vrecip
+// CHECK:       minitpu.vmemst {{.*}} rows 16
+// CHECK-NOT:   minitpu.attention
+// PROGRAM-LABEL: minitpuisa.program @decode_attention
+// PROGRAM:       minitpuisa.lbegin 2
+// PROGRAM:       minitpuisa.lbegin 1
+// PROGRAM:       minitpuisa.vtxout
+// PROGRAM:       minitpuisa.halt
+minitpu.kernel @decode_attention {
+  %constants = minitpu.arg 0
+  %cache = minitpu.arg 1
+  %queries = minitpu.arg 2
+  minitpu.attention %constants, %queries cache %cache heads 2 head 16 keys 32
+}

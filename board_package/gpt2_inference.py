@@ -572,7 +572,8 @@ def add_bias_resident(d_left: DeviceTensor, d_bias: ResidentWeights, *,
 
 
 def gemm_resident(d_activations: DeviceTensor, d_weights: ResidentWeights, *,
-                  activate: bool = False, d_out: DeviceTensor | None = None) -> DeviceTensor:
+                  activate: bool = False, d_bias: ResidentWeights | None = None,
+                  d_out: DeviceTensor | None = None) -> DeviceTensor:
     """Multiplies two DMEM operands and leaves the product in DMEM.
 
     Notes:
@@ -589,6 +590,8 @@ def gemm_resident(d_activations: DeviceTensor, d_weights: ResidentWeights, *,
         d_activations: [tokens, contraction] left operand, resident.
         d_weights: [contraction, columns] right operand, resident.
         activate: Whether each staged tile is GELU-activated entering the array.
+        d_bias: One resident row added to every product row, as `upload_bias` leaves it, or None for none. An image
+            set that fuses the bias into the product adds it there, and any other adds it in a launch of its own.
         d_out: Where to write. Allocated when omitted.
 
     Returns:
@@ -614,7 +617,14 @@ def gemm_resident(d_activations: DeviceTensor, d_weights: ResidentWeights, *,
             )
             raise ValueError(message)
 
-    image_bytes = _compiled_gemm(depth=depth, columns=columns, activate=activate)
+    fused = d_bias is not None and _has_image(kind="gemm_bias", depth=depth, columns=columns, activate=activate)
+    if d_bias is not None and not fused:
+        d_product = gemm_resident(d_activations, d_weights, activate=activate)
+        try:
+            return add_bias_resident(d_product, d_bias, d_out=d_out)
+        finally:
+            d_product.free()
+    image_bytes = _compiled_gemm(depth=depth, columns=columns, activate=activate, bias=fused)
 
     if d_out is None:
         d_out = _allocate_tensor(tokens, columns)
@@ -622,10 +632,11 @@ def gemm_resident(d_activations: DeviceTensor, d_weights: ResidentWeights, *,
     minitpuSetDevice(UIO_NAME)
     d_image = _stage_image(image_bytes)
 
+    bias_arguments = [d_bias.address] if fused else []
     for block in range(tokens // _BLOCK_TOKENS):
         _launch(
             d_image, len(image_bytes),
-            args=[d_activations.operand(block), d_weights.address, d_out.d_drain(block)])
+            args=[d_activations.operand(block), d_weights.address, d_out.d_drain(block), *bias_arguments])
     return d_out
 
 
@@ -1025,13 +1036,14 @@ def decode_attention(d_fused: DeviceTensor, cache: KVCache, *, heads: int = 12) 
     return DeviceTensorSlice(d_fused, 0, d_fused.features // 3)
 
 
-def _compiled_gemm(*, depth: int, columns: int, activate: bool) -> bytes:
+def _compiled_gemm(*, depth: int, columns: int, activate: bool, bias: bool = False) -> bytes:
     """Returns the compiled image that runs one GEMM shape with the contraction summed on the device.
 
     Args:
         depth: Contraction depth the product covers.
         columns: Output columns the product covers.
         activate: Determines whether the left operand passes through the GELU before it enters the array.
+        bias: Determines whether the image adds the bias row its fourth argument points to.
 
     Returns:
         The image bytes, padded to the loader's boundary.
@@ -1040,7 +1052,8 @@ def _compiled_gemm(*, depth: int, columns: int, activate: bool) -> bytes:
         ValueError: If no compiled image covers the shape, or if the image drains other than one partial per
             column tile for a block of token rows.
     """
-    image_bytes, entry = _compiled_image(kind="gemm", depth=depth, columns=columns, activate=activate)
+    image_bytes, entry = _compiled_image(kind="gemm_bias" if bias else "gemm", depth=depth, columns=columns,
+                                         activate=activate)
     # Holds the image to the drain these drivers allocate, since an image draining any other layout writes its
     # product into the wrong rows rather than failing.
     expected = _ZERO_TILE_WORDS + columns // _TILE * _BLOCK_TOKENS * _TILE
@@ -1086,6 +1099,12 @@ def _compiled_image(*, kind: str, **shape: int | bool) -> tuple[bytes, dict]:
     return cached
 
 
+def _has_image(*, kind: str, **shape: int | bool) -> bool:
+    """Determines whether the image set carries an image of one kind and shape."""
+    return any(entry["kind"] == kind and all(entry.get(field) == value for field, value in shape.items())
+               for entry in _manifest().values())
+
+
 def _attention_constants(entry: dict) -> int:
     """Uploads an attention image's constants block once and returns its DMEM address.
 
@@ -1113,8 +1132,8 @@ def _run_layer(hidden: NDArray[np.float32], weights: dict, *, heads: int,
     """Runs one GPT-2 block on the device around the attention it is given, every intermediate resident in DMEM.
 
     Notes:
-        Both LayerNorms, all four projections, every bias and residual add and the attention run as launches
-        that read the previous launch's output where it lies, so the block crosses the host boundary once on
+        Both LayerNorms, all four projections with their biases, both residual adds and the attention run as
+        launches that read the previous launch's output where it lies, so the block crosses the host boundary once on
         entry and once on exit. Attention's 1/sqrt(head) rides the query columns of the QKV projection, folded
         into its weights and bias before upload.
 
@@ -1149,19 +1168,16 @@ def _run_layer(hidden: NDArray[np.float32], weights: dict, *, heads: int,
 
         d_hidden = kept(upload_activations(hidden))
         d_normed = kept(layernorm_resident(d_hidden, d_constants[0]))
-        d_fused = kept(add_bias_resident(kept(gemm_resident(d_normed, d_weights["attn.qkv.w"])),
-                                         d_biases["attn.qkv.b"]))
+        d_fused = kept(gemm_resident(d_normed, d_weights["attn.qkv.w"], d_bias=d_biases["attn.qkv.b"]))
         d_attended = attend(d_fused)
-        d_projected = kept(add_bias_resident(kept(gemm_resident(d_attended, d_weights["attn.proj.w"])),
-                                             d_biases["attn.proj.b"]))
+        d_projected = kept(gemm_resident(d_attended, d_weights["attn.proj.w"], d_bias=d_biases["attn.proj.b"]))
         d_residual = kept(add_resident(d_hidden, d_projected))
 
         d_normed = kept(layernorm_resident(d_residual, d_constants[1]))
-        d_wide = kept(add_bias_resident(kept(gemm_resident(d_normed, d_weights["mlp.fc.w"])),
-                                        d_biases["mlp.fc.b"]))
+        d_wide = kept(gemm_resident(d_normed, d_weights["mlp.fc.w"], d_bias=d_biases["mlp.fc.b"]))
         # Applies the GELU while staging the down projection's operand, so it costs no launch of its own.
-        d_narrow = kept(add_bias_resident(kept(gemm_resident(d_wide, d_weights["mlp.proj.w"], activate=True)),
-                                          d_biases["mlp.proj.b"]))
+        d_narrow = kept(gemm_resident(d_wide, d_weights["mlp.proj.w"], activate=True,
+                                      d_bias=d_biases["mlp.proj.b"]))
         return download_activations(kept(add_resident(d_residual, d_narrow)))
     finally:
         for d_tensor in d_owned:

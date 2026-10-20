@@ -233,16 +233,55 @@ def Minitpu_AllocOp : Minitpu_Op<"alloc", [MemoryEffects<[MemAlloc]>]>
  * weights as `[columns / 16][depth][16]`, and the drain buffer holds a zeroed 16x16 tile followed by the product as
  * `[columns / 16][tokens][16]`, which is the layout board_package/bf16.py's pack_activations and pack_weights write and
  * the board runtime reads back. With activate set, the activations pass through the GELU before they enter the array.
+ * With a bias, the product's columns each add one value, the bias packed as `[columns / 16][4][16]` as pack_bias writes
+ * it, so the bias costs no launch of its own.
  */
 def Minitpu_MatmulOp : Minitpu_Op<"matmul", [MemoryEffects<[MemRead, MemWrite]>]>
 {
     let summary = "A block of tokens multiplied by a weight matrix in host memory";
-    let arguments = (ins I32:$activations, I32:$weights, I32:$drain, Minitpu_Field<1, 65535>:$tokens,
-                         Minitpu_Field<1, 65535>:$depth, Minitpu_Field<1, 1048560>:$columns, UnitAttr:$activate);
+    let arguments = (ins I32:$activations, I32:$weights, I32:$drain, Optional<I32>:$bias,
+                         Minitpu_Field<1, 65535>:$tokens, Minitpu_Field<1, 65535>:$depth,
+                         Minitpu_Field<1, 1048560>:$columns, UnitAttr:$activate);
     let assemblyFormat = [{
-        $activations `,` $weights `->` $drain `tokens` $tokens `depth` $depth `columns` $columns
+        $activations `,` $weights `->` $drain (`bias` $bias^)? `tokens` $tokens `depth` $depth `columns` $columns
         (`activate` $activate^)? attr-dict
     }];
+    let hasVerifier = 1;
+}
+
+/**
+ * @brief Provides an elementwise sum of one block of tokens and a second operand, staged from and drained to host
+ * memory.
+ *
+ * @details The left operand and the output are packed as `[features / 16][tokens][16]`, the layout pack_activations
+ * writes. The right operand shares that layout, or with broadcast set it is one feature row added to every token and
+ * packed as `[features / 16][4][16]`, each tile repeated across the four sublanes as pack_bias writes it.
+ */
+def Minitpu_AddOp : Minitpu_Op<"add", [MemoryEffects<[MemRead, MemWrite]>]>
+{
+    let summary = "A block of tokens added elementwise to a second operand in host memory";
+    let arguments = (ins I32:$left, I32:$right, I32:$output, Minitpu_Field<1, 65535>:$tokens,
+                         Minitpu_Field<1, 1048560>:$features, UnitAttr:$broadcast);
+    let assemblyFormat = [{
+        $left `,` $right `->` $output `tokens` $tokens `features` $features (`broadcast` $broadcast^)? attr-dict
+    }];
+    let hasVerifier = 1;
+}
+
+/**
+ * @brief Provides a LayerNorm over each token of one block, staged from and drained to host memory.
+ *
+ * @details The rows and the output are packed as `[features / 16][tokens][16]`. The constants block holds gamma and then
+ * beta, one row per 16 features, followed by the reciprocal of the width and then epsilon, each repeated across one
+ * register's 64 elements, which is the block board_package/gpt2_inference.py's upload_layernorm_constants writes from
+ * the image's manifest entry.
+ */
+def Minitpu_LayernormOp : Minitpu_Op<"layernorm", [MemoryEffects<[MemRead, MemWrite]>]>
+{
+    let summary = "A block of tokens normalised over their features in host memory";
+    let arguments = (ins I32:$rows, I32:$constants, I32:$output, Minitpu_Field<1, 65535>:$tokens,
+                         Minitpu_Field<1, 1048560>:$features);
+    let assemblyFormat = "$rows `,` $constants `->` $output `tokens` $tokens `features` $features attr-dict";
     let hasVerifier = 1;
 }
 

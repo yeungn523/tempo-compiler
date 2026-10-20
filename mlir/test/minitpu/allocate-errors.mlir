@@ -13,17 +13,21 @@ minitpu.kernel @buffers_past_a_slot {
 // -----
 
 minitpu.kernel @more_scalars_than_registers {
+  %e = arith.constant 32 : i32
   %a = minitpu.arg 0
   %b = minitpu.arg 1
   %c = minitpu.arg 2
-  %d = minitpu.arg 3
   // expected-error @below {{is unable to get a scalar register. 5 values are live here, where the file holds 4}}
-  %e = arith.constant 32 : i32
+  %d = minitpu.arg 3
   %buffer = minitpu.alloc : !minitpu.vmem<16>
   %c0 = arith.constant 0 : index
   minitpu.vmemld %buffer[%c0], base %a, stride %e, rows 1, slot 0 : !minitpu.vmem<16>
-  minitpu.vmemld %buffer[%c0], base %b, stride %e, rows 1, slot 1 : !minitpu.vmem<16>
+  minitpu.vmemld %buffer[%c0], base %b, stride %c, rows 1, slot 1 : !minitpu.vmem<16>
   minitpu.flush_slot 3
+  minitpu.vmemld %buffer[%c0], base %d, stride %e, rows 1, slot 0 : !minitpu.vmem<16>
+  minitpu.flush_slot 1
+  minitpu.vmemld %buffer[%c0], base %a, stride %b, rows 1, slot 0 : !minitpu.vmem<16>
+  minitpu.flush_slot 1
   minitpu.vmemld %buffer[%c0], base %c, stride %d, rows 1, slot 0 : !minitpu.vmem<16>
   minitpu.flush_slot 1
 }

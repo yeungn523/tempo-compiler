@@ -12,7 +12,7 @@
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/IR/DialectImplementation.h>
 #include <mlir/IR/Matchers.h>
-#include "matmul_layout.h"
+#include "tile_layout.h"
 
 using namespace mlir;
 using namespace mlir::minitpu;
@@ -98,23 +98,75 @@ LogicalResult MinitpuDialect::verifyOperationAttribute(Operation* operation, con
 /// Verifies that the product's shape is one the lowering covers and that its staged rows fit one VMEM bank.
 LogicalResult MatmulOp::verify()
 {
-    if (getTokens() != matmul::kTokens)
+    if (getTokens() != tile::kTokens)
     {
-        return emitOpError() << "is unable to cover " << getTokens() << " tokens. One launch covers " << matmul::kTokens
+        return emitOpError() << "is unable to cover " << getTokens() << " tokens. One launch covers " << tile::kTokens
                              << ", whose pushes fill the MXU output FIFO exactly.";
     }
-    if (getDepth() % matmul::kChunkRows != 0 || getColumns() % matmul::kTile != 0)
+    if (getDepth() % tile::kChunkRows != 0 || getColumns() % tile::kTile != 0)
     {
         return emitOpError() << "is unable to cover a depth of " << getDepth() << " by " << getColumns()
-                             << " columns. The depth must be a whole number of " << matmul::kChunkRows
-                             << "-row weight chunks and the columns a whole number of " << matmul::kTile
+                             << " columns. The depth must be a whole number of " << tile::kChunkRows
+                             << "-row weight chunks and the columns a whole number of " << tile::kTile
                              << "-wide tiles.";
     }
-    if (matmul::StagedRows(getDepth()) > matmul::kBankRows)
+    const uint32_t staged = tile::MatmulStagedRows(getDepth(), getColumns(), getBias() != nullptr);
+    if (staged > tile::kBankRows)
     {
-        return emitOpError() << "is unable to stage a depth of " << getDepth() << ". Its buffers take "
-                             << matmul::StagedRows(getDepth()) << " VMEM rows, where one bank holds "
-                             << matmul::kBankRows << ".";
+        return emitOpError() << "is unable to stage a depth of " << getDepth() << " by " << getColumns()
+                             << " columns. Its buffers take " << staged << " VMEM rows, where one bank holds "
+                             << tile::kBankRows << ".";
+    }
+    return success();
+}
+
+/// Verifies that the sum's shape is one the lowering covers and that its staged rows fit one VMEM bank.
+LogicalResult AddOp::verify()
+{
+    if (getTokens() != tile::kTokens)
+    {
+        return emitOpError() << "is unable to cover " << getTokens() << " tokens. One launch covers " << tile::kTokens
+                             << ", which fill one feature tile's rows.";
+    }
+
+    // Holds the width to an even number of chunks, since the steady loop alternates two buffers between them.
+    const uint32_t pair = 2 * tile::kChunkFeatureTiles * tile::kTile;
+    if (getFeatures() % pair != 0)
+    {
+        return emitOpError() << "is unable to cover " << getFeatures() << " features. The width must be a whole number "
+                             << "of " << pair << ", an even number of " << tile::kChunkRows << "-row chunks.";
+    }
+    if (tile::AddStagedRows(getFeatures(), getBroadcast()) > tile::kBankRows)
+    {
+        return emitOpError() << "is unable to stage " << getFeatures() << " features. Its buffers take "
+                             << tile::AddStagedRows(getFeatures(), getBroadcast())
+                             << " VMEM rows, where one bank holds " << tile::kBankRows << ".";
+    }
+    return success();
+}
+
+/// Verifies that the LayerNorm's shape is one the lowering covers and that its staged rows fit one VMEM bank.
+LogicalResult LayernormOp::verify()
+{
+    if (getTokens() != tile::kTokens)
+    {
+        return emitOpError() << "is unable to cover " << getTokens() << " tokens. One launch covers " << tile::kTokens
+                             << ", which fill one feature tile's rows.";
+    }
+
+    // Holds a token to whole registers and to one descriptor, which gathers its rows from every feature tile.
+    const uint32_t register_features = tile::kSublanes * tile::kTile;
+    if (getFeatures() % register_features != 0 || getFeatures() / tile::kTile > tile::kChunkRows)
+    {
+        return emitOpError() << "is unable to cover " << getFeatures() << " features. The width must be a whole number "
+                             << "of " << register_features << ", and at most " << tile::kChunkRows * tile::kTile
+                             << " so one descriptor gathers a token.";
+    }
+    if (tile::LayernormStagedRows(getFeatures()) > tile::kBankRows)
+    {
+        return emitOpError() << "is unable to stage " << getFeatures() << " features. Its buffers take "
+                             << tile::LayernormStagedRows(getFeatures()) << " VMEM rows, where one bank holds "
+                             << tile::kBankRows << ".";
     }
     return success();
 }

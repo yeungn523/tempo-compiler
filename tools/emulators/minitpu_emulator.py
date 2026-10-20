@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
 """Executes a MiniTPU image functionally, so a compiled kernel's numbers can be checked without the board.
-
-Timing is not modelled, because the scheduler owns it and the board is the timing check. What is modelled is where
-every access lands and what every operation computes: hardware loops and the AGU, scalar registers, DMA between DRAM
-and the two VMEM banks, the VMEM compute port, the MXU with its output FIFO, the transpose array, and every E-slot
-operation. A bundle reads its operands before any of its writes land, and every vector register write and VMEM word is
-rounded to BF16, as the machine rounds them. Registers and VMEM start as NaN, so an image reading state it never wrote
-returns NaN where the board would return whatever the memory held. The SFU is modelled by the function it
-approximates, so a check built on this needs a tolerance for the table's interpolation.
 """
 
 from __future__ import annotations
@@ -90,6 +82,7 @@ class Machine:
         bundles: Bundles issued so far.
         cycles: Cycles the issued bundles span, each taking one cycle plus its delay field, which counts the scheduled
             timing and leaves out any stall the hardware's own interlocks add.
+        pending: Each DMA slot's unflushed descriptor as its bank, first row, row count and whether it stores, or None.
     """
 
     def __init__(self, dram: NDArray[np.uint8], *, arguments: tuple[int, ...]) -> None:
@@ -104,6 +97,7 @@ class Machine:
         self.transpose = np.full((_LANES, _LANES), np.nan, dtype=np.float32)
         self.bundles = 0
         self.cycles = 0
+        self.pending: list[tuple[int, int, int, bool] | None] = [None, None]
 
     def write_words(self, address: int, words: NDArray[np.uint16]) -> None:
         """Stages BF16 words in DRAM at a byte address."""
@@ -168,6 +162,10 @@ class Machine:
         self._vector(word, pc, writes)
         self._scalar(word, pc)
         control = _field(word, asm._F_SHIFT, asm.F_SLOT_W)
+        if control >> 24 == asm._F_FLUSH:
+            for slot in range(len(self.pending)):
+                if (control >> slot) & 1:
+                    self.pending[slot] = None
         if control >> 24 == asm._OPCODES["vmemswap"]:
             self.compute_bank ^= 1
         written = [register for register, _, _ in writes]
@@ -192,6 +190,15 @@ class Machine:
         if row + rows > _VMEM_ROWS:
             message = f"Unable to run the descriptor at bundle {pc}. Its rows must stay inside one VMEM bank."
             raise EmulationError(message)
+        for other, held in enumerate(self.pending):
+            if held is not None and held[0] == bank and held[1] < row + rows and row < held[1] + held[2] \
+                    and (store == 0 or not held[3]):
+                message = (
+                    f"Unable to run the descriptor at bundle {pc}. Its VMEM rows {row} through {row + rows - 1} race "
+                    f"the unflushed descriptor on slot {other}, so a flush must cover that slot first."
+                )
+                raise EmulationError(message)
+        self.pending[(word >> 125) & 1] = (bank, row, rows, bool(store))
         for index in range(rows):
             offset = base + index * stride
             if offset < 0 or offset + _ROW_BYTES > self.dram.size:
@@ -218,6 +225,15 @@ class Machine:
             row += ivs[level] << shift
         sublanes = np.array([(mask >> sublane) & 1 == 1 for sublane in range(_SUBLANES)])
         rows = [(row + sublane) & (_VMEM_ROWS - 1) for sublane in range(_SUBLANES)]
+        for slot, held in enumerate(self.pending):
+            # A pending load races every access to its rows, and a pending store races only the writes.
+            if held is not None and held[0] == self.compute_bank and (store or not held[3]) \
+                    and any(held[1] <= target < held[1] + held[2] for target in rows):
+                message = (
+                    f"Unable to run bundle {pc}. Its {'vst' if store else 'vld'} of row {rows[0]} races the "
+                    f"unflushed descriptor on slot {slot}, so a flush must cover that slot first."
+                )
+                raise EmulationError(message)
         bank = self.vmem[self.compute_bank]
         if store:
             for sublane, target in enumerate(rows):

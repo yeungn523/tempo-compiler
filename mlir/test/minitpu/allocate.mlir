@@ -1,7 +1,8 @@
 // The allocators name every unpinned buffer's rows and every unpinned value's register. Buffers take the next free rows
-// in program order, stepping over pinned ones, and values take the lowest register free over their whole lifetime. A
-// loop-carried value shares one register with its initial value and result, an initial value read elsewhere is copied
-// first, and a vmatload's four operands take consecutive registers.
+// in program order, stepping over pinned ones, and values take the free register idle the longest, never-used registers
+// first, each argument read just before its first use. A loop-carried value shares one register with its initial value
+// and result, an initial value read elsewhere is copied first, and a vmatload's four operands take consecutive
+// registers.
 
 // RUN: minitpu-opt %s -split-input-file -pass-pipeline='builtin.module(minitpu.kernel(minitpu-allocate-vmem,minitpu-allocate-registers))' | FileCheck %s
 
@@ -17,8 +18,8 @@ minitpu.kernel @accumulate {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c4 = arith.constant 4 : index
-  // CHECK: minitpu.arg 0 {minitpu.reg = 0 : i32}
-  // CHECK: arith.constant {minitpu.reg = 1 : i32} 32 : i32
+  // CHECK: arith.constant {minitpu.reg = 0 : i32} 32 : i32
+  // CHECK: minitpu.arg 0 {minitpu.reg = 1 : i32}
   %pointer = minitpu.arg 0
   %stride = arith.constant 32 : i32
   minitpu.vmemld %buffer[%c0], base %pointer, stride %stride, rows 16, slot 0 : !minitpu.vmem<16>
@@ -72,7 +73,7 @@ minitpu.kernel @weights_in_a_row {
   // CHECK: minitpu.vld %{{.*}}[%{{.*}}] {minitpu.reg = 4 : i32}
   // CHECK: minitpu.vld %{{.*}}[%{{.*}}] {minitpu.reg = 5 : i32}
   // CHECK: minitpu.vld %{{.*}}[%{{.*}}] {minitpu.reg = 6 : i32}
-  // CHECK: minitpu.vadd %{{.*}}, %{{.*}} {minitpu.reg = 0 : i32}
+  // CHECK: minitpu.vadd %{{.*}}, %{{.*}} {minitpu.reg = 7 : i32}
   %activation = minitpu.vld %buffer[%c0] : !minitpu.vmem<16>
   %bias = minitpu.vld %buffer[%c4] : !minitpu.vmem<16>
   %other = minitpu.vld %buffer[%c8] : !minitpu.vmem<16>

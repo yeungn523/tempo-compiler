@@ -1,6 +1,7 @@
 // A kernel with every register and row named lowers one bundle per machine operation. A loop index times a power of
 // two becomes the AGU's induction term, the loop becomes lbegin and loop_end, and the accumulator stays in its
-// register. Scheduled, the program is the image codegen/asm.py assembles from the same instructions.
+// register. Scheduled, the program is the image codegen/asm.py assembles from the same instructions. An empty kernel
+// lowers to the halt alone, the shortest program the loader takes.
 
 // RUN: minitpu-opt %s -convert-minitpu-to-isa | FileCheck %s
 // RUN: minitpu-opt %s -convert-minitpu-to-isa -minitpuisa-schedule | FileCheck %s --check-prefix=SCHEDULED
@@ -36,4 +37,12 @@ minitpu.kernel @accumulate {
     scf.yield %next : !minitpu.vreg
   }
   minitpu.vst %sum, %buffer[%c0] : !minitpu.vmem<16>
+}
+
+// CHECK-LABEL: minitpuisa.program @halt
+// CHECK-NEXT:    minitpuisa.bundle {
+// CHECK-NEXT:      minitpuisa.halt
+// CHECK-NEXT:    }
+// CHECK-NEXT:  }
+minitpu.kernel @halt {
 }

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Runs the board's own checks on a host, every launch going through the functional emulator.
 
-board_package/board_checks.py is imported unchanged with tools/emulators/emulated_runtime.py installed as its `runtime`, so a
-check passing here passes the same assertion the board makes, against the same host reference, on the same images.
+board_package/board_checks.py is imported with tools/emulators/emulated_runtime.py installed as its `runtime`, so a
+check passing here passes the same assertion the board makes against the same host reference on the same images.
 """
 
 from __future__ import annotations
@@ -43,15 +43,18 @@ def main() -> int:
         Zero when every selected check passes.
     """
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("checks", nargs="*", default=list(_CHECKS), choices=list(_CHECKS),
-                        help="Checks to run, every one when none is named.")
+    parser.add_argument("checks", nargs="*", metavar="check",
+                        help=f"Checks to run, every one when none is named: {', '.join(_CHECKS)}.")
     parser.add_argument("--images", help="Image set to launch, board_package/images when omitted.")
     arguments = parser.parse_args()
+    unknown = [name for name in arguments.checks if name not in _CHECKS]
+    if unknown:
+        parser.error(f"unknown check {', '.join(unknown)}, expected one of {', '.join(_CHECKS)}")
     if arguments.images:
         gpt2_inference._IMAGE_DIRECTORY = pathlib.Path(arguments.images).expanduser().resolve()
 
     passed = True
-    for name in arguments.checks:
+    for name in arguments.checks or list(_CHECKS):
         started = time.perf_counter()
         passed &= board_checks.run_check(name=name, check=getattr(board_checks, _CHECKS[name]))
         print(f"    {time.perf_counter() - started:.1f} s on the host, {emulated_runtime.LAUNCHES[0]} launches and "

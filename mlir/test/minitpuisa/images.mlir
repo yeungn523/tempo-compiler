@@ -20,7 +20,7 @@
 
 // RUN: minitpu-translate --import-minitpu-image %images/gemm_768x768.bin | FileCheck %s --check-prefix=GEMM
 // GEMM-LABEL: minitpuisa.program @gemm_768x768
-// GEMM:         minitpuisa.vmemld slot 0, vmem 0, rows 16, base s1, stride s3
+// GEMM:         minitpuisa.vmemld slot 0, vmem 0, rows 16, base s{{[0-3]}}, stride s{{[0-3]}}
 // GEMM:         minitpuisa.flush_slot 1
 // GEMM:         minitpuisa.lbegin 48
 // GEMM:         minitpuisa.vmatpush

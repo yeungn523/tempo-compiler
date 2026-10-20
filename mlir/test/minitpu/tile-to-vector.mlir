@@ -1,10 +1,11 @@
-// A minitpu.matmul expands into the machine operations that compute it: the zero tile and the resident activations
-// staged, then per column tile the weight chunks streamed double buffered, each k-tile loading a weight tile, pushing
-// the eight token groups and popping eight results into the accumulators, and the column tile stored and drained.
-// The whole expansion then allocates, lowers and schedules.
+// Each tile op expands into the machine operations that compute it. A minitpu.matmul stages the zero tile and the
+// resident activations, then per column tile streams the weight chunks double buffered, each k-tile loading a weight
+// tile, pushing the eight token groups and popping eight results into the accumulators, and stores and drains the
+// column tile. A minitpu.add streams its operands chunk by chunk, double buffered, and a minitpu.layernorm gathers
+// one token at a time. Every expansion then allocates, lowers, packs and schedules.
 
 // RUN: minitpu-opt %s -split-input-file -pass-pipeline='builtin.module(minitpu.kernel(minitpu-tile-to-vector))' | FileCheck %s
-// RUN: minitpu-opt %s -split-input-file -pass-pipeline='builtin.module(minitpu.kernel(minitpu-tile-to-vector,minitpu-allocate-vmem,minitpu-allocate-registers),convert-minitpu-to-isa,minitpuisa.program(minitpuisa-schedule))' | FileCheck %s --check-prefix=PROGRAM
+// RUN: minitpu-opt %s -split-input-file -pass-pipeline='builtin.module(minitpu.kernel(minitpu-tile-to-vector,minitpu-allocate-vmem,minitpu-allocate-registers),convert-minitpu-to-isa,minitpuisa.program(minitpuisa-pack,minitpuisa-schedule))' | FileCheck %s --check-prefix=PROGRAM
 
 // CHECK-LABEL: minitpu.kernel @gemm
 // CHECK:       minitpu.alloc : !minitpu.vmem<16>
@@ -48,4 +49,119 @@ minitpu.kernel @gemm_gelu {
   %weights = minitpu.arg 1
   %drain = minitpu.arg 2
   minitpu.matmul %activations, %weights -> %drain tokens 32 depth 256 columns 32 activate
+}
+
+// -----
+
+// A product with a bias stages the bias row in place of the zero tile, and each column tile's accumulators load that
+// tile's bias register, so the bias needs no launch of its own.
+
+// CHECK-LABEL: minitpu.kernel @gemm_bias
+// CHECK:       minitpu.alloc : !minitpu.vmem<8>
+// CHECK:       minitpu.vmemld {{.*}} rows 8, slot 0
+// CHECK:       scf.for %[[COLUMN:arg[0-9]+]] =
+// CHECK:         %[[SCALED:.*]] = arith.muli %[[COLUMN]], %{{.*}}
+// CHECK:         %[[ROW:[0-9]+]] = arith.addi %[[SCALED]], %{{.*}}
+// CHECK-COUNT-8: minitpu.vld %{{.*}}[%[[ROW]]] : !minitpu.vmem<8>
+// CHECK-NOT:   minitpu.vmem<16>
+// PROGRAM-LABEL: minitpuisa.program @gemm_bias
+// PROGRAM:       minitpuisa.smov_arg {{.*}}, arg 3
+// PROGRAM:       minitpuisa.halt
+minitpu.kernel @gemm_bias {
+  %activations = minitpu.arg 0
+  %weights = minitpu.arg 1
+  %drain = minitpu.arg 2
+  %bias = minitpu.arg 3
+  minitpu.matmul %activations, %weights -> %drain bias %bias tokens 32 depth 256 columns 32
+}
+
+// -----
+
+// A streamed sum loads both operands' first chunks on the two slots, peels its first chunk, runs the middle chunks two
+// per iteration, and peels its last, each chunk prefetching the next before its additions and draining on slot 0.
+
+// CHECK-LABEL: minitpu.kernel @add
+// CHECK:       minitpu.vmemld {{.*}} rows 128, slot 1
+// CHECK:       minitpu.vmemld {{.*}} rows 128, slot 0
+// CHECK:       minitpu.flush_slot 3
+// CHECK:       minitpu.vmemld {{.*}} rows 128, slot 0
+// CHECK:       minitpu.vmemld {{.*}} rows 128, slot 1
+// CHECK-COUNT-32: minitpu.vadd
+// CHECK:       minitpu.flush_slot 1
+// CHECK:       minitpu.vmemst {{.*}} rows 128, slot 0
+// CHECK:       scf.for
+// CHECK-COUNT-2: minitpu.vmemst {{.*}} rows 128, slot 0
+// CHECK:       scf.yield
+// CHECK:       minitpu.vmemst {{.*}} rows 128, slot 0
+// CHECK:       minitpu.flush_slot 1
+// CHECK-NOT:   minitpu.add
+// PROGRAM-LABEL: minitpuisa.program @add
+// PROGRAM:       minitpuisa.lbegin 3
+// PROGRAM:       minitpuisa.halt
+minitpu.kernel @add {
+  %left = minitpu.arg 0
+  %right = minitpu.arg 1
+  %output = minitpu.arg 2
+  minitpu.add %left, %right -> %output tokens 32 features 512
+}
+
+// -----
+
+// A broadcast sum stages the whole bias row first and reads it once per feature tile, draining on slot 1. Two chunks
+// leave no middle, so no loop is built.
+
+// CHECK-LABEL: minitpu.kernel @add_bias
+// CHECK:       minitpu.alloc : !minitpu.vmem<32>
+// CHECK:       minitpu.vmemld {{.*}} rows 32, slot 0
+// CHECK:       minitpu.flush_slot 1
+// CHECK:       minitpu.flush_slot 1
+// CHECK-COUNT-36: minitpu.vld
+// CHECK:       minitpu.vmemst {{.*}} rows 128, slot 1
+// CHECK:       minitpu.flush_slot 3
+// CHECK-NOT:   scf.for
+// CHECK:       minitpu.vmemst {{.*}} rows 128, slot 1
+// CHECK:       minitpu.flush_slot 2
+// PROGRAM-LABEL: minitpuisa.program @add_bias
+// PROGRAM-NOT:   minitpuisa.lbegin
+// PROGRAM:       minitpuisa.halt
+minitpu.kernel @add_bias {
+  %left = minitpu.arg 0
+  %bias = minitpu.arg 1
+  %output = minitpu.arg 2
+  minitpu.add %left, %bias -> %output tokens 32 features 128 broadcast
+}
+
+// -----
+
+// A LayerNorm stages its constants and keeps the reciprocal width and epsilon in registers, then gathers each token
+// with a stride of one block of tokens, sums its registers as a tree before each vredsum, scales and shifts it, and
+// drains it on slot 1. The first and last tokens are peeled around a loop of token pairs.
+
+// CHECK-LABEL: minitpu.kernel @layernorm
+// CHECK:       minitpu.alloc : !minitpu.vmem<24>
+// CHECK:       minitpu.vmemld {{.*}} rows 24, slot 0
+// CHECK:       minitpu.flush_slot 1
+// CHECK:       minitpu.vld
+// CHECK:       minitpu.vld
+// CHECK:       arith.constant 1024 : i32
+// CHECK:       minitpu.vmemld {{.*}} rows 8, slot 0
+// CHECK:       minitpu.vadd
+// CHECK-NEXT:  minitpu.vredsum
+// CHECK:       minitpu.vrsqrt
+// CHECK:       minitpu.vmemst {{.*}} rows 8, slot 1
+// CHECK:       scf.for
+// CHECK-COUNT-2: minitpu.vmemst {{.*}} rows 8, slot 1
+// CHECK:       scf.yield
+// CHECK:       minitpu.vmemst {{.*}} rows 8, slot 1
+// CHECK:       minitpu.flush_slot 2
+// CHECK-NOT:   minitpu.layernorm
+// PROGRAM-LABEL: minitpuisa.program @layernorm
+// PROGRAM:       minitpuisa.lbegin 15
+// PROGRAM:       minitpuisa.vrsqrt
+// PROGRAM:       minitpuisa.halt
+minitpu.kernel @layernorm {
+  %rows = minitpu.arg 0
+  %constants = minitpu.arg 1
+  %output = minitpu.arg 2
+  minitpu.layernorm %rows, %constants -> %output tokens 32 features 128
 }

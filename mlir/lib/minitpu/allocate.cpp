@@ -11,6 +11,7 @@
 #include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/IR/Matchers.h>
 #include <algorithm>
+#include <array>
 #include <optional>
 #include <vector>
 #include "minitpu/minitpu/passes.h"
@@ -114,12 +115,17 @@ namespace
     struct Interval
     {
         llvm::SmallVector<Value, 4> members;  ///< The values sharing the register.
-        int64_t start  = 0;                   ///< The position the first member is defined at.
-        int64_t end    = 0;                   ///< The position the last member is last read at.
-        bool is_vector = false;               ///< Determines whether the register is a vector register.
-        std::optional<uint32_t> pinned;       ///< The register a member pins, if any.
-        std::optional<uint32_t> assigned;     ///< The register the allocator names.
-        Operation* anchor = nullptr;          ///< The operation defining the first member, for diagnostics.
+        int64_t start = 0;                    ///< The position the first member is defined at.
+        int64_t end   = 0;                    ///< The position the last member is last read at.
+
+        /// Stores each member's own span, from its definition to its last read. A loop-carried set holds its register
+        /// only over these, so a value living between the carried value's last read and the next value's definition
+        /// may share it.
+        llvm::SmallVector<std::pair<int64_t, int64_t>, 4> spans;
+        bool is_vector = false;            ///< Determines whether the register is a vector register.
+        std::optional<uint32_t> pinned;    ///< The register a member pins, if any.
+        std::optional<uint32_t> assigned;  ///< The register the allocator names.
+        Operation* anchor = nullptr;       ///< The operation defining the first member, for diagnostics.
     };
 
     /// Stores one allocation unit: a single interval, or the four intervals of a weight tile in consecutive registers.
@@ -141,6 +147,7 @@ namespace
         /// Allocates every unpinned value's register, failing with a diagnostic on the first conflict.
         LogicalResult Run()
         {
+            SinkArguments();
             if (failed(IsolateLoopCarriedValues())) return failure();
             Number(_kernel.getBody().front());
             if (failed(GroupValues()) || failed(GroupTiles())) return failure();
@@ -174,6 +181,29 @@ namespace
             if (definition == nullptr || llvm::isa<scf::ForOp>(definition)) return false;
             if (auto constant = dyn_cast<arith::ConstantOp>(definition)) return NeedsRegister(constant);
             return true;
+        }
+
+        /**
+         * @brief Moves every argument read to just before the operation that first uses it.
+         *
+         * A launch argument holds one value for the whole launch, so reading it late changes nothing but the scalar
+         * register it holds, which an argument first used late would otherwise hold from the kernel's start.
+         */
+        void SinkArguments()
+        {
+            Block& body = _kernel.getBody().front();
+            llvm::SmallVector<ArgOp> arguments;
+            for (ArgOp argument : body.getOps<ArgOp>()) arguments.push_back(argument);
+            for (ArgOp argument : arguments)
+            {
+                Operation* first = nullptr;
+                for (Operation* user : argument->getUsers())
+                {
+                    Operation* top = body.findAncestorOpInBlock(*user);
+                    if (top != nullptr && (first == nullptr || top->isBeforeInBlock(first))) first = top;
+                }
+                if (first != nullptr) argument->moveBefore(first);
+            }
         }
 
         /**
@@ -317,7 +347,8 @@ namespace
                         interval.anchor = value.getDefiningOp() != nullptr ? value.getDefiningOp()
                                                                            : value.getParentRegion()->getParentOp();
                     }
-                    interval.end          = std::max(interval.end, LastReadOf(value));
+                    interval.end = std::max(interval.end, LastReadOf(value));
+                    interval.spans.emplace_back(defined, LastReadOf(value));
                     Operation* definition = value.getDefiningOp();
                     if (definition == nullptr) continue;
                     const auto pin =
@@ -393,7 +424,14 @@ namespace
         {
             // Lets a value take the register of one last read by the operation defining it, which reads before
             // it writes.
-            return lhs.start < rhs.end && rhs.start < lhs.end;
+            for (const auto& [left_start, left_end] : lhs.spans)
+            {
+                for (const auto& [right_start, right_end] : rhs.spans)
+                {
+                    if (left_start < right_end && right_start < left_end) return true;
+                }
+            }
+            return false;
         }
 
         /// Determines whether `interval` may take `candidate` alongside every interval already assigned.
@@ -421,6 +459,9 @@ namespace
                 if (member.pinned)
                     return *member.pinned >= offset ? std::optional(*member.pinned - offset) : std::nullopt;
             }
+            // Gives a lone value the free register idle the longest, so consecutive values land in different registers
+            // and the scheduler finds no false dependence between them. A weight tile takes the lowest free run.
+            std::optional<uint32_t> chosen;
             for (uint32_t base = 0; base <= last; ++base)
             {
                 bool free = true;
@@ -428,9 +469,11 @@ namespace
                 {
                     free = IsFree(_intervals[unit.intervals[offset]], base + offset);
                 }
-                if (free) return base;
+                if (!free) continue;
+                if (span > 1) return base;
+                if (!chosen || _released[base] < _released[*chosen]) chosen = base;
             }
-            return std::nullopt;
+            return chosen;
         }
 
         /// Returns how many of the file's intervals hold a register at `position`.
@@ -440,7 +483,10 @@ namespace
             uint32_t live = 0;
             for (const Interval& interval : _intervals)
             {
-                if (interval.is_vector == is_vector && interval.start <= position && position < interval.end) ++live;
+                if (interval.is_vector != is_vector) continue;
+                live += llvm::any_of(interval.spans, [position](const std::pair<int64_t, int64_t>& span) {
+                    return span.first <= position && position < span.second;
+                });
             }
             return live;
         }
@@ -449,6 +495,7 @@ namespace
         LogicalResult Assign(const bool is_vector)
         {
             const uint32_t registers = is_vector ? kVectorRegisters : kScalarRegisters;
+            _released.fill(INT64_MIN);
             for (const Unit& unit : _units)
             {
                 if (_intervals[unit.intervals.front()].is_vector != is_vector) continue;
@@ -468,7 +515,9 @@ namespace
                 }
                 for (uint32_t offset = 0; offset < unit.intervals.size(); ++offset)
                 {
-                    _intervals[unit.intervals[offset]].assigned = *base + offset;
+                    Interval& interval        = _intervals[unit.intervals[offset]];
+                    interval.assigned         = *base + offset;
+                    _released[*base + offset] = std::max(_released[*base + offset], interval.end);
                 }
             }
             return success();
@@ -512,6 +561,9 @@ namespace
 
         /// Stores the allocation units, in the order their registers are chosen.
         std::vector<Unit> _units;
+
+        /// Stores the last position each register of the file being assigned is held to, for choosing the idlest.
+        std::array<int64_t, kVectorRegisters> _released {};
     };
 
     /// Provides the minitpu-allocate-registers pass over one kernel.

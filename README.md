@@ -88,6 +88,10 @@ step.
 
 ### Running the Tests
 
+`tox` builds mlir/, runs every suite below against that build, and repeats the lit suite against an AddressSanitizer
+build that also fails on leaks. `tox -e build`, `tox -e test`, and `tox -e memcheck` run one step each, and
+`tox -e clean,build` rebuilds from scratch. tox needs `pip install "tox>=4,<5" "tox-uv>=1,<2"`.
+
 `python3 -m unittest discover -s tests -t . -q` runs the code generator's tests, which cover the assembler, the
 emitter, and the path from a Triton kernel through to the image its plan emits. `python3 -m unittest discover -s
 board_package/tests -q` runs the board package's own tests, which `make check` also runs on the board.

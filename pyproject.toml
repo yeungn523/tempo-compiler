@@ -1,6 +1,6 @@
 # Pins every dependency the compiler builds and runs against. The repository runs from a checkout rather than as an
 # installed distribution, so the Python dependencies are dependency groups pip installs directly, as in
-# 'pip install --group compiler --group mlir'.
+# 'pip install --group compiler --group mlir --group test'.
 [dependency-groups]
 compiler = [
     # Frontend. The pin is exact because mlir/ compiles this release's tt dialect from source.
@@ -16,6 +16,10 @@ mlir = [
     # Formatting and linting, held to one release so every contributor formats and lints identically
     "clang-format==18.1.8",
     "clang-tidy==18.1.8",
+]
+test = [
+    # Runs both the pytest suites under tests/ and the unittest suites under board_package/tests/
+    "pytest>=8,<9",
 ]
 
 # Pins the C++ toolchain mlir/ builds against, which no Python package carries. tools/toolchain/setup_toolchain.py fetches and

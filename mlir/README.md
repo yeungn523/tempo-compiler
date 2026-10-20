@@ -22,9 +22,12 @@ is the one Triton's own `cmake/llvm-info.json` names. Configuring refuses an LLV
 pin changes in `pyproject.toml` alone.
 
 `tools/board/build_mlir_images.py --output <dir>` writes the board's image set with every kernel this pipeline covers
-built by it from its Triton source in `gpt2_triton.py`, currently the four GEMMs, each adding its bias, the two
-sums and the LayerNorm, along with the two KV-cache copies and the four attention images, which are stated as tile ops, and `tools/emulators/emulate_board_checks.py --images <dir>` runs the board's checks against
-that set. It imports Triton, so it runs under the environment the `compiler` group installs. `tools/board/prepare_board.sh <account> <board> --mlir` deploys it.
+built by it from its Triton source in `gpt2_triton.py`, currently the four GEMMs, each adding its bias, the two sums and
+the LayerNorm, its four attention images converted from one-head kernels into images walking all twelve heads, along
+with the two KV-cache copies, which have no Triton source and are stated as tile ops, and
+`tools/emulators/emulate_board_checks.py --images <dir>` runs the board's checks against that set. It imports Triton, so
+it runs under the environment the `compiler` group installs. `tools/board/prepare_board.sh <account> <board> --mlir`
+deploys it.
 
 C++ is formatted by `.clang-format` and linted by `.clang-tidy`, both in this directory.
 
@@ -34,7 +37,7 @@ C++ is formatted by `.clang-format` and linted by `.clang-tidy`, both in this di
 |-------------------------------|-------------------------------------------------------------------------------------|
 | `third_party/triton/`         | Triton's tt dialect, compiled from `TRITON_SOURCE_DIR` without the rest of Triton    |
 | `include/minitpu/minitpu/`    | The minitpu dialect: machine operations over virtual registers (`!minitpu.vreg`), VMEM buffers and `scf.for` loops, and its passes |
-| `lib/minitpu/`                | The dialect's verifiers, the conversion of a Triton kernel into the one tile op computing it (`tt_to_minitpu.cpp`), the expansion of the `minitpu.matmul`, `minitpu.add`, `minitpu.layernorm`, `minitpu.copy` and `minitpu.attention` tile ops (`tile_to_vector.cpp`, over the layout in `tile_layout.h`), the VMEM and register allocators (`allocate.cpp`), and the lowering into minitpuisa (`to_isa.cpp`) |
+| `lib/minitpu/`                | The dialect's verifiers, the conversion of a Triton kernel into the one tile op computing it, attention given its head count (`tt_to_minitpu.cpp`), the expansion of the `minitpu.matmul`, `minitpu.add`, `minitpu.layernorm`, `minitpu.copy` and `minitpu.attention` tile ops (`tile_to_vector.cpp`, over the layout in `tile_layout.h`), the VMEM and register allocators (`allocate.cpp`), and the lowering into minitpuisa (`to_isa.cpp`) |
 | `include/minitpu/minitpuisa/` | The minitpuisa dialect: one op per instruction, its slots and opcodes read from `codegen/minitpuisa.td`, and the bundle bit layout (`encoding.h`) |
 | `lib/minitpuisa/`             | The dialect's verifiers, the image import and export (`image.cpp`), and the `-minitpuisa-pack` and `-minitpuisa-schedule` passes over the traffic model they share (`traffic.h`) |
 | `tools/minitpu-opt/`          | The `mlir-opt`-style driver every lit test runs                                     |

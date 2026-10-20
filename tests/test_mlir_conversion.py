@@ -15,10 +15,10 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE / "tools" / "board"))
 
-from build_mlir_images import (_TOOLS, add_kernel, compile_kernel, gemm_kernel, layernorm_kernel,  # noqa: E402
-                               triton_kernel)
-from gpt2_triton import (gpt2_add, gpt2_add_bias, gpt2_attention, gpt2_layernorm, gpt2_matmul,  # noqa: E402
-                         gpt2_matmul_bias, gpt2_matmul_gelu)
+from build_mlir_images import (_TOOLS, add_kernel, attention_kernel, compile_kernel, gemm_kernel,  # noqa: E402
+                               layernorm_kernel, triton_kernel)
+from gpt2_triton import (gpt2_add, gpt2_add_bias, gpt2_attention, gpt2_decode_attention, gpt2_layernorm,  # noqa: E402
+                         gpt2_matmul, gpt2_matmul_bias, gpt2_matmul_gelu)
 
 pytestmark = pytest.mark.skipif(not (_TOOLS / "minitpu-opt").exists(), reason="mlir/ is not built")
 
@@ -93,16 +93,36 @@ def test_mlir_conversion_refuses_a_transposed_operand(tmp_path: pathlib.Path) ->
     assert "addresses the weights in a layout the host does not pack it in" in refusal.value.stderr
 
 
-def test_mlir_conversion_refuses_attention(tmp_path: pathlib.Path) -> None:
-    """Verifies that attention, which no tile op covers yet, is refused with a diagnostic."""
+@pytest.mark.parametrize("tokens", [32, 64, 96])
+def test_mlir_converts_causal_attention(tokens: int, tmp_path: pathlib.Path) -> None:
+    """Verifies that the causal attention kernel, written for one head, converts into the image walking every head,
+    at GPT-2's sequence length and at others."""
+    _assert_same_image(triton_kernel(gpt2_attention, M=tokens), attention_kernel(keys=tokens, causal=True), tmp_path)
+
+
+@pytest.mark.parametrize(("keys", "length"), [(64, 64), (256, 256), (1024, 1024), (256, 100)])
+def test_mlir_converts_decode_attention(keys: int, length: int, tmp_path: pathlib.Path) -> None:
+    """Verifies that the decode attention kernel converts into the image masking its keys at run time, whatever
+    length the kernel states, since the host writes the masks for the cache's own length."""
+    converted = triton_kernel(gpt2_decode_attention, N=keys, LENGTH=length)
+    _assert_same_image(converted, attention_kernel(keys=keys, causal=False), tmp_path)
+
+
+def test_mlir_conversion_refuses_unnormalised_attention(tmp_path: pathlib.Path) -> None:
+    """Verifies that attention whose output is stored without its division by the sum is refused, naming it."""
+    module = triton_kernel(gpt2_attention, M=64)
+    lines = module.splitlines()
+    divide = next(line for line in lines if "arith.divf" in line and "16x64" in line)
+    result, accumulated = divide.split("=")[0].strip(), divide.split("arith.divf")[1].split(",")[0].strip()
+    module = "\n".join(line for line in lines if line != divide).replace(result, accumulated)
     with pytest.raises(subprocess.CalledProcessError) as refusal:
-        _run_opt(triton_kernel(gpt2_attention, M=64), tmp_path)
-    assert "takes 2 dot products" in refusal.value.stderr
+        _run_opt(module, tmp_path)
+    assert "must store the output divided by its sum" in refusal.value.stderr
 
 
 def _run_opt(module: str, directory: pathlib.Path) -> None:
     """Runs the conversion alone over a module, raising with its diagnostics when it refuses."""
     source = directory / "kernel.ttir"
     source.write_text(module)
-    subprocess.run([str(_TOOLS / "minitpu-opt"), str(source), "--convert-tt-to-minitpu"], check=True,
+    subprocess.run([str(_TOOLS / "minitpu-opt"), str(source), "--convert-tt-to-minitpu=attention-heads=12"], check=True,
                    capture_output=True, text=True)

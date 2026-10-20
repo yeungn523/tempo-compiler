@@ -23,6 +23,7 @@
 #include <optional>
 #include <utility>
 #include "minitpu/minitpu/passes.h"
+#include "tile_layout.h"
 
 namespace mlir::minitpu
 {
@@ -44,6 +45,9 @@ namespace
 
     /// Stores the divisor the exact GELU scales its argument by.
     constexpr double kRootTwo = 1.4142135623730951;
+
+    /// Stores the highest constant read as masking a score, which no real score reaches.
+    constexpr double kMaskBound = -1.0e9;
 
     /// Stores the dimension a broadcast feature row is repeated along, being the tokens.
     constexpr int32_t kTokenAxis = 0;
@@ -400,12 +404,26 @@ namespace
         return {};
     }
 
-    /// Returns the tensor `value` sums along its features, or null when it is no such sum.
-    Value FeatureSum(Value value)
+    /// Returns the tensor `value` folds along its features under `CombineOp`, or null when it is no such fold.
+    template <typename CombineOp>
+    Value FeatureFold(Value value)
     {
         auto reduce = value ? value.getDefiningOp<tt::ReduceOp>() : tt::ReduceOp {};
         if (!reduce || reduce.getSrcs().size() != 1 || reduce.getAxis() != kFeatureAxis) return {};
-        return isa_and_nonnull<arith::AddFOp>(reduce.getSingleCombiner()) ? reduce.getSrcs()[0] : Value {};
+        return isa_and_nonnull<CombineOp>(reduce.getSingleCombiner()) ? reduce.getSrcs()[0] : Value {};
+    }
+
+    /// Returns the tensor `value` sums along its features, or null when it is no such sum.
+    Value FeatureSum(Value value)
+    {
+        return FeatureFold<arith::AddFOp>(value);
+    }
+
+    /// Returns whether `value` is a float constant below every real score: negative infinity or a mask value.
+    bool IsMasked(Value value)
+    {
+        const std::optional<double> constant = FloatConstant(value);
+        return constant && *constant <= kMaskBound;
     }
 
     /// Stores the loops walking one operand's rows and columns, each absent when the kernel's shape gives it one
@@ -448,8 +466,8 @@ namespace
     class KernelConversion
     {
       public:
-        /// Prepares to convert `function`.
-        explicit KernelConversion(tt::FuncOp function) : _function(function)
+        /// Prepares to convert `function`, an attention kernel among them walking `heads` heads in its image.
+        KernelConversion(tt::FuncOp function, const uint32_t heads) : _function(function), _heads(heads)
         {}
 
         /**
@@ -466,10 +484,12 @@ namespace
                 if (auto dot = dyn_cast<tt::DotOp>(operation)) products.push_back(dot);
                 if (llvm::isa<tt::ReduceOp>(operation)) reduces = true;
             });
-            if (products.size() > 1)
+            if (products.size() == 2) return ConvertAttention(products[0], products[1], store);
+            if (products.size() > 2)
             {
                 return _function.emitError() << "takes " << products.size() << " dot products. A product converts "
-                                             << "into minitpu.matmul when one dot product accumulates its result.";
+                                             << "into minitpu.matmul when one dot product accumulates its result, "
+                                             << "and attention into minitpu.attention when two do.";
             }
             if (!products.empty()) return ConvertMatmul(products.front(), store);
             if (reduces) return ConvertLayernorm(store);
@@ -479,6 +499,9 @@ namespace
       private:
         /// Stores the kernel being converted.
         tt::FuncOp _function;
+
+        /// Stores the heads an attention image walks.
+        uint32_t _heads;
 
         /// Stores the addresses resolved so far.
         AddressAnalysis _addresses;
@@ -766,6 +789,265 @@ namespace
             return success();
         }
 
+        /**
+         * @brief Holds an integer index tensor to the indices one loop walks along one dimension.
+         *
+         * @param value the index tensor, two-dimensional.
+         * @param loop the loop whose counter advances it by one per unit, or nullopt when the loop is folded away.
+         * @param dimension the dimension the indices run along, the other being broadcast.
+         * @returns whether the tensor is exactly the loop's counter plus a range along `dimension`.
+         */
+        bool IsIndex(Value value, const std::optional<Loop>& loop, const int64_t dimension)
+        {
+            const FailureOr<Affine> form = _addresses.Of(value);
+            if (failed(form) || form->base || form->constant != 0 || form->strides.size() != 2) return false;
+            SmallVector<int64_t> strides(2, 0);
+            strides[dimension]    = 1;
+            const size_t counters = loop ? 1 : 0;
+            return ArrayRef<int64_t>(form->strides) == ArrayRef<int64_t>(strides) &&
+                   form->counters.size() == counters && (!loop || form->Step(loop->counter) == 1);
+        }
+
+        /**
+         * @brief Converts a kernel attending one head under the online softmax into minitpu.attention.
+         *
+         * @details The kernel reads one head's queries, keys and values as dense row-major [tokens, head] tensors and
+         * stores its output the same way, the scores masked causally or to a length. The image it converts into is
+         * the one the board launches: every head of the fused QKV tensor at once, each head's output written over
+         * its queries, the keys read from that tensor when causal and from the KV cache otherwise, and the masks
+         * read from the constants block the host writes.
+         *
+         * @param scores the dot product of the queries and the transposed keys.
+         * @param attended the dot product of the probabilities and the values, accumulating the output.
+         * @param store the kernel's only store, writing the normalised output.
+         * @returns success once the kernel is replaced, failure with a diagnostic otherwise.
+         */
+        LogicalResult ConvertAttention(tt::DotOp scores, tt::DotOp attended, tt::StoreOp store)
+        {
+            constexpr StringRef kFamily = "attention";
+            auto keys_loop              = dyn_cast<scf::ForOp>(attended->getParentOp());
+            if (!keys_loop || scores->getParentOp() != keys_loop)
+            {
+                return Refuse(attended, kFamily, "both dot products must sit in one loop over the keys.");
+            }
+
+            // Reads the carried running maximum, running sum and output off the output's rescale.
+            const unsigned first = keys_loop.getNumInductionVars();
+            Value maximum_in;
+            Value total_in;
+            Value output_in;
+            Value rescale;
+            for (const auto& [carried, factor] : Orders<arith::MulFOp>(attended.getC()))
+            {
+                if (output_in || !llvm::is_contained(keys_loop.getRegionIterArgs(), carried)) continue;
+                output_in = carried;
+                rescale   = Broadcasted(factor, kFeatureAxis);
+            }
+            auto exponent    = rescale ? rescale.getDefiningOp<math::ExpOp>() : math::ExpOp {};
+            auto difference  = exponent ? exponent.getOperand().getDefiningOp<arith::SubFOp>() : arith::SubFOp {};
+            maximum_in       = difference ? difference.getLhs() : Value {};
+            Value maximum    = difference ? difference.getRhs() : Value {};
+            const auto index = [&](Value carried) {
+                return cast<BlockArgument>(carried).getArgNumber() - first;
+            };
+            if (!output_in || !maximum_in || !llvm::is_contained(keys_loop.getRegionIterArgs(), maximum_in) ||
+                keys_loop.getYieldedValues()[index(output_in)] != attended.getResult() ||
+                keys_loop.getYieldedValues()[index(maximum_in)] != maximum)
+            {
+                return Refuse(
+                    attended,
+                    kFamily,
+                    "the loop must carry the output, rescaling it by exp(old maximum - new maximum) before "
+                    "accumulating the probabilities pushed against the values, and carry the new maximum."
+                );
+            }
+
+            // Reads the new maximum off the masked scores, and the probabilities and their sum against it.
+            Value masked;
+            for (const auto& [carried, block] : Orders<arith::MaxNumFOp>(maximum))
+            {
+                if (carried == maximum_in && FeatureFold<arith::MaxNumFOp>(block))
+                    masked = FeatureFold<arith::MaxNumFOp>(block);
+            }
+            auto narrowed      = attended.getA().getDefiningOp<arith::TruncFOp>();
+            auto probabilities = narrowed ? narrowed.getIn().getDefiningOp<math::ExpOp>() : math::ExpOp {};
+            auto centring =
+                probabilities ? probabilities.getOperand().getDefiningOp<arith::SubFOp>() : arith::SubFOp {};
+            if (!masked || !centring || centring.getLhs() != masked ||
+                Broadcasted(centring.getRhs(), kFeatureAxis) != maximum)
+            {
+                return Refuse(
+                    attended,
+                    kFamily,
+                    "the probabilities must be exp(masked scores - new maximum), the new maximum being the "
+                    "old one past the masked scores' maximum over the keys."
+                );
+            }
+            for (Value carried : keys_loop.getRegionIterArgs())
+            {
+                if (carried == output_in || carried == maximum_in) continue;
+                total_in = carried;
+            }
+            bool sums = false;
+            for (const auto& [kept, added] : Orders<arith::AddFOp>(keys_loop.getYieldedValues()[index(total_in)]))
+            {
+                for (const auto& [carried, factor] : Orders<arith::MulFOp>(kept))
+                {
+                    sums = sums || (carried == total_in && Broadcasted(factor, kFeatureAxis) == Value {} &&
+                                    factor == rescale && FeatureSum(added) == probabilities.getResult());
+                }
+            }
+            const bool cleared = IsFloat(keys_loop.getInitArgs()[index(total_in)], 0.0) &&
+                                 IsFloat(keys_loop.getInitArgs()[index(output_in)], 0.0) &&
+                                 IsMasked(keys_loop.getInitArgs()[index(maximum_in)]);
+            if (!sums || !cleared || keys_loop.getNumRegionIterArgs() != 3)
+            {
+                return Refuse(
+                    attended,
+                    kFamily,
+                    "the loop must carry exactly the maximum, entering below every score, the sum and the "
+                    "output, both entering at zero, the sum rescaled and added the probabilities' sum."
+                );
+            }
+
+            // Reads the mask: a causal one keeping each key up to its query, or one keeping the keys below a length.
+            Value product = masked;
+            std::optional<int64_t> length;
+            bool causal = false;
+            Value keep;
+            if (auto choice = masked.getDefiningOp<arith::SelectOp>())
+            {
+                if (!IsMasked(choice.getFalseValue()))
+                    return Refuse(choice, kFamily, "a masked score must be a mask value.");
+                product = choice.getTrueValue();
+                keep    = choice.getCondition();
+            }
+            auto score_product = product.getDefiningOp<tt::DotOp>();
+            auto transposed    = score_product ? score_product.getB().getDefiningOp<tt::TransOp>() : tt::TransOp {};
+            tt::LoadOp query   = score_product ? Load(score_product.getA()) : tt::LoadOp {};
+            tt::LoadOp key     = transposed ? Load(transposed.getSrc()) : tt::LoadOp {};
+            tt::LoadOp value   = Load(attended.getB());
+            if (score_product != scores || !query || !key || !value || !IsFloat(scores.getC(), 0.0) || store.getMask())
+            {
+                return Refuse(
+                    scores,
+                    kFamily,
+                    "the scores must be the unmasked queries' load against the transposed keys' load, from "
+                    "zero, and the output must multiply the values' load and store unmasked."
+                );
+            }
+
+            // Finds the query and key loops by what they walk, each absent when the shape gives it one iteration.
+            const FailureOr<SmallVector<Loop>> loops = Enclosing(scores);
+            if (failed(loops)) return failure();
+            const FailureOr<Walk> queries = Classify(query, "queries", query.getPtr(), *loops);
+            const FailureOr<Walk> keys    = Classify(key, "keys", key.getPtr(), *loops);
+            if (failed(queries) || failed(keys)) return failure();
+            const std::optional<Loop>& query_loop = queries->rows;
+            const std::optional<Loop>& key_loop   = keys->rows;
+            if (!key_loop || key_loop->op != keys_loop || queries->columns || keys->columns ||
+                (query_loop ? 2U : 1U) != loops->size())
+            {
+                return Refuse(scores, kFamily, "one loop must walk the keys, inside at most one walking the queries.");
+            }
+            const ArrayRef<int64_t> query_tile = Shape(query.getResult());
+            const ArrayRef<int64_t> key_tile   = Shape(key.getResult());
+            const int64_t head                 = query_tile[1];
+            const int64_t tokens               = query_loop ? query_loop->upper : query_tile[0];
+            const int64_t key_count            = key_loop->upper;
+            if (key_tile[1] != head || key_loop->step != key_tile[0] ||
+                (query_loop && query_loop->step != query_tile[0]))
+            {
+                return Refuse(scores, kFamily, "the loops must step by the query and key tiles' rows over one head.");
+            }
+
+            if (keep)
+            {
+                auto widened = keep.getDefiningOp<tt::BroadcastOp>();
+                auto compare = (widened ? widened.getSrc() : keep).getDefiningOp<arith::CmpIOp>();
+                if (compare && compare.getPredicate() == arith::CmpIPredicate::sge)
+                {
+                    causal = IsIndex(compare.getLhs(), query_loop, 0) && IsIndex(compare.getRhs(), key_loop, 1);
+                }
+                if (compare && compare.getPredicate() == arith::CmpIPredicate::sle)
+                {
+                    causal = IsIndex(compare.getLhs(), key_loop, 1) && IsIndex(compare.getRhs(), query_loop, 0);
+                }
+                APInt bound;
+                if (compare && compare.getPredicate() == arith::CmpIPredicate::slt &&
+                    IsIndex(compare.getLhs(), key_loop, 1) && matchPattern(compare.getRhs(), m_ConstantInt(&bound)))
+                {
+                    length = bound.getSExtValue();
+                }
+                if (!causal && (!length || *length < 1 || *length > key_count))
+                {
+                    return Refuse(
+                        compare ? compare.getOperation() : scores.getOperation(),
+                        kFamily,
+                        "the mask must keep each key up to its own query, or the keys below a length."
+                    );
+                }
+            }
+            if (causal != static_cast<bool>(query_loop) || (causal && tokens != key_count) ||
+                (!causal && query_tile[0] != tile::kQueryBlock))
+            {
+                return Refuse(
+                    scores,
+                    kFamily,
+                    "a causal kernel must walk its queries over the same tokens as its keys, and any other "
+                    "must attend one block of 16 queries."
+                );
+            }
+
+            // Holds the output to the queries' sum-normalised accumulation, and every operand to a dense row-major
+            // head.
+            auto out_narrowed = store.getValue().getDefiningOp<arith::TruncFOp>();
+            auto quotient     = out_narrowed ? out_narrowed.getIn().getDefiningOp<arith::DivFOp>() : arith::DivFOp {};
+            if (!quotient || quotient.getLhs() != keys_loop.getResult(index(output_in)) ||
+                Broadcasted(quotient.getRhs(), kFeatureAxis) != keys_loop.getResult(index(total_in)))
+            {
+                return Refuse(store, kFamily, "the kernel must store the output divided by its sum, narrowed to BF16.");
+            }
+            Type bf16 = BFloat16Type::get(store.getContext());
+            if (Pointee(query.getPtr()) != bf16 || Pointee(key.getPtr()) != bf16 || Pointee(value.getPtr()) != bf16 ||
+                Pointee(store.getPtr()) != bf16)
+            {
+                return Refuse(store, kFamily, "the queries, keys, values and output must be BF16.");
+            }
+            SmallVector<Counter> per_query;
+            AddCounter(per_query, query_loop, head);
+            SmallVector<Counter> per_key;
+            AddCounter(per_key, key_loop, head);
+            const FailureOr<Value> query_base = Expect(query, "queries", query.getPtr(), {head, 1}, per_query);
+            const FailureOr<Value> key_base   = Expect(key, "keys", key.getPtr(), {head, 1}, per_key);
+            const FailureOr<Value> value_base = Expect(value, "values", value.getPtr(), {head, 1}, per_key);
+            const FailureOr<Value> output     = Expect(store, "output", store.getPtr(), {head, 1}, per_query);
+            if (failed(query_base) || failed(key_base) || failed(value_base) || failed(output)) return failure();
+            if (failed(
+                    Arguments({*query_base, *key_base, *value_base, *output}, {"queries", "keys", "values", "output"})
+                ))
+            {
+                return failure();
+            }
+
+            OpBuilder builder = Open();
+            Value constants   = Argument(builder, 0);
+            Value cache       = causal ? Value {} : Argument(builder, 1);
+            Value fused       = Argument(builder, 2);
+            AttentionOp::create(
+                builder,
+                _function.getLoc(),
+                constants,
+                fused,
+                cache,
+                _heads,
+                static_cast<uint32_t>(head),
+                static_cast<uint32_t>(key_count),
+                causal
+            );
+            return success();
+        }
+
         /// Converts a kernel storing the elementwise sum of two operands, one optionally a broadcast feature row, into
         /// minitpu.add.
         LogicalResult ConvertAdd(tt::StoreOp store)
@@ -1006,7 +1288,7 @@ namespace
      * @param function the kernel.
      * @returns success once it is replaced, failure with a diagnostic otherwise.
      */
-    LogicalResult ConvertFunction(tt::FuncOp function)
+    LogicalResult ConvertFunction(tt::FuncOp function, const uint32_t heads)
     {
         SmallVector<tt::StoreOp> stores;
         function.walk([&](tt::StoreOp store) {
@@ -1018,7 +1300,7 @@ namespace
                                         << "which writes one result.";
         }
 
-        KernelConversion conversion(function);
+        KernelConversion conversion(function, heads);
         if (failed(conversion.Convert(stores.front()))) return failure();
         function.erase();
         return success();
@@ -1028,6 +1310,8 @@ namespace
     class ConvertTritonPass final : public mlir::minitpu::impl::ConvertTritonToMinitpuBase<ConvertTritonPass>
     {
       public:
+        using ConvertTritonToMinitpuBase::ConvertTritonToMinitpuBase;
+
         void runOnOperation() override
         {
             SmallVector<tt::FuncOp> functions;
@@ -1036,7 +1320,7 @@ namespace
             });
             for (tt::FuncOp function : functions)
             {
-                if (failed(ConvertFunction(function))) signalPassFailure();
+                if (failed(ConvertFunction(function, heads))) signalPassFailure();
             }
         }
     };

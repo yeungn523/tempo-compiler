@@ -15,6 +15,10 @@ def ConvertTritonToMinitpu : Pass<"convert-tt-to-minitpu", "::mlir::ModuleOp">
 {
     let summary = "Convert every Triton kernel into a minitpu kernel of one tile op";
     let dependentDialects = ["::mlir::minitpu::MinitpuDialect"];
+    let options = [
+        Option<"heads", "attention-heads", "uint32_t", "1",
+               "Heads an attention image walks, the Triton kernel attending one of them">
+    ];
 }
 
 /**

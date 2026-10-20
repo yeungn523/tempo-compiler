@@ -24,17 +24,19 @@ sys.path.insert(0, str(_HERE / "board_package"))
 from bf16 import _BLOCK_TOKENS, _TILE, as_bf16_words  # noqa: E402
 from codegen import signature_of  # noqa: E402
 from codegen.frontend import compile_to_ttir  # noqa: E402
-from gpt2_triton import (gpt2_add, gpt2_add_bias, gpt2_layernorm, gpt2_matmul, gpt2_matmul_bias,  # noqa: E402
-                         gpt2_matmul_gelu)
+from gpt2_triton import (gpt2_add, gpt2_add_bias, gpt2_attention, gpt2_decode_attention,  # noqa: E402
+                         gpt2_layernorm, gpt2_matmul_bias)
 
 _TOOLS: pathlib.Path = _HERE / "mlir" / "build" / "bin"
 """Stores the directory minitpu-opt and minitpu-translate are built into."""
 
 _PIPELINE: str = (
-    "builtin.module(convert-tt-to-minitpu,minitpu.kernel(minitpu-tile-to-vector,minitpu-allocate-vmem,minitpu-allocate-registers),"
+    "builtin.module(convert-tt-to-minitpu{{attention-heads={heads}}},"
+    "minitpu.kernel(minitpu-tile-to-vector,minitpu-allocate-vmem,minitpu-allocate-registers),"
     "convert-minitpu-to-isa,minitpuisa.program(minitpuisa-pack,minitpuisa-schedule))"
 )
-"""Passes taking a Triton kernel, or a kernel of tile ops, to a scheduled program."""
+"""Passes taking a Triton kernel, or a kernel of tile ops, to a scheduled program, given the heads an attention image
+walks."""
 
 _GEMMS: tuple[tuple[int, int, bool], ...] = (
     (768, 2304, False),
@@ -221,12 +223,13 @@ def triton_kernel(kernel: JITFunction, **bound: int | bool) -> str:
     return module.str_nodebug()
 
 
-def compile_kernel(kernel: str, *, image: pathlib.Path) -> None:
+def compile_kernel(kernel: str, *, image: pathlib.Path, heads: int = _HEADS) -> None:
     """Compiles one kernel through the MLIR pipeline and writes its image.
 
     Args:
         kernel: The kernel's MLIR text, a Triton kernel's tt module or a minitpu kernel of tile ops.
         image: The path the image is written to.
+        heads: The heads an attention image walks, its Triton kernel attending one of them.
 
     Raises:
         subprocess.CalledProcessError: If either tool refuses the kernel, carrying its diagnostic.
@@ -235,7 +238,8 @@ def compile_kernel(kernel: str, *, image: pathlib.Path) -> None:
         source = pathlib.Path(scratch) / "kernel.mlir"
         program = pathlib.Path(scratch) / "program.mlir"
         source.write_text(kernel)
-        subprocess.run([str(_TOOLS / "minitpu-opt"), str(source), f"-pass-pipeline={_PIPELINE}", "-o", str(program)],
+        pipeline = _PIPELINE.format(heads=heads)
+        subprocess.run([str(_TOOLS / "minitpu-opt"), str(source), f"-pass-pipeline={pipeline}", "-o", str(program)],
                        check=True)
         subprocess.run([str(_TOOLS / "minitpu-translate"), "--export-minitpu-image", str(program), "-o", str(image)],
                        check=True)
@@ -266,8 +270,9 @@ def main() -> int:
                 for features, broadcast in _ADDS]
     kernels += [(f"layernorm_{features}", triton_kernel(gpt2_layernorm, N=features)) for features in _LAYERNORMS]
     kernels += [(f"copy_{rows}x{stride}", copy_kernel(rows=rows, stride=stride)) for rows, stride in _COPIES]
-    kernels += [(f"attention_{tokens}", attention_kernel(keys=tokens, causal=True)) for tokens in _ATTENTION_TOKENS]
-    kernels += [(f"decode_attention_{keys}", attention_kernel(keys=keys, causal=False)) for keys in _DECODE_KEYS]
+    kernels += [(f"attention_{tokens}", triton_kernel(gpt2_attention, M=tokens)) for tokens in _ATTENTION_TOKENS]
+    kernels += [(f"decode_attention_{keys}", triton_kernel(gpt2_decode_attention, N=keys, LENGTH=keys))
+                for keys in _DECODE_KEYS]
     # Builds the shortest program the loader takes, an empty kernel lowering to its halt alone.
     kernels += [("halt", "minitpu.kernel @halt {\n}\n")]
     for name, kernel in kernels:

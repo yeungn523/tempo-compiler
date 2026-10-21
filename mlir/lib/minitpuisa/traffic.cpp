@@ -31,7 +31,7 @@ namespace
     uint32_t ReadOperand(Operation& operation, const llvm::StringRef role)
     {
         // Reads the field's zero bits where an instruction carries no operand of that role, as the hardware decoder
-        // and asm.py's decoder both do.
+        // does.
         const std::optional<Attribute> attribute = operation.getInherentAttr(role);
         if (!attribute) return 0;
         return static_cast<uint32_t>(cast<IntegerAttr>(*attribute).getInt());
@@ -41,7 +41,7 @@ namespace
      * @brief Appends the registers one register role reads, expanding a range such as reg_idx+0..3.
      *
      * @param operation the instruction carrying the role.
-     * @param role the role, as codegen/minitpuisa.td's register_reads names it.
+     * @param role the role, as minitpuisa/isa.td's register_reads names it.
      * @param register_count the size of the register file, which a range wraps around.
      * @param reads the registers read, which receives the role's registers.
      */
@@ -82,7 +82,7 @@ FailureOr<BundleTraffic> mlir::minitpu::isa::CollectTraffic(BundleOp bundle)
         if (facts == nullptr)
         {
             return operation.emitOpError(
-                "is unable to be scheduled. Its mnemonic must be one codegen/minitpuisa.td publishes facts for."
+                "is unable to be scheduled. Its mnemonic must be one minitpuisa/isa.td publishes facts for."
             );
         }
 
@@ -90,7 +90,8 @@ FailureOr<BundleTraffic> mlir::minitpu::isa::CollectTraffic(BundleOp bundle)
         switch (facts->slot)
         {
             case kSlot::kE:
-                // Prices every E instruction as asm.py's decoder does: reading its ra field and claiming port A.
+                // Prices every E instruction as reading its ra field and claiming port A, the over-claim traffic.h
+                // names.
                 traffic.vector_reads.push_back(ReadOperand(operation, "ra"));
                 for (const std::string_view role : facts->register_reads)
                 {

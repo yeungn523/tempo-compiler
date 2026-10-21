@@ -1,6 +1,6 @@
-# Reads every mnemonic's group from codegen/minitpuisa.td, which the include path below reaches.
+# Reads every mnemonic's group from minitpuisa/isa.td, the ISA contract, which the include path below reaches.
 set(LLVM_TARGET_DEFINITIONS minitpu_ops.td)
-set(_MINITPU_INCLUDES "-I${MINITPU_REPOSITORY_DIR}")
+set(_MINITPU_INCLUDES "-I${MINITPU_REPOSITORY_DIR}/mlir/include")
 mlir_tablegen(minitpu_dialect.h.inc -gen-dialect-decls -dialect=minitpu ${_MINITPU_INCLUDES})
 mlir_tablegen(minitpu_dialect.cpp.inc -gen-dialect-defs -dialect=minitpu ${_MINITPU_INCLUDES})
 mlir_tablegen(minitpu_types.h.inc -gen-typedef-decls -typedefs-dialect=minitpu ${_MINITPU_INCLUDES})

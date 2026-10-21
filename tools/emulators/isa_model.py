@@ -1,4 +1,4 @@
-"""Provides the per-opcode scheduling facts the assembler schedules against.
+"""Provides the per-opcode facts the emulator decodes images with.
 
 Run `python3 tools/toolchain/gen_isa_doc.py --write` to generate.
 """

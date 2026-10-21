@@ -34,20 +34,19 @@ def test_board_check_fails_on_a_miscompiled_image(tmp_path: pathlib.Path) -> Non
         sys.path.insert(0, {str(_HERE)!r})
         import emulated_runtime
         sys.modules["runtime"] = emulated_runtime
-        from codegen import asm
-        import gpt2_inference, board_checks
+        import gpt2_inference, board_checks, minitpu_emulator as isa
 
         images = pathlib.Path({str(tmp_path)!r})
         shutil.copytree(gpt2_inference._IMAGE_DIRECTORY, images, dirs_exist_ok=True)
         path = images / "add_768.bin"
         data = bytearray(path.read_bytes())
-        width = (1 << asm.E_SLOT_W) - 1
-        vadd, vsub = asm._OPCODES["vadd"], asm._OPCODES["vsub"]
+        width = (1 << isa._E_SLOT_W) - 1
+        vadd, vsub = isa._OPCODES["vadd"], isa._OPCODES["vsub"]
         for offset in range(0, len(data), 16):
             word = int.from_bytes(data[offset:offset + 16], "little")
-            operation = (word >> asm._E_SHIFT) & width
+            operation = (word >> isa._E_SHIFT) & width
             if operation >> 15 == vadd:
-                word ^= (vadd ^ vsub) << (asm._E_SHIFT + 15)
+                word ^= (vadd ^ vsub) << (isa._E_SHIFT + 15)
                 data[offset:offset + 16] = word.to_bytes(16, "little")
         path.write_bytes(bytes(data))
         gpt2_inference._IMAGE_DIRECTORY = images

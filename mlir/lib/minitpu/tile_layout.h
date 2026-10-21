@@ -114,6 +114,12 @@ namespace mlir::minitpu::tile
     /// Stores the tiles an attention constants block opens with: the entering maximum and zeros.
     static constexpr uint32_t kAttentionStatedTiles = 2;
 
+    /// Stores the value each query's running maximum enters its keys below, which every real score clears.
+    static constexpr double kEnteringMaximum = -1.0e30;
+
+    /// Stores the score a mask tile gives a masked key, which no real score reaches, so its probability is zero.
+    static constexpr double kMaskedScore = -1.0e30;
+
     /// Stores the most head tiles an attention block accumulates, the registers its output holds across the keys.
     static constexpr uint32_t kMaxHeadTiles = 4;
 

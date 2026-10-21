@@ -1,13 +1,15 @@
 /**
- * @file minitpuisa.td
+ * @file isa.td
  * @brief Provides the implemented ISA scheduling contract, which is the single source of truth every generated
  * artifact derives from.
  *
- * @details tools/toolchain/gen_isa_doc.py reads this file through llvm-tblgen and writes the operation table published in
- * docs/ISA_AND_INTERFACES.md, the conformance package in tb/isa_latency_pkg.sv, and the scheduling facts the
- * assembler reads from codegen/isa_model.py. That tool regenerates all three under --write and exits non-zero
- * on a stale one under --check. Reading these records needs an llvm-tblgen on PATH, while the operation definitions
- * that eventually join them need mlir-tblgen for its C++ backends alone.
+ * @details The minitpu and minitpuisa dialects read their opcodes and slots from these records, and minitpu-tblgen's
+ * -gen-minitpu-sched writes the scheduler's latencies and capacities from them. tools/toolchain/gen_isa_doc.py reads
+ * this file through a TableGen driver and writes the operation table published in docs/ISA_AND_INTERFACES.md, the
+ * conformance package in tb/isa_latency_pkg.sv, and the per-opcode facts the emulator decodes images with in
+ * tools/emulators/isa_model.py. That tool regenerates all three under --write and exits non-zero on a stale one under
+ * --check. The records stay readable by llvm-tblgen alone, while the operation definitions that include them need
+ * mlir-tblgen for its C++ backends.
  */
 
 /// @brief Stores the array geometry the writeback offsets below are quoted against.
@@ -337,27 +339,9 @@ class ResourceValue<string value_name, int capacity_value>
 }
 
 /**
- * @brief Binds one assembler constant to the resource value it must equal.
- *
- * @details codegen/asm.py runs without llvm-tblgen and cannot read this file at runtime, so its constants are written
- * out there and checked against these bindings by tools/toolchain/gen_isa_doc.py --check.
- *
- * @param constant_name Names the constant as codegen/asm.py spells it.
- * @param value_name Names the resource value the constant must equal.
- */
-class AsmConstant<string constant_name, string value_name>
-{
-    /// Stores the constant's name as codegen/asm.py spells it.
-    string name = constant_name;
-
-    /// Stores the name of the resource value the constant must equal.
-    string resource_field = value_name;
-}
-
-/**
  * @brief Stores one hardware capacity a schedule can exceed, as distinct from the latencies above.
  *
- * @details These capacities were spread across RTL localparams, codegen/asm.py constants and comments
+ * @details These capacities were spread across RTL localparams, compiler constants and comments
  * independently. The MXU output FIFO's depth being known only to the RTL is how a kernel that overflowed it on every
  * step of every block reached silicon and returned plausible wrong numbers.
  *
@@ -374,8 +358,8 @@ class HardwareResource<string group_name>
     /// Stores every named value the capacity carries.
     list<ResourceValue> values = [];
 
-    /// Stores every assembler constant bound to one of those values.
-    list<AsmConstant> asm_constants = [];
+    /// Stores the name of the value the published table and the RTL localparam state, or "" for the first value.
+    string headline = "";
 
     /// Stores what exceeding the capacity costs, as the published table words it.
     string note = "";
@@ -387,9 +371,7 @@ def MatrixOutputFifo : HardwareResource<"mxu_output_fifo">
     let values = [ResourceValue<"depth", 32>,
                   ResourceValue<"entries_per_vmatpush", 4>,
                   ResourceValue<"entries_per_vmatpop", 4>];
-    let asm_constants = [AsmConstant<"_MXU_OUTPUT_FIFO_DEPTH", "depth">,
-                         AsmConstant<"_MXU_ENTRIES_PER_PUSH", "entries_per_vmatpush">,
-                         AsmConstant<"_MXU_ENTRIES_PER_POP", "entries_per_vmatpop">];
+    let headline = "depth";
     let note = "One per lane (mxu.sv gen_lane_output). A vmatpush streams NUM_SUBLANES activation rows and so produces that many entries; a vmatpop consumes the same across its masked beats. Overflow drops results silently -- vpu_fifo.sv has no replay path.";
 }
 
@@ -397,7 +379,7 @@ def LoopBuffer : HardwareResource<"loop_buffer">
 {
     let rtl_parameter = "LB_CAP";
     let values = [ResourceValue<"capacity_bundles", 24>];
-    let asm_constants = [AsmConstant<"LB_CAP", "capacity_bundles">];
+    let headline = "capacity_bundles";
     let note = "A body longer than this refetches from IRAM instead of replaying, which bounds replay rather than speed.";
 }
 
@@ -405,7 +387,7 @@ def InstructionMemory : HardwareResource<"iram">
 {
     let rtl_parameter = "IRAM_DEPTH";
     let values = [ResourceValue<"depth_bundles", 4096>];
-    let asm_constants = [AsmConstant<"IRAM_DEPTH", "depth_bundles">];
+    let headline = "depth_bundles";
     let note = "Bundles the loader places, being 2**IRAM_ADDR_WIDTH. A longer image is loaded up to this and its tail never runs, so the drain it ends on leaves the buffer untouched.";
 }
 
@@ -413,7 +395,7 @@ def DelayField : HardwareResource<"delay_field">
 {
     let rtl_parameter = "DELAY_W";
     let values = [ResourceValue<"width_bits", 6>];
-    let asm_constants = [AsmConstant<"DELAY_W", "width_bits">];
+    let headline = "width_bits";
     let note = "One bundle spaces at most 2**width-1 cycles, while a vmatpush result is 82 away, so every push-to-pop gap needs a filler bundle.";
 }
 
@@ -428,7 +410,7 @@ def DmaSlots : HardwareResource<"dma_slots">
 {
     let rtl_parameter = "DMA_SLOT_COUNT";
     let values = [ResourceValue<"count", 2>];
-    let asm_constants = [AsmConstant<"DMA_SLOT_COUNT", "count">];
+    let headline = "count";
     let note = "Descriptor slots a flush mask selects between. flush_slot blocks until dma_slot_done covers every bit of its mask and only a descriptor asserts that bit, so flushing a slot the kernel never issued on wedges the device until the PL is reprogrammed.";
 }
 

@@ -1,5 +1,6 @@
-// The scheduler spaces each consumer by its producer's latency from codegen/minitpuisa.td, and bridges a gap past one
-// delay field with empty bundles. Each expectation matches what codegen/asm.py's schedule() places for the same stream.
+// The scheduler spaces each consumer by its producer's latency from minitpuisa/isa.td, and bridges a gap past one
+// delay field with empty bundles. Each expectation matches what the retired Python assembler placed for the same
+// stream.
 
 // RUN: minitpu-opt %s -split-input-file -minitpuisa-schedule | FileCheck %s
 

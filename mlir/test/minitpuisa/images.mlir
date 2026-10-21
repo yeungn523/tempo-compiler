@@ -1,5 +1,5 @@
 // Every image the board package launches reads into minitpuisa and writes back byte for byte, which holds the
-// dialect's encoder to the one codegen/asm.py assembled those images with.
+// dialect's encoder to the one the images were assembled with.
 
 // RUN: minitpu-translate --import-minitpu-image %images/add_768.bin -o %t.add_768.mlir && minitpu-translate --export-minitpu-image %t.add_768.mlir -o %t.add_768.bin && cmp %images/add_768.bin %t.add_768.bin
 // RUN: minitpu-translate --import-minitpu-image %images/add_bias_768.bin -o %t.add_bias_768.mlir && minitpu-translate --export-minitpu-image %t.add_bias_768.mlir -o %t.add_bias_768.bin && cmp %images/add_bias_768.bin %t.add_bias_768.bin

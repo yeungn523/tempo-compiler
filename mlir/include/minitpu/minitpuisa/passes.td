@@ -16,7 +16,7 @@ include "mlir/Pass/PassBase.td"
  * A, the VMEM compute port, and the single vector write port allow, and the gap before it becomes the previous
  * bundle's delay. A gap past the delay field's reach is bridged with empty bundles. The program keeps its order, so
  * scalar WAW and WAR hazards and VMEM ownership stay with whatever placed the bundles. Five hazards no delay repairs
- * are refused before any delay is placed. Every latency and capacity is read from codegen/minitpuisa.td.
+ * are refused before any delay is placed. Every latency and capacity is read from minitpuisa/isa.td.
  */
 def MinitpuisaSchedule : Pass<"minitpuisa-schedule", "::mlir::minitpu::isa::ProgramOp">
 {

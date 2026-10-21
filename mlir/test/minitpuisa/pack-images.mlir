@@ -1,6 +1,6 @@
-// Every GPT-2 image's emitted stream packs to the bytes codegen/asm.py's pack() makes of it, and layernorm_768, the
-// image built packed, reaches its board image through the packer and the scheduler together. Regenerate the streams
-// with tools/fixtures/record_schedule_streams.py. The attention streams are left out: pack() moves a vtxin past the
+// Every GPT-2 image's emitted stream, recorded under Inputs/schedule, packs to the bytes the retired Python assembler's
+// pack() made of it, and layernorm_768, the image built packed, reaches its recorded image through the packer and the
+// scheduler together. The attention streams are left out: pack() moved a vtxin past the
 // vtxouts draining the tile before it, which their hand placement never ships, and this packer keeps every transpose
 // in program order.
 

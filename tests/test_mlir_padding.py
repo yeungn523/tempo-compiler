@@ -6,9 +6,7 @@ from __future__ import annotations
 
 import math
 import pathlib
-import subprocess
 import sys
-import tempfile
 
 import numpy as np
 import pytest
@@ -18,16 +16,17 @@ import triton.language as tl
 _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent.parent
 """Stores the path to the repository's root directory."""
 
+sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE / "board_package"))
 sys.path.insert(0, str(_HERE / "tools" / "board"))
 sys.path.insert(0, str(_HERE / "tools" / "emulators"))
 
 from bf16 import _BLOCK_TOKENS, _TILE, _ZERO_TILE_WORDS, from_bf16_words, pack_activations, pack_bias, pack_weights  # noqa: E402
-from build_mlir_images import (_PIPELINE, _TOOLS, attention_kernel, compile_kernel, gemm_kernel,  # noqa: E402
-                               triton_kernel)
+from build_images import attention_kernel, gemm_kernel  # noqa: E402
+from driver import TOOLS, ProgramError, compile_kernel, triton_kernel  # noqa: E402
 from minitpu_emulator import Machine, read_image, to_bf16  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not (_TOOLS / "minitpu-opt").exists(), reason="mlir/ is not built")
+pytestmark = pytest.mark.skipif(not (TOOLS / "minitpu-opt").exists(), reason="mlir/ is not built")
 
 _ROOT_TWO: tl.constexpr = tl.constexpr(1.4142135623730951)
 """Divisor the exact GELU scales its argument by."""
@@ -164,18 +163,10 @@ def _gelu(values: np.ndarray) -> np.ndarray:
 
 
 def _refusal(module: str) -> str:
-    """Runs the whole pipeline over a module, expecting a refusal, and returns its diagnostics."""
-    with tempfile.TemporaryDirectory() as scratch:
-        source, program = pathlib.Path(scratch) / "kernel.mlir", pathlib.Path(scratch) / "program.mlir"
-        source.write_text(module)
-        opt = subprocess.run([str(_TOOLS / "minitpu-opt"), str(source), f"-pass-pipeline={_PIPELINE.format(heads=1)}",
-                              "-o", str(program)], capture_output=True, text=True)
-        if opt.returncode:
-            return opt.stderr
-        translate = subprocess.run([str(_TOOLS / "minitpu-translate"), "--export-minitpu-image", str(program), "-o",
-                                    str(pathlib.Path(scratch) / "image.bin")], capture_output=True, text=True)
-        assert translate.returncode, "the pipeline compiled a kernel it was expected to refuse"
-        return translate.stderr
+    """Compiles a module through every stage, expecting a refusal, and returns its diagnostics."""
+    with pytest.raises(ProgramError) as refusal:
+        compile_kernel(module)
+    return str(refusal.value)
 
 
 @pytest.mark.parametrize(("tokens", "columns", "depth", "block_k"),
@@ -185,7 +176,8 @@ def test_mlir_pads_masked_extents(tokens: int, columns: int, depth: int, block_k
     tiles, matching the reference over its own extents and draining zeros past them, a contraction deeper than one
     bank among them."""
     image = tmp_path / "gemm.bin"
-    compile_kernel(triton_kernel(indexed_matmul, M=tokens, N=columns, K=depth, BLOCK_K=block_k), image=image)
+    kernel = triton_kernel(indexed_matmul, M=tokens, N=columns, K=depth, BLOCK_K=block_k)
+    image.write_bytes(compile_kernel(kernel).image)
 
     rng = np.random.default_rng(0)
     left = to_bf16(rng.standard_normal((_BLOCK_TOKENS, depth)).astype(np.float32))
@@ -201,7 +193,7 @@ def test_mlir_pads_a_masked_bias(activate: bool, tmp_path: pathlib.Path) -> None
     """Verifies that a GEMM advancing carried pointers, masking the contraction by what remains of it and adding a
     masked bias, converts into the padded product plus the bias, with and without the GELU."""
     image = tmp_path / "gemm.bin"
-    compile_kernel(triton_kernel(advanced_matmul, ACTIVATE=activate), image=image)
+    image.write_bytes(compile_kernel(triton_kernel(advanced_matmul, ACTIVATE=activate)).image)
 
     rng = np.random.default_rng(1)
     left = to_bf16(rng.standard_normal((_BLOCK_TOKENS, 100)).astype(np.float32))
@@ -219,7 +211,7 @@ def test_mlir_splits_a_deep_contraction_exactly(depth: int, columns: int, bias: 
     product the one before drained, sums every k-tile exactly once, on operands whose every partial sum BF16 holds
     exactly."""
     image = tmp_path / "gemm.bin"
-    compile_kernel(gemm_kernel(depth=depth, columns=columns, activate=False, bias=bias), image=image)
+    image.write_bytes(compile_kernel(gemm_kernel(depth=depth, columns=columns, activate=False, bias=bias)).image)
 
     rng = np.random.default_rng(3)
     left = ((rng.random((_BLOCK_TOKENS, depth)) < 16 / depth) * rng.choice([1.0, 2.0], (_BLOCK_TOKENS, depth)))

@@ -1,5 +1,6 @@
 add_mlir_library(MinitpuDialect
   allocate.cpp
+  manifest.cpp
   minitpu.cpp
   tile_to_vector.cpp
   to_isa.cpp

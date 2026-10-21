@@ -18,7 +18,7 @@ include "mlir/IR/OpBase.td"
 include "mlir/IR/RegionKindInterface.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
-include "codegen/minitpuisa.td"
+include "minitpu/minitpuisa/isa.td"
 
 /// @brief Provides the dialect a kernel is stated in before its registers, rows and timing are chosen.
 def Minitpu_Dialect : Dialect
@@ -77,7 +77,7 @@ class Minitpu_IndexIn<OpGroup group, string mnemonic>
 class Minitpu_Op<string mnemonic, list<Trait> traits = []> : Op<Minitpu_Dialect, mnemonic, traits>;
 
 /**
- * @brief Provides an operation the machine runs as the instruction of the same mnemonic, which codegen/minitpuisa.td
+ * @brief Provides an operation the machine runs as the instruction of the same mnemonic, which minitpuisa/isa.td
  * must name in `group`.
  *
  * @param group Names the operation group the instruction belongs to.
@@ -86,7 +86,7 @@ class Minitpu_Op<string mnemonic, list<Trait> traits = []> : Op<Minitpu_Dialect,
 class Minitpu_InstructionOp<OpGroup group, string mnemonic, list<Trait> traits = []> : Minitpu_Op<mnemonic, traits>
 {
     defvar index = Minitpu_IndexIn<group, mnemonic>.value;
-    assert !ge(index, 0), "codegen/minitpuisa.td's " # group.slot # " group names no '" # mnemonic # "'.";
+    assert !ge(index, 0), "minitpuisa/isa.td's " # group.slot # " group names no '" # mnemonic # "'.";
     let summary = "`" # mnemonic # "`";
     let description = group.issue_requirement;
 }

@@ -1,5 +1,5 @@
-// Every stream codegen/asm.py's schedule() received while building the GPT-2 images schedules to the same bytes it
-// returned. Regenerate the streams with tools/fixtures/record_schedule_streams.py.
+// Every stream the retired Python assembler's schedule() received while building the GPT-2 images schedules to the same
+// bytes it returned, as recorded under Inputs/schedule.
 
 // RUN: minitpu-translate --import-minitpu-image %S/../Inputs/schedule/add_768.placed.bin | minitpu-opt -minitpuisa-schedule | minitpu-translate --export-minitpu-image -o %t.add_768.bin && cmp %t.add_768.bin %S/../Inputs/schedule/add_768.scheduled.bin
 // RUN: minitpu-translate --import-minitpu-image %S/../Inputs/schedule/add_bias_2304.placed.bin | minitpu-opt -minitpuisa-schedule | minitpu-translate --export-minitpu-image -o %t.add_bias_2304.bin && cmp %t.add_bias_2304.bin %S/../Inputs/schedule/add_bias_2304.scheduled.bin

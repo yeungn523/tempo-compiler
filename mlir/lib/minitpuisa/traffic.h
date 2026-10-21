@@ -3,9 +3,9 @@
  *
  * @brief Provides the traffic analysis the minitpuisa passes share: what each bundle reads, writes and occupies.
  *
- * @note The model matches codegen/asm.py's decoder, including its over-claims: every E instruction reads its ra field
- * and claims read port A, and every scalar operation reads its rs field. Matching it keeps the passes' images identical
- * to asm.py's while the Python assembler remains the reference.
+ * @note The model over-claims as the retired Python assembler's decoder did: every E instruction reads its ra field
+ * and claims read port A, and every scalar operation reads its rs field. Keeping it keeps the passes' images identical
+ * to the recorded ones the lit tests compare against.
  */
 
 #ifndef MINITPU_LIB_MINITPUISA_TRAFFIC_H

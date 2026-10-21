@@ -5,10 +5,9 @@
  *
  * @details The minitpu and minitpuisa dialects read their opcodes and slots from these records, and minitpu-tblgen's
  * -gen-minitpu-sched writes the scheduler's latencies and capacities from them. tools/toolchain/gen_isa_doc.py reads
- * this file through a TableGen driver and writes the operation table published in docs/ISA_AND_INTERFACES.md, the
- * conformance package in tb/isa_latency_pkg.sv, and the per-opcode facts the emulator decodes images with in
- * tools/emulators/isa_model.py. That tool regenerates all three under --write and exits non-zero on a stale one under
- * --check. The records stay readable by llvm-tblgen alone, while the operation definitions that include them need
+ * this file through a TableGen driver and writes the operation table published in docs/ISA_AND_INTERFACES.md and the
+ * per-opcode facts the emulator decodes images with in tools/emulators/isa_model.py. That tool regenerates both under
+ * --write and exits non-zero on a stale one under --check. The records stay readable by llvm-tblgen alone, while the operation definitions that include them need
  * mlir-tblgen for its C++ backends.
  */
 
@@ -44,7 +43,7 @@ def MiniTpuProfile : Profile
  * several beats, and the pair then publishes as a range.
  *
  * @param slot_letter Names the physical bundle slot, being one of E, X, M, S, D and F.
- * @param mnemonic_names Names every mnemonic the group covers, positionally matching opcodes and rtl_enumerators.
+ * @param mnemonic_names Names every mnemonic the group covers, positionally matching opcodes.
  */
 class OpGroup<string slot_letter, list<string> mnemonic_names>
 {
@@ -70,7 +69,7 @@ class OpGroup<string slot_letter, list<string> mnemonic_names>
     /// Stores the closing cycle of a reservation spanning several beats.
     int writeback_last_offset;
 
-    /// Stores the sequencer localparam tb_isa_conformance.sv holds the writeback offset against.
+    /// Stores the sequencer localparam the writeback offset mirrors.
     string rtl_parameter = "";
 
     /// Stores the consumer convention replacing the offset plus one that every other group follows.
@@ -87,9 +86,6 @@ class OpGroup<string slot_letter, list<string> mnemonic_names>
 
     /// Determines whether an operation of this group claims vector register read port A.
     bit claims_read_port_a = 0;
-
-    /// Stores the sequencer_pkg enumerator of each mnemonic, positionally.
-    list<string> rtl_enumerators = [];
 }
 
 def VectorAlu : OpGroup<"E", ["vadd", "vsub", "vmul", "vmax", "vmin"]>
@@ -103,7 +99,6 @@ def VectorAlu : OpGroup<"E", ["vadd", "vsub", "vmul", "vmax", "vmin"]>
     let register_reads = ["ra", "rb"];
     let register_write = "rd";
     let claims_read_port_a = 1;
-    let rtl_enumerators = ["E_VADD", "E_VSUB", "E_VMUL", "E_VMAX", "E_VMIN"];
 }
 
 def VectorMove : OpGroup<"E", ["vmov"]>
@@ -117,7 +112,6 @@ def VectorMove : OpGroup<"E", ["vmov"]>
     let register_reads = ["ra"];
     let register_write = "rd";
     let claims_read_port_a = 1;
-    let rtl_enumerators = ["E_VMOV"];
 }
 
 def VectorSfu : OpGroup<"E", ["vgelu", "vexp", "vrecip", "vrsqrt"]>
@@ -131,7 +125,6 @@ def VectorSfu : OpGroup<"E", ["vgelu", "vexp", "vrecip", "vrsqrt"]>
     let register_reads = ["ra"];
     let register_write = "rd";
     let claims_read_port_a = 1;
-    let rtl_enumerators = ["E_VGELU", "E_VEXP", "E_VRECIP", "E_VRSQRT"];
 }
 
 def VectorReduce : OpGroup<"E", ["vredsum", "vredmax"]>
@@ -145,7 +138,6 @@ def VectorReduce : OpGroup<"E", ["vredsum", "vredmax"]>
     let register_reads = ["ra"];
     let register_write = "rd";
     let claims_read_port_a = 1;
-    let rtl_enumerators = ["E_VREDSUM", "E_VREDMAX"];
 }
 
 def TransposeIn : OpGroup<"E", ["vtxin"]>
@@ -156,19 +148,17 @@ def TransposeIn : OpGroup<"E", ["vtxin"]>
     let opcodes = [13];
     let register_reads = ["ra"];
     let claims_read_port_a = 1;
-    let rtl_enumerators = ["E_VTXIN"];
 }
 
 def TransposeOut : OpGroup<"E", ["vtxout"]>
 {
     let vreg_reads = "the transpose staging array";
     let vreg_writes = "1 full VREG";
-    let issue_requirement = "II=1; no RTL localparam names this offset, so tb_isa_conformance cannot check it";
+    let issue_requirement = "II=1; no RTL localparam names this offset";
     let writeback_offset = 4;
     let opcodes = [14];
     let register_reads = [];
     let register_write = "rd";
-    let rtl_enumerators = ["E_VTXOUT"];
 }
 
 def VectorLoad : OpGroup<"X", ["vld"]>
@@ -199,7 +189,6 @@ def MatrixLoad : OpGroup<"M", ["vmatload"]>
     let opcodes = [1];
     let register_reads = ["reg_idx+0..3"];
     let claims_read_port_a = 1;
-    let rtl_enumerators = ["M_VMATLOAD"];
 }
 
 def MatrixPush : OpGroup<"M", ["vmatpush"]>
@@ -210,7 +199,6 @@ def MatrixPush : OpGroup<"M", ["vmatpush"]>
     let opcodes = [2];
     let register_reads = ["reg_idx"];
     let claims_read_port_a = 1;
-    let rtl_enumerators = ["M_VMATPUSH"];
 }
 
 def MatrixPop : OpGroup<"M", ["vmatpop"]>
@@ -224,7 +212,6 @@ def MatrixPop : OpGroup<"M", ["vmatpop"]>
     let opcodes = [3];
     let register_reads = [];
     let register_write = "reg_idx";
-    let rtl_enumerators = ["M_VMATPOP"];
 }
 
 def Scalar : OpGroup<"S", ["smovi", "smov_arg", "saddi", "smac", "sshl"]>
@@ -235,7 +222,6 @@ def Scalar : OpGroup<"S", ["smovi", "smov_arg", "saddi", "smac", "sshl"]>
     let opcodes = [0, 1, 2, 3, 4];
     let register_reads = ["rs"];
     let register_write = "rd";
-    let rtl_enumerators = ["SMOVI", "SMOV_ARG", "SADDI", "SMAC", "SSHL"];
 }
 
 def Descriptor : OpGroup<"D", ["vmemld", "vmemst"]>
@@ -254,34 +240,7 @@ def Control : OpGroup<"F", ["lbegin", "loop_end", "flush_slot", "halt", "vmemswa
     let issue_requirement = "Halt drains all pending VREG producers";
     let opcodes = [1, 2, 3, 4, 5];
     let register_reads = [];
-    let rtl_enumerators = ["F_LBEGIN", "F_LEND", "F_FLUSH", "F_HALT", "F_VMEMSWAP"];
 }
-
-/**
- * @brief Stores one writeback reservation offset the conformance package publishes.
- *
- * @details These restate the offsets the groups above carry, and tb_isa_conformance.sv holds them against the
- * sequencer's own localparams. An offset derived from the group it annotates could never disagree with that group,
- * and disagreeing is what the conformance check exists to detect.
- *
- * @param parameter_name Names the sequencer localparam the offset belongs to.
- * @param offset_cycles Sets the reservation offset, in cycles.
- */
-class RtlParameter<string parameter_name, int offset_cycles>
-{
-    /// Stores the sequencer localparam name the conformance package publishes.
-    string name = parameter_name;
-
-    /// Stores the reservation offset, in cycles.
-    int value = offset_cycles;
-}
-
-def WritebackAlu : RtlParameter<"WB_W_ALU", 5>;
-def WritebackSfu : RtlParameter<"WB_W_SFU", 7>;
-def WritebackReduce : RtlParameter<"WB_W_REDUCE", 15>;
-def WritebackVectorLoad : RtlParameter<"WB_W_VLD", 6>;
-def WritebackMatrixPopFirst : RtlParameter<"WB_W_MPOP_FIRST", 3>;
-def WritebackMatrixPopLast : RtlParameter<"WB_W_MPOP_LAST", 6>;
 
 /**
  * @brief Stores the occupancy and result latency of one matrix command, which are two separate scheduling inputs.
@@ -452,9 +411,6 @@ class EmissionOrder
     /// Stores the operation groups, in publication order.
     list<OpGroup> operations = [];
 
-    /// Stores the writeback reservation offsets, in publication order.
-    list<RtlParameter> rtl_parameters = [];
-
     /// Stores the matrix commands, in publication order.
     list<MatrixCommand> matrix_commands = [];
 
@@ -471,9 +427,6 @@ def IsaOrder : EmissionOrder
                       VectorLoad, VectorStore,
                       MatrixLoad, MatrixPush, MatrixPop,
                       Scalar, Descriptor, Control];
-
-    let rtl_parameters = [WritebackAlu, WritebackSfu, WritebackReduce, WritebackVectorLoad,
-                          WritebackMatrixPopFirst, WritebackMatrixPopLast];
 
     let matrix_commands = [MatrixLoadCommand, MatrixPushCommand, MatrixPopCommand];
 

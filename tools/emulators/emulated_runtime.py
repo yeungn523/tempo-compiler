@@ -64,6 +64,9 @@ class HostBuffer:
         self.view = np.zeros(-(-int(nbytes) // 4), dtype=np.uint32)
         self.phys_addr = 0
 
+    def sync_to_device(self) -> None:
+        """Accepts a cache flush, which the emulator's host buffers, holding no cache, do not need."""
+
 
 def minitpuSetDevice(uio_name: str) -> None:  # noqa: N802 -- mirrors the board runtime's name
     """Accepts a device name, of which the emulator has one."""

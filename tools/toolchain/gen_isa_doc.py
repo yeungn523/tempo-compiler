@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Generates the published ISA operation table, the RTL conformance package and the emulator's opcode model.
+"""Generates the published ISA operation table and the emulator's opcode model.
 
 mlir/include/minitpu/minitpuisa/isa.td is the single source of truth for the implemented scheduling contract, and it is
 read through a TableGen driver's --dump-json, the minitpu-tblgen mlir/ builds against the pinned LLVM when it is built
 and a system llvm-tblgen otherwise. The artifacts derived from it are the operation table spliced between the generated
-markers in docs/ISA_AND_INTERFACES.md, the localparams in tb/isa_latency_pkg.sv and the per-opcode facts in
-tools/emulators/isa_model.py. Running this script with --write regenerates all three, and running it with --check exits
-non-zero when any of them disagrees with the source.
+markers in docs/ISA_AND_INTERFACES.md and the per-opcode facts in tools/emulators/isa_model.py. Running this script
+with --write regenerates both, and running it with --check exits non-zero when either disagrees with the source.
 """
 
 from __future__ import annotations
@@ -29,9 +28,6 @@ _SOURCE: pathlib.Path = _REPO / "mlir" / "include" / "minitpu" / "minitpuisa" / 
 _DOC: pathlib.Path = _REPO / "docs" / "ISA_AND_INTERFACES.md"
 """Stores the path to the markdown page carrying the generated operation table."""
 
-_PACKAGE: pathlib.Path = _REPO / "tb" / "isa_latency_pkg.sv"
-"""Stores the path to the package tb_isa_conformance.sv holds the sequencer's own localparams against."""
-
 _MODEL: pathlib.Path = _REPO / "tools" / "emulators" / "isa_model.py"
 """Stores the path to the module the emulator reads its opcodes and array geometry from."""
 
@@ -42,7 +38,7 @@ _END: str = "<!-- END GENERATED -->"
 """Stores the marker closing the generated region of the markdown page."""
 
 _HEADER: str = "Run `python3 tools/toolchain/gen_isa_doc.py --write` to generate."
-"""Stores the line the generated SystemVerilog package and Python module open with."""
+"""Stores the line the generated Python module opens with."""
 
 _COLUMNS: tuple[str, ...] = (
     "Physical slot / operation",
@@ -73,8 +69,6 @@ def _load() -> dict[str, Any]:
     return {
         "profile": _profile(records),
         "operations": _operations(records),
-        "rtl_params": {record["name"]: record["value"]
-                       for record in _ordered(records, "RtlParameter", "rtl_parameters")},
         "matrix": _matrix(records),
         "resources": _resources(records),
     }
@@ -181,8 +175,6 @@ def _operations(records: dict[str, Any]) -> list[dict[str, Any]]:
         }
         optional = (
             ("opcodes", record["opcodes"]),
-            ("rtl_enum", record["rtl_enumerators"]),
-            ("rtl_param", record["rtl_parameter"]),
             ("consumer_override", record["consumer_override"]),
         )
         entry.update({key: value for key, value in optional if value})
@@ -233,7 +225,6 @@ def _artifacts(data: dict[str, Any]) -> dict[pathlib.Path, str]:
     """Returns the content each generated artifact must hold, keyed by its path."""
     return {
         _DOC: _splice(_DOC.read_text(), _render_table(data)),
-        _PACKAGE: _render_package(data),
         _MODEL: _render_model(data),
     }
 
@@ -333,36 +324,6 @@ def _capacity(spec: dict[str, Any]) -> int | None:
     return spec[values[0]] if values else None
 
 
-def _render_package(data: dict[str, Any]) -> str:
-    """Returns the generated SystemVerilog package carrying one localparam per published offset and opcode."""
-    lines = [
-        # Emits the licence header every other source carries here rather than adding it afterwards, since --check
-        # would call the file stale the moment it had one.
-        "// Copyright MiniTPU Authors",
-        "// SPDX-License-Identifier: Apache-2.0",
-        "",
-        f"// {_HEADER}",
-        "//",
-        "// Concepts: ISA latency contract, writeback offset, generated artifact.",
-        "package isa_latency_pkg;",
-    ]
-
-    params = dict(data["rtl_params"])
-    for spec in data["resources"].values():
-        capacity = _capacity(spec)
-        if "rtl_param" in spec and capacity is not None:
-            params[spec["rtl_param"]] = capacity
-    for name, value in params.items():
-        lines.append(f"  localparam int unsigned DOC_{name} = {value};")
-
-    for entry in data["operations"]:
-        for name, value in zip(entry.get("rtl_enum", ()), entry.get("opcodes", ())):
-            lines.append(f"  localparam int unsigned DOC_{name} = {value};")
-
-    lines += ["endpackage : isa_latency_pkg", ""]
-    return "\n".join(lines)
-
-
 def _render_model(data: dict[str, Any]) -> str:
     """Returns the generated Python module carrying the per-opcode facts the emulator decodes images with."""
     lines = [
@@ -379,29 +340,7 @@ def _render_model(data: dict[str, Any]) -> str:
         lines.append(f"    {_python_literal(name)}: {value},")
     lines += [
         "}",
-        '"""Array geometry every offset below is quoted against, and every capacity a consumer derives from it."""',
-        "",
-        "RTL_PARAMS: dict[str, int] = {",
-    ]
-    for name, value in data["rtl_params"].items():
-        lines.append(f"    {_python_literal(name)}: {value},")
-    lines += [
-        "}",
-        '"""Writeback reservation offset of each sequencer_pkg localparam tb_isa_conformance checks."""',
-        "",
-        "MATRIX_OCCUPANCY: dict[str, int] = {",
-    ]
-    for name, cycles in data["matrix"]["occupancy"].items():
-        lines.append(f"    {_python_literal(name)}: {cycles},")
-    lines += [
-        "}",
-        '"""Cycles each matrix command holds the controller, measured against the RTL."""',
-        "",
-        "MATRIX_PORT_A: tuple[str, ...] = " + repr(tuple(data["matrix"]["port_a_held_by"])).replace("'", '"'),
-        '"""Matrix commands owning VREG read port A while they stream."""',
-        "",
-        f"MATRIX_RESULT_LATENCY: int = {data['matrix']['result_latency']['vmatpush']}",
-        '"""Cycles from a vmatpush to its first result leaving the array."""',
+        '"""Array geometry the emulator decodes vector registers and VMEM rows against."""',
         "",
         "OPERATIONS: tuple[dict, ...] = (",
     ]

@@ -26,6 +26,7 @@ import board_checks  # noqa: E402
 import gpt2_inference  # noqa: E402
 
 _CHECKS: dict[str, str] = {
+    "copy": "check_copy_argument",
     "gemm": "check_full_gemm",
     "add": "check_elementwise_add",
     "layernorm": "check_layernorm",

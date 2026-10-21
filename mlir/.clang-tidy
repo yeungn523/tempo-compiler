@@ -1,11 +1,3 @@
-# A general catch-all clang-tidy configuration. Equivalent to ruff (for Python), but statically checks C++ and C
-# code. Every check is named explicitly and no glob is used, so the enabled set is identical on every clang-tidy
-# version. A glob silently adopts each check a new release adds, which combined with the 'WarningsAsErrors' setting
-# below turns a toolchain upgrade into a build failure across every project that shares this file.
-#
-# 'google-build-using-namespace' and 'google-global-names-in-headers' are absent because the .cpp files bring the
-# project's own namespaces and MLIR's into scope with file-scope 'using namespace' directives.
----
 Checks: '-*,
 bugprone-argument-comment,
 bugprone-assert-side-effect,

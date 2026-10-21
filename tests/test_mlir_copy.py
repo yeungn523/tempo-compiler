@@ -19,7 +19,7 @@ from build_images import copy_kernel  # noqa: E402
 from driver import TOOLS, compile_kernel  # noqa: E402
 from minitpu_emulator import Machine, read_image  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not (TOOLS / "minitpu-opt").exists(), reason="mlir/ is not built")
+pytestmark = pytest.mark.skipif(not (TOOLS / "tempo-opt").exists(), reason="mlir/ is not built")
 
 _ROW_WORDS: int = 16
 """BF16 words one 32-byte row holds."""

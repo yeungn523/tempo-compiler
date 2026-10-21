@@ -1,6 +1,9 @@
-# minitpu-compiler
+# tempo-compiler
 
-Compiles GPT-2 small inference from Triton kernels into images for a systolic-array NPU.
+Compiles GPT-2 small inference from Triton kernels into images for a systolic-array NPU whose RTL has no hardware
+interlocks.
+
+Summer' 26 @ Cornell CSL
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
@@ -8,37 +11,21 @@ ___
 
 ## Detailed Description
 
-The target NPU is a 16 by 16 BF16 systolic array with a VLIW vector unit, synthesized on a ZCU104. This compiler reads
-each kernel of a GPT-2 small layer, written in Triton, through Triton's own frontend down to the tt dialect, converts it
-into a minitpu tile op, and lowers that through the MLIR pipeline under `mlir/` into the 128-bit VLIW bundles the board
-fetches, along with the manifest entry the runtime launches each image with. `driver/` runs those steps as the stages
-of a Triton backend. The board carries no compiler, so the images are built on a host and run there from
-`board_package/`, which holds the runtime and the layer drivers.
-
-The NPU's RTL lives in a separate repository. This repository ships its synthesized design as the bitstream
-`board_package/fpga/minitpu_zcu104.bit.bin`, which `sudo make minitpu` loads onto the board, so running on the
-board needs no RTL checkout. Only the simulation tools read the RTL itself.
-
-## Features
-
-- Compiles every launch of a GPT-2 small layer: the four projections, the bias and residual adds, both LayerNorms,
-  and causal flash attention covering every head and token block in one launch.
-- Compiles decode attention over a KV cache that fills on the device, with images for 64, 256 and 1024 keys.
-- Compiles GEMMs past GPT-2's shapes: an extent a kernel masks is padded with zeros to whole 16-wide tiles, and a
-  contraction deeper than one VMEM bank holds runs in segments within one image.
-- Derives every latency, capacity and opcode from `mlir/include/minitpu/minitpuisa/isa.td`, the implemented scheduling
-  contract.
-- Checks each image against the RTL in simulation and against a host reference on the board.
-- Apache 2.0 License.
+The target NPU is a 16 by 16 BF16 systolic array with a VLIW vector unit, synthesized on a ZCU104. The compiler takes a
+Triton kernel through Triton's own frontend to the tt dialect and converts it into a tempo tile op. An MLIR pipeline
+lowers that op into the 128-bit VLIW bundles the board fetches, along with the manifest entry the board runtime
+launches each image with. The images run on the board from `board_package/`, which holds the runtime, the GPT-2 layer
+drivers, and the NPU's bitstream.
 
 ## Table of Contents
 
 - [Dependencies](#dependencies)
 - [Installation](#installation)
 - [Usage](#usage)
+  - [Compiling a Kernel](#compiling-a-kernel)
   - [Running on the Board](#running-on-the-board)
   - [Simulating Against the RTL](#simulating-against-the-rtl)
-  - [Running the Tests](#running-the-tests)
+- [Developers](#developers)
 - [Authors](#authors)
 - [License](#license)
 
@@ -46,71 +33,136 @@ ___
 
 ## Dependencies
 
-- [Triton](https://triton-lang.org/) 3.8.0, which compiling any kernel needs. `pyproject.toml` pins it with the rest of
-  the Python dependencies, installed by `pip install --group compiler`, and pins the C++ toolchain `mlir/` builds against
-  (see `mlir/README.md`).
-- A checkout of the separate RTL repository, named by `minitpu_rtl`, for the simulation tools alone. The tools fall
-  back to a sibling directory named `minitpu-tmp` when the variable is unset.
-- [LLVM](https://llvm.org/) 17 through 20, supplying the `llvm-tblgen` that `tools/toolchain/gen_isa_doc.py` reads the ISA
-  source through.
-- A ZCU104 running PetaLinux, for everything under `board_package/` that launches.
+Building the compiler requires Python 3.11, git, [CMake](https://cmake.org/) 3.20 or above,
+[Ninja](https://ninja-build.org/), and [Clang](https://clang.llvm.org/) with the lld linker on the system path. The
+build fetches the rest of the C++ toolchain itself: Triton's v3.8.0 source, for the tt dialect, and the prebuilt LLVM
+that release pins (commit `5f07f818`). `pyproject.toml` pins both, along with every Python dependency.
+
+Running on the board requires a ZCU104 running PetaLinux. The simulation tools additionally require
+[Verilator](https://www.veripool.org/verilator/) and a checkout of the RTL repository, named by the `minitpu_rtl`
+environment variable or found as a sibling directory named `minitpu-tmp`.
 
 ___
 
 ## Installation
 
-The repository runs from a checkout. Every tool extends `sys.path` to reach `driver/` and `board_package/` itself, so
-each one runs from the repository root once Triton is installed.
+1. Download this repository to the local machine.
+2. `cd` to the root directory of the repository.
+3. Run `pip install --group compiler --group mlir --group test "tox>=4,<5" "tox-uv>=1,<2"` to install the Python
+   dependencies and tox.
+4. Run `tox -e build`. It fetches and verifies Triton's source and the pinned LLVM, then builds `tempo-opt`,
+   `tempo-translate` and `tempo-tblgen` into `mlir/build/bin`.
 
 ___
 
 ## Usage
 
+### Compiling a Kernel
+
+A kernel is an ordinary `@triton.jit` function whose shapes are `tl.constexpr` parameters and whose pointers are
+annotated with their element types. `driver.compile_kernel` compiles it from the repository root, and its keyword arguments
+override the kernel's constexpr defaults:
+
+```python
+import pathlib
+
+import triton
+import triton.language as tl
+
+from driver import compile_kernel
+
+
+@triton.jit
+def matmul(a: "*bf16", b: "*bf16", c: "*fp32", N: tl.constexpr = 768, K: tl.constexpr = 768):
+    ...
+
+
+compiled = compile_kernel(matmul, N=3072)             # compiles the 768 by 3072 product
+compiled.write(pathlib.Path("board_package/images"))  # writes gemm_768x3072.bin
+print(compiled.entry)  # {'kind': 'gemm', 'depth': 768, 'columns': 3072, 'activate': False, 'drain_words': 98560}
+```
+
+The compiler supports four types of kernels: a GEMM, optionally passing its input through the exact GELU and adding a
+bias, attention, a LayerNorm, and an elementwise add. Each image covers one block of 32 tokens, which the host launches
+once per block. Any other kernel raises `driver.ProgramError` with the reason it was refused.
+
+`tools/board/build_images.py` compiles every image GPT-2 small launches from `gpt2_triton.py` and writes them, with
+their manifest, into `board_package/images`.
+
 ### Running on the Board
 
-Hold a session open on the board, then run `tools/board/prepare_board.sh <account> <board-id>` on the host. The script
-downloads GPT-2 small's weights and tokenizer, compiles every image the layers launch, and deploys them with the board
-package. The board erases the home directory whenever no session holds it, so run the script after every login.
+On the host, with a session open on the board:
 
-On the board, `sudo make minitpu` programs the PL, `make kernels` runs the board checks, and
-`make generate PROMPT="The capital of France is" TOKENS=8` prints GPT-2 small's greedy continuation of a prompt. See
+```bash
+tools/board/prepare_board.sh <account> <board-id>  # exports GPT-2's weights, builds the images, deploys the package
+```
+
+On the board:
+
+```bash
+sudo make minitpu                                            # programs the PL and sets its clock
+make kernels                                                 # runs the board checks
+make generate PROMPT="The capital of France is" TOKENS=8     # prints GPT-2 small's greedy continuation
+```
+
+The board erases its home directory whenever no session holds it, so rerun `prepare_board.sh` after every login. See
 [board_package/README.md](board_package/README.md) for what each check proves.
 
-***Warning!*** Program the PL through `sudo make minitpu` only. The target sets the PL clock first, and a PL programmed
-without it runs at 99.999 MHz, where every check still passes and every launch is about 1.8 times too slow.
+***Warning!*** Program the PL only through `sudo make minitpu`.
 
 ### Simulating Against the RTL
 
-Each tool compiles its image through `driver/` and runs it in the RTL's kernel image testbench, which it finds in the
-checkout `minitpu_rtl` names.
-
-| Tool                                          | Checks                                                                        |
-|-----------------------------------------------|-------------------------------------------------------------------------------|
+| Tool                                          | Checks                                                                           |
+|-----------------------------------------------|----------------------------------------------------------------------------------|
 | `tools/simulations/sim_gemm.py`               | A GEMM image against a float64 reference, from its dimensions or a Triton kernel |
-| `tools/simulations/sim_layernorm.py`          | GPT-2's LayerNorm image against the host reference                            |
-| `tools/simulations/sim_resident_attention.py` | The attention image over a sequence, or one decode step with `--decode`       |
+| `tools/simulations/sim_layernorm.py`          | GPT-2's LayerNorm image against the host reference                               |
+| `tools/simulations/sim_resident_attention.py` | The attention image over a sequence, or one decode step with `--decode`          |
 
+`tools/simulations/sim_gemm.py --kernel my_kernels.py:matmul` compiles a Triton kernel and runs its image in one step.
 Pass `--build-dir` to keep the Verilator build across runs.
-`tools/simulations/sim_gemm.py --kernel gpt2_triton.py:gpt2_matmul` compiles a Triton kernel and runs its image in one
-step.
 
-### Running the Tests
+___
 
-`tox` builds mlir/, runs every suite below against that build, and repeats the lit suite against an AddressSanitizer
-build that also fails on leaks. `tox -e build`, `tox -e test`, and `tox -e memcheck` run one step each, and
-`tox -e clean,build` rebuilds from scratch. tox needs `pip install "tox>=4,<5" "tox-uv>=1,<2"`.
+## Development automation
 
-`ninja -C mlir/build check-minitpu` runs the lit suite, one pass per file. `pytest -q tests` runs the compiler's
-Python suite, which compiles each kernel through `driver/` and checks its image on the functional emulator against a
-reference. `python3 -m unittest discover -s board_package/tests -q` runs the board package's own tests, which
-`make check` also runs on the board.
+Tox runs `build`, `test` and `memcheck` in order.
+
+| Environment | Description                                                                                          |
+|-------------|------------------------------------------------------------------------------------------------------|
+| `build`     | Fetches and verifies the pinned toolchain, then configures and builds `mlir/` into `mlir/build`      |
+| `test`      | Runs the lit suite, then the compiler's pytest suite and the board package's tests                   |
+| `memcheck`  | Builds `mlir/` with AddressSanitizer into `mlir/build-asan` and runs the lit suite, failing on leaks |
+| `clean`     | Removes both build directories                                                                       |
+
+`tox -e clean,build` rebuilds from scratch. `tools/emulators/emulate_board_checks.py` runs the board's own checks on the
+functional emulator.
+
+C++ under `mlir/` is formatted by `mlir/.clang-format` and linted by `mlir/.clang-tidy`. The generated ISA tables in
+`docs/ISA_AND_INTERFACES.md` and `tools/emulators/isa_model.py` are regenerated from `isa.td` with
+`python3 tools/toolchain/gen_isa_doc.py --write`.
+
+### Repository Layout
+
+| Path                           | Holds                                                                                   |
+|--------------------------------|-----------------------------------------------------------------------------------------|
+| `driver/`                      | The Triton backend whose stages run the MLIR tools, and `compile_kernel`                |
+| `gpt2_triton.py`               | The Triton kernels a GPT-2 small layer launches                                         |
+| `mlir/include/tempo/tempo/`    | The tempo dialect: tile ops, machine operations over virtual registers, and its passes  |
+| `mlir/include/tempo/tempoisa/` | The tempoisa dialect, one op per instruction, and the ISA contract `isa.td`             |
+| `mlir/lib/tempo/`              | The Triton conversion, tile op expansion, allocators, ISA lowering, and manifest export |
+| `mlir/lib/tempoisa/`           | The packer, the scheduler, and the image import and export                              |
+| `mlir/tools/`                  | `tempo-opt`, `tempo-translate`, and `tempo-tblgen`                                      |
+| `mlir/test/`                   | The lit suite, one pass per file, with every GPT-2 kernel's tt module under `Inputs/`   |
+| `tests/`                       | The compiler's pytest suite                                                             |
+| `tools/`                       | The image builder, board deployment, emulator, RTL simulations, and toolchain setup     |
+| `board_package/`               | The board runtime, the GPT-2 drivers, the board checks, and the compiled images         |
 
 ___
 
 ## Authors
 
 - Natalie Yeung ([yeungn523](https://github.com/yeungn523))
-- Duke Gandin
+- Duke Gandin ([dgandin1](https://github.com/dgandin1))
 
 ___
 

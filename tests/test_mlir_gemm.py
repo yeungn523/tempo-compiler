@@ -31,7 +31,7 @@ from build_images import gemm_kernel  # noqa: E402
 from driver import TOOLS, compile_kernel  # noqa: E402
 from minitpu_emulator import Machine, read_image, to_bf16  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not (TOOLS / "minitpu-opt").exists(), reason="mlir/ is not built")
+pytestmark = pytest.mark.skipif(not (TOOLS / "tempo-opt").exists(), reason="mlir/ is not built")
 
 
 @pytest.mark.parametrize("kind", ["structured", "varying"])

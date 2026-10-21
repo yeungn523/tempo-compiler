@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetches and verifies the C++ toolchain mlir/ builds against, as pyproject.toml's [tool.minitpu.toolchain] pins it.
+"""Fetches and verifies the C++ toolchain mlir/ builds against, as pyproject.toml's [tool.tempo.toolchain] pins it.
 
 The toolchain is Triton's source at the pinned tag, for the tt dialect mlir/ compiles, and the prebuilt LLVM that tag
 pins, which Triton publishes. Each is fetched once and held to its pin: the LLVM package to its checksum and its
@@ -54,7 +54,7 @@ def main() -> int:
                         help="Runs the configure line instead of printing it.")
     arguments = parser.parse_args()
 
-    pins = tomllib.loads((_HERE / "pyproject.toml").read_text())["tool"]["minitpu"]["toolchain"]
+    pins = tomllib.loads((_HERE / "pyproject.toml").read_text())["tool"]["tempo"]["toolchain"]
     triton = _fetch_triton(pathlib.Path(arguments.toolchains).expanduser(), tag=pins["triton-tag"])
     _check_triton_pins_llvm(triton, commit=pins["llvm-commit"])
     llvm = _fetch_llvm(pathlib.Path(arguments.llvm_root).expanduser(), package=pins["llvm-package"],
@@ -70,7 +70,7 @@ def main() -> int:
     ]
     if arguments.sanitize:
         configure.append("-DLLVM_USE_SANITIZER=Address")
-    # The prebuilt LLVM package ships no llvm-lit, so check-minitpu runs the lit the mlir dependency group installs.
+    # The prebuilt LLVM package ships no llvm-lit, so check-tempo runs the lit the mlir dependency group installs.
     if lit := shutil.which("lit"):
         configure.append(f"-DLLVM_EXTERNAL_LIT={lit}")
     print(f"toolchain matches pyproject.toml: Triton {pins['triton-tag']}, LLVM {pins['llvm-commit'][:12]}")

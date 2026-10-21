@@ -32,9 +32,9 @@ _tt_tablegen(TritonTypeInterfaces.td TypeInterfaces.h.inc:-gen-type-interface-de
 set(LLVM_TARGET_DEFINITIONS "${_TT_LIB}/Canonicalize.td")
 tablegen(MLIR TritonCanonicalize.inc -gen-rewriters "-I${TRITON_SOURCE_DIR}/include")
 
-add_public_tablegen_target(MinitpuTritonTableGen)
+add_public_tablegen_target(TempoTritonTableGen)
 
-add_mlir_library(MinitpuTritonIR
+add_mlir_library(TempoTritonIR
   "${_TT_LIB}/Dialect.cpp"
   "${_TT_LIB}/DiscardableAttributes.cpp"
   "${_TT_LIB}/Ops.cpp"
@@ -44,7 +44,7 @@ add_mlir_library(MinitpuTritonIR
   "${_TT_LIB}/Utility.cpp"
 
   DEPENDS
-  MinitpuTritonTableGen
+  TempoTritonTableGen
 
   LINK_LIBS PUBLIC
   MLIRIR
@@ -57,4 +57,4 @@ add_mlir_library(MinitpuTritonIR
   MLIRInferTypeOpInterface
   MLIRSideEffectInterfaces
 )
-target_include_directories(MinitpuTritonIR PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_include_directories(TempoTritonIR PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")

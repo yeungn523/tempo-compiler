@@ -7,10 +7,10 @@ import pathlib
 
 from triton.runtime import JITFunction
 
-from .backend import MinitpuBackend
+from .backend import TempoBackend
 from .frontend import make_ir
 
-_TEXT_STAGES: tuple[str, ...] = ("minitpu", "minitpuisa", "bin")
+_TEXT_STAGES: tuple[str, ...] = ("tempo", "tempoisa", "bin")
 """Stages a kernel given as MLIR text runs: a tt module the "ttir" stage already left, or a kernel of tile ops, which
 the conversion passes through unchanged."""
 
@@ -49,7 +49,7 @@ def compile_kernel(kernel: JITFunction | str, *, heads: int = 1, **bound: int | 
     """Compiles one kernel through every stage the backend registers.
 
     Args:
-        kernel: The function the triton.jit decorator returned, or a kernel's MLIR text, a tt module or a minitpu
+        kernel: The function the triton.jit decorator returned, or a kernel's MLIR text, a tt module or a tempo
             kernel of tile ops.
         heads: The heads an attention image walks, its Triton kernel attending one of them.
         **bound: The constexprs bound past a Triton kernel's defaults.
@@ -61,7 +61,7 @@ def compile_kernel(kernel: JITFunction | str, *, heads: int = 1, **bound: int | 
         ProgramError: If a stage refuses the kernel, carrying the MLIR pipeline's diagnostics.
     """
     # Triton types the target argument and then ignores it, so this backend carries no target descriptor.
-    backend = MinitpuBackend(None)
+    backend = TempoBackend(None)
     options = backend.parse_options({"attention_heads": heads})
     stages: dict = {}
     backend.add_stages(stages, options)

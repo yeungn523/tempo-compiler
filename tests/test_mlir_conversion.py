@@ -19,7 +19,7 @@ from driver import TOOLS, ProgramError, compile_kernel, triton_kernel  # noqa: E
 from gpt2_triton import (gpt2_add, gpt2_add_bias, gpt2_attention, gpt2_decode_attention, gpt2_layernorm,  # noqa: E402
                          gpt2_matmul, gpt2_matmul_bias, gpt2_matmul_gelu)
 
-pytestmark = pytest.mark.skipif(not (TOOLS / "minitpu-opt").exists(), reason="mlir/ is not built")
+pytestmark = pytest.mark.skipif(not (TOOLS / "tempo-opt").exists(), reason="mlir/ is not built")
 
 
 def _assert_same_image(converted: str, stated: str) -> None:

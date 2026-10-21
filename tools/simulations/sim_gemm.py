@@ -2,7 +2,7 @@
 """Provides the RTL check that a GEMM image computes the product it claims.
 
 The image is compiled through the MLIR pipeline, either from a Triton kernel named on the command line or from the
-minitpu.matmul its dimensions state, and runs once per token block in the RTL's kernel image testbench, so a kernel is
+tempo.matmul its dimensions state, and runs once per token block in the RTL's kernel image testbench, so a kernel is
 checked here before it reaches hardware.
 """
 

@@ -21,7 +21,7 @@ from build_images import add_kernel  # noqa: E402
 from driver import TOOLS, compile_kernel  # noqa: E402
 from minitpu_emulator import Machine, read_image, to_bf16  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not (TOOLS / "minitpu-opt").exists(), reason="mlir/ is not built")
+pytestmark = pytest.mark.skipif(not (TOOLS / "tempo-opt").exists(), reason="mlir/ is not built")
 
 
 def _run_sum(image: pathlib.Path, left: np.ndarray, right: np.ndarray, *, broadcast: bool) -> tuple[np.ndarray, int]:

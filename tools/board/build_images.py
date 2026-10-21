@@ -67,7 +67,7 @@ def gemm_name(*, depth: int, columns: int, activate: bool, bias: bool = False) -
 
 
 def gemm_kernel(*, depth: int, columns: int, activate: bool, bias: bool = False) -> str:
-    """Returns the minitpu kernel stating one GEMM image's product as a tile op.
+    """Returns the tempo kernel stating one GEMM image's product as a tile op.
 
     Args:
         depth: The contraction the product covers.
@@ -79,12 +79,12 @@ def gemm_kernel(*, depth: int, columns: int, activate: bool, bias: bool = False)
         The kernel's MLIR text.
     """
     return "\n".join([
-        f"minitpu.kernel @{gemm_name(depth=depth, columns=columns, activate=activate, bias=bias)} {{",
-        "  %activations = minitpu.arg 0",
-        "  %weights = minitpu.arg 1",
-        "  %drain = minitpu.arg 2",
-        *(["  %bias = minitpu.arg 3"] if bias else []),
-        f"  minitpu.matmul %activations, %weights -> %drain{' bias %bias' if bias else ''} tokens 32 depth {depth} "
+        f"tempo.kernel @{gemm_name(depth=depth, columns=columns, activate=activate, bias=bias)} {{",
+        "  %activations = tempo.arg 0",
+        "  %weights = tempo.arg 1",
+        "  %drain = tempo.arg 2",
+        *(["  %bias = tempo.arg 3"] if bias else []),
+        f"  tempo.matmul %activations, %weights -> %drain{' bias %bias' if bias else ''} tokens 32 depth {depth} "
         f"columns {columns}{' activate' if activate else ''}",
         "}",
         "",
@@ -92,7 +92,7 @@ def gemm_kernel(*, depth: int, columns: int, activate: bool, bias: bool = False)
 
 
 def add_kernel(*, features: int, broadcast: bool) -> str:
-    """Returns the minitpu kernel stating one sum image's addition as a tile op.
+    """Returns the tempo kernel stating one sum image's addition as a tile op.
 
     Args:
         features: The width the sum covers.
@@ -103,18 +103,18 @@ def add_kernel(*, features: int, broadcast: bool) -> str:
     """
     name = f"add_{'bias_' if broadcast else ''}{features}"
     return "\n".join([
-        f"minitpu.kernel @{name} {{",
-        "  %left = minitpu.arg 0",
-        "  %right = minitpu.arg 1",
-        "  %output = minitpu.arg 2",
-        f"  minitpu.add %left, %right -> %output tokens 32 features {features}{' broadcast' if broadcast else ''}",
+        f"tempo.kernel @{name} {{",
+        "  %left = tempo.arg 0",
+        "  %right = tempo.arg 1",
+        "  %output = tempo.arg 2",
+        f"  tempo.add %left, %right -> %output tokens 32 features {features}{' broadcast' if broadcast else ''}",
         "}",
         "",
     ])
 
 
 def layernorm_kernel(*, features: int) -> str:
-    """Returns the minitpu kernel stating one LayerNorm image's normalisation as a tile op.
+    """Returns the tempo kernel stating one LayerNorm image's normalisation as a tile op.
 
     Args:
         features: The width each token is normalised over.
@@ -123,18 +123,18 @@ def layernorm_kernel(*, features: int) -> str:
         The kernel's MLIR text.
     """
     return "\n".join([
-        f"minitpu.kernel @layernorm_{features} {{",
-        "  %rows = minitpu.arg 0",
-        "  %constants = minitpu.arg 1",
-        "  %output = minitpu.arg 2",
-        f"  minitpu.layernorm %rows, %constants -> %output tokens 32 features {features} epsilon 1.0e-05",
+        f"tempo.kernel @layernorm_{features} {{",
+        "  %rows = tempo.arg 0",
+        "  %constants = tempo.arg 1",
+        "  %output = tempo.arg 2",
+        f"  tempo.layernorm %rows, %constants -> %output tokens 32 features {features} epsilon 1.0e-05",
         "}",
         "",
     ])
 
 
 def copy_kernel(*, rows: int, stride: int) -> str:
-    """Returns the minitpu kernel stating one copy image's move as a tile op.
+    """Returns the tempo kernel stating one copy image's move as a tile op.
 
     Notes:
         A copy has no Triton source, the runtime moving the KV cache's rows without computing on them.
@@ -147,17 +147,17 @@ def copy_kernel(*, rows: int, stride: int) -> str:
         The kernel's MLIR text.
     """
     return "\n".join([
-        f"minitpu.kernel @copy_{rows}x{stride} {{",
-        "  %source = minitpu.arg 0",
-        "  %destination = minitpu.arg 2",
-        f"  minitpu.copy %source -> %destination rows {rows} stride {stride}",
+        f"tempo.kernel @copy_{rows}x{stride} {{",
+        "  %source = tempo.arg 0",
+        "  %destination = tempo.arg 2",
+        f"  tempo.copy %source -> %destination rows {rows} stride {stride}",
         "}",
         "",
     ])
 
 
 def attention_kernel(*, keys: int, causal: bool) -> str:
-    """Returns the minitpu kernel stating one attention image as a tile op.
+    """Returns the tempo kernel stating one attention image as a tile op.
 
     Args:
         keys: The tokens a causal attention attends to each other, or the cached keys a decode attention walks.
@@ -168,11 +168,11 @@ def attention_kernel(*, keys: int, causal: bool) -> str:
     """
     name = f"attention_{keys}" if causal else f"decode_attention_{keys}"
     return "\n".join([
-        f"minitpu.kernel @{name} {{",
-        "  %constants = minitpu.arg 0",
-        *([] if causal else ["  %cache = minitpu.arg 1"]),
-        "  %queries = minitpu.arg 2",
-        f"  minitpu.attention %constants, %queries{'' if causal else ' cache %cache'} heads {_HEADS} head {_HEAD} "
+        f"tempo.kernel @{name} {{",
+        "  %constants = tempo.arg 0",
+        *([] if causal else ["  %cache = tempo.arg 1"]),
+        "  %queries = tempo.arg 2",
+        f"  tempo.attention %constants, %queries{'' if causal else ' cache %cache'} heads {_HEADS} head {_HEAD} "
         f"keys {keys}{' causal' if causal else ''}",
         "}",
         "",
@@ -198,7 +198,7 @@ def build_image_set() -> list[Compiled]:
     compiled += [compile_kernel(gpt2_decode_attention, heads=_HEADS, N=keys, LENGTH=keys) for keys in _DECODE_KEYS]
     compiled += [compile_kernel(copy_kernel(rows=rows, stride=stride)) for rows, stride in _COPIES]
     # Builds the shortest program the loader takes, an empty kernel lowering to its halt alone.
-    compiled.append(compile_kernel("minitpu.kernel @halt {\n}\n"))
+    compiled.append(compile_kernel("tempo.kernel @halt {\n}\n"))
     return compiled
 
 

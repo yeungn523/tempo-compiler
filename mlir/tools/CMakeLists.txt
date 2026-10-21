@@ -1,2 +1,2 @@
-add_subdirectory(minitpu-opt)
-add_subdirectory(minitpu-translate)
+add_subdirectory(tempo-opt)
+add_subdirectory(tempo-translate)

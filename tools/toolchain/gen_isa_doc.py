@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generates the published ISA operation table and the emulator's opcode model.
 
-mlir/include/minitpu/minitpuisa/isa.td is the single source of truth for the implemented scheduling contract, and it is
-read through a TableGen driver's --dump-json, the minitpu-tblgen mlir/ builds against the pinned LLVM when it is built
+mlir/include/tempo/tempoisa/isa.td is the single source of truth for the implemented scheduling contract, and it is
+read through a TableGen driver's --dump-json, the tempo-tblgen mlir/ builds against the pinned LLVM when it is built
 and a system llvm-tblgen otherwise. The artifacts derived from it are the operation table spliced between the generated
 markers in docs/ISA_AND_INTERFACES.md and the per-opcode facts in tools/emulators/isa_model.py. Running this script
 with --write regenerates both, and running it with --check exits non-zero when either disagrees with the source.
@@ -22,7 +22,7 @@ from typing import Any
 _REPO: pathlib.Path = pathlib.Path(__file__).resolve().parents[2]
 """Stores the path to the repository root."""
 
-_SOURCE: pathlib.Path = _REPO / "mlir" / "include" / "minitpu" / "minitpuisa" / "isa.td"
+_SOURCE: pathlib.Path = _REPO / "mlir" / "include" / "tempo" / "tempoisa" / "isa.td"
 """Stores the path to the TableGen contract every generated artifact derives from."""
 
 _DOC: pathlib.Path = _REPO / "docs" / "ISA_AND_INTERFACES.md"
@@ -50,7 +50,7 @@ _COLUMNS: tuple[str, ...] = (
 )
 """Stores the header cells of the generated operation table."""
 
-_PINNED_TBLGEN: pathlib.Path = _REPO / "mlir" / "build" / "bin" / "minitpu-tblgen"
+_PINNED_TBLGEN: pathlib.Path = _REPO / "mlir" / "build" / "bin" / "tempo-tblgen"
 """Stores the TableGen driver mlir/ builds against the pinned LLVM, which is read first whenever it is built."""
 
 _TBLGEN_CANDIDATES: tuple[str, ...] = (
@@ -88,7 +88,7 @@ def _records() -> dict[str, Any]:
 
 
 def _tblgen() -> str:
-    """Returns the TableGen driver to read the source with, the pinned minitpu-tblgen first.
+    """Returns the TableGen driver to read the source with, the pinned tempo-tblgen first.
 
     Raises:
         SystemExit: If none is on PATH, naming the environment variable that overrides the search.

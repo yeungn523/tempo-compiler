@@ -227,10 +227,6 @@ docs/
 AGENTS.md
 CLAUDE.md
 
-# Analysis and inspection tooling, not part of the shipped compiler
-tools/check_codegen.py
-tools/golden/
-
 # GPT-2 weights and tokenizer, exported on a host and copied to the board
 board_package/weights/
 

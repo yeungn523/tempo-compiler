@@ -16,10 +16,8 @@ _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parents[2]
 """Stores the path to the repository's root directory."""
 
 sys.path.insert(0, str(_HERE))
-sys.path.insert(0, str(_HERE / "board_package"))
 
-from codegen import signature_of  # noqa: E402
-from codegen.frontend import compile_to_ttir  # noqa: E402
+from driver import triton_kernel  # noqa: E402
 from gpt2_triton import (gpt2_add, gpt2_add_bias, gpt2_attention, gpt2_decode_attention,  # noqa: E402
                          gpt2_layernorm, gpt2_matmul, gpt2_matmul_bias, gpt2_matmul_gelu)
 from triton.runtime import JITFunction  # noqa: E402
@@ -42,7 +40,7 @@ _KERNELS: tuple[tuple[str, JITFunction, dict[str, int]], ...] = (
     ("decode_attention_256", gpt2_decode_attention, {"N": 256, "LENGTH": 256}),
 )
 """Name each module is written under, the kernel, and the constexprs the layer binds past the kernel's defaults,
-matching tools/board/build_gpt2_images.py."""
+matching tools/board/build_images.py."""
 
 
 def main() -> int:
@@ -59,11 +57,8 @@ def main() -> int:
     written = pathlib.Path(arguments.output).expanduser().resolve()
     written.mkdir(parents=True, exist_ok=True)
     for name, kernel, bound in _KERNELS:
-        declared = {parameter.name: parameter.default for parameter in kernel.params if parameter.is_constexpr}
-        module = compile_to_ttir(kernel, signature=signature_of(kernel, operands={}), constexprs=declared | bound)
         path = written / f"{name}.ttir"
-        # Ends the file in the newline MLIR's own printer writes and Triton's binding leaves off.
-        path.write_text(module.str_nodebug().rstrip("\n") + "\n")
+        path.write_text(triton_kernel(kernel, **bound))
         print(f"wrote {path}")
     return 0
 

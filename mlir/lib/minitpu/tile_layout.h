@@ -66,12 +66,32 @@ namespace mlir::minitpu::tile
         return NormConstantRows(features) + 4 * (features / kTile);
     }
 
-    /// Returns the VMEM rows a product of the given shape stages: the zero tile, or the bias row when it adds one, the
-    /// activations, two weight chunks and one column tile of output.
-    constexpr uint32_t MatmulStagedRows(const uint32_t depth, const uint32_t columns, const bool bias)
+    /// Returns the VMEM rows a product of the given width stages besides its activations: the zero tile, or the bias
+    /// row when it adds one, two weight chunks and one column tile of output.
+    constexpr uint32_t MatmulFixedRows(const uint32_t columns, const bool bias)
     {
         const uint32_t start = bias ? kBroadcastRows * (columns / kTile) : kZeroRows;
-        return start + kTokens * (depth / kTile) + 2 * kChunkRows + kTokens;
+        return start + 2 * kChunkRows + kTokens;
+    }
+
+    /// Returns the most k-tiles of activations a product of the given width keeps resident at once, a whole number of
+    /// weight chunks, or zero when its fixed buffers leave no room for one chunk.
+    constexpr uint32_t MatmulSegmentLimit(const uint32_t columns, const bool bias)
+    {
+        const uint32_t fixed = MatmulFixedRows(columns, bias);
+        return fixed >= kBankRows ? 0 : (kBankRows - fixed) / kTokens / kChunkTiles * kChunkTiles;
+    }
+
+    /// Returns the k-tiles each segment of a product's contraction stages, every segment but the last holding this
+    /// many: the contraction split as evenly as whole chunks allow into the fewest segments that fit.
+    constexpr uint32_t MatmulSegmentTiles(const uint32_t depth, const uint32_t columns, const bool bias)
+    {
+        const uint32_t tiles = depth / kTile;
+        const uint32_t limit = MatmulSegmentLimit(columns, bias);
+        if (limit == 0 || tiles <= limit) return tiles;
+        const uint32_t segments = (tiles + limit - 1) / limit;
+        const uint32_t even     = (tiles + segments - 1) / segments;
+        return (even + kChunkTiles - 1) / kChunkTiles * kChunkTiles;
     }
 
     /// Returns the VMEM rows a sum of the given width stages: two chunks of each streamed operand, one chunk of output,
@@ -93,6 +113,12 @@ namespace mlir::minitpu::tile
 
     /// Stores the tiles an attention constants block opens with: the entering maximum and zeros.
     static constexpr uint32_t kAttentionStatedTiles = 2;
+
+    /// Stores the value each query's running maximum enters its keys below, which every real score clears.
+    static constexpr double kEnteringMaximum = -1.0e30;
+
+    /// Stores the score a mask tile gives a masked key, which no real score reaches, so its probability is zero.
+    static constexpr double kMaskedScore = -1.0e30;
 
     /// Stores the most head tiles an attention block accumulates, the registers its output holds across the keys.
     static constexpr uint32_t kMaxHeadTiles = 4;

@@ -12,6 +12,7 @@ import pytest
 _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent.parent
 """Stores the path to the repository's root directory."""
 
+sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE / "board_package"))
 sys.path.insert(0, str(_HERE / "tools" / "board"))
 sys.path.insert(0, str(_HERE / "tools" / "emulators"))
@@ -26,10 +27,11 @@ from bf16 import (  # noqa: E402
     pack_bias,
     pack_weights,
 )
-from build_mlir_images import _TOOLS, compile_kernel, gemm_kernel  # noqa: E402
+from build_images import gemm_kernel  # noqa: E402
+from driver import TOOLS, compile_kernel  # noqa: E402
 from minitpu_emulator import Machine, read_image, to_bf16  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not (_TOOLS / "minitpu-opt").exists(), reason="mlir/ is not built")
+pytestmark = pytest.mark.skipif(not (TOOLS / "minitpu-opt").exists(), reason="mlir/ is not built")
 
 
 @pytest.mark.parametrize("kind", ["structured", "varying"])
@@ -38,7 +40,7 @@ def test_mlir_gemm_matches_the_board_reference(kind: str, tmp_path: pathlib.Path
     ones."""
     depth = columns = 768
     image = tmp_path / "gemm.bin"
-    compile_kernel(gemm_kernel(depth=depth, columns=columns, activate=False), image=image)
+    image.write_bytes(compile_kernel(gemm_kernel(depth=depth, columns=columns, activate=False)).image)
 
     left, right = build_operands(_BLOCK_TOKENS, depth, columns, kind=kind, seed=0)
     activations, weights = pack_activations(activations=left), pack_weights(weights=right)
@@ -88,8 +90,8 @@ def test_mlir_gemm_folds_the_bias(depth: int, columns: int, activate: bool, tmp_
     """Verifies that a GEMM folding the bias into its accumulators drains the product plus the bias as closely as the
     plain GEMM drains the product, for a plain product and one activating its input."""
     plain, fused = tmp_path / "gemm.bin", tmp_path / "gemm_bias.bin"
-    compile_kernel(gemm_kernel(depth=depth, columns=columns, activate=activate), image=plain)
-    compile_kernel(gemm_kernel(depth=depth, columns=columns, activate=activate, bias=True), image=fused)
+    plain.write_bytes(compile_kernel(gemm_kernel(depth=depth, columns=columns, activate=activate)).image)
+    fused.write_bytes(compile_kernel(gemm_kernel(depth=depth, columns=columns, activate=activate, bias=True)).image)
 
     left, right = build_operands(_BLOCK_TOKENS, depth, columns, kind="varying", seed=0)
     bias = to_bf16(np.random.default_rng(1).standard_normal(columns).astype(np.float32))

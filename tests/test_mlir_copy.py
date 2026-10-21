@@ -1,5 +1,4 @@
-"""Holds the copies the MLIR pipeline builds to the rows they must move and to the images codegen/ compiles, through
-the emulator."""
+"""Holds the copies the MLIR pipeline builds to the rows they must move, through the emulator."""
 
 from __future__ import annotations
 
@@ -12,14 +11,15 @@ import pytest
 _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent.parent
 """Stores the path to the repository's root directory."""
 
+sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE / "tools" / "board"))
 sys.path.insert(0, str(_HERE / "tools" / "emulators"))
 
-from build_mlir_images import _TOOLS, compile_kernel, copy_kernel  # noqa: E402
-from codegen import compile_copy  # noqa: E402
+from build_images import copy_kernel  # noqa: E402
+from driver import TOOLS, compile_kernel  # noqa: E402
 from minitpu_emulator import Machine, read_image  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not (_TOOLS / "minitpu-opt").exists(), reason="mlir/ is not built")
+pytestmark = pytest.mark.skipif(not (TOOLS / "minitpu-opt").exists(), reason="mlir/ is not built")
 
 _ROW_WORDS: int = 16
 """BF16 words one 32-byte row holds."""
@@ -44,7 +44,7 @@ def test_mlir_copy_moves_the_rows(rows: int, stride: int, tmp_path: pathlib.Path
     """Verifies that each copy writes every row it moves and nothing between them, with one chunk, a partial last
     chunk, the loop over chunk pairs, and an advance past saddi's reach."""
     image = tmp_path / "copy.bin"
-    compile_kernel(copy_kernel(rows=rows, stride=stride), image=image)
+    image.write_bytes(compile_kernel(copy_kernel(rows=rows, stride=stride)).image)
     source, destination, _ = _run_copy(image, rows=rows, stride=stride)
 
     spaced = stride // 2
@@ -53,24 +53,3 @@ def test_mlir_copy_moves_the_rows(rows: int, stride: int, tmp_path: pathlib.Path
         moved[row * spaced: row * spaced + _ROW_WORDS] = True
     np.testing.assert_array_equal(destination[moved], source[moved])
     assert not destination[~moved].any()
-
-
-@pytest.mark.parametrize(("rows", "stride", "faster"), [(3072, 32, True), (96, 1024, False)])
-def test_mlir_copy_beats_codegen(rows: int, stride: int, faster: bool, tmp_path: pathlib.Path) -> None:
-    """Verifies that each copy GPT-2 launches writes what codegen/'s image writes in fewer bundles, and a copy of
-    several chunks in fewer cycles, its drains running beside the next chunk's load.
-
-    Notes:
-        A copy of one chunk issues the same descriptors and flushes as codegen/'s, but reads its destination after
-        the first flush, where the packer keeps it, which costs two cycles beside the transfer's wait.
-    """
-    image = tmp_path / "copy.bin"
-    compile_kernel(copy_kernel(rows=rows, stride=stride), image=image)
-    baseline = tmp_path / "codegen.bin"
-    baseline.write_bytes(compile_copy(rows=rows, stride=stride))
-
-    _, destination, cycles = _run_copy(image, rows=rows, stride=stride)
-    _, baseline_destination, baseline_cycles = _run_copy(baseline, rows=rows, stride=stride)
-    np.testing.assert_array_equal(destination, baseline_destination)
-    assert image.stat().st_size < baseline.stat().st_size
-    assert cycles < baseline_cycles if faster else cycles <= baseline_cycles + 2

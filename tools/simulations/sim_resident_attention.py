@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Provides the RTL check that the resident attention images attend every head of a sequence, or of a decode step,
-in one launch.
+"""Provides the RTL check that the attention images the MLIR pipeline compiles from GPT-2's kernels attend every head
+of a sequence, or of a decode step, in one launch.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 _HERE: pathlib.Path = pathlib.Path(__file__).resolve().parent
-"""The repository's tools directory."""
+"""The directory holding the RTL checks."""
 
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parents[1]))
@@ -26,13 +26,13 @@ from bf16 import (  # noqa: E402
     as_bf16_words,
     attention_bf16_reference,
     attention_reference,
+    decode_mask_tiles,
     from_bf16_words,
-    pack_activations,
     pack_attention_constants,
 )
-from codegen import FlashLaunch, compile_resident_attention, plan, read_program, signature_of  # noqa: E402
+from driver import compile_kernel  # noqa: E402
 from gpt2_triton import gpt2_attention, gpt2_decode_attention  # noqa: E402
-from sim_gemm import _run_image  # noqa: E402
+from rtl import run_image  # noqa: E402
 
 _TOLERANCE: float = 0.02
 """Relative error the head is allowed past what the BF16 model costs over the same operands."""
@@ -42,6 +42,9 @@ _HEAD: int = 64
 
 _SPREAD: float = 1.25
 """Bound the operands are drawn inside, which keeps the scores inside the range the exponential table covers."""
+
+_MASKED: float = -1.0e30
+"""Score a masked key takes in the references, matching what the image's mask tiles add."""
 
 
 def simulate(*, tokens: int, heads: int, build_dir: str | None = None,
@@ -57,43 +60,17 @@ def simulate(*, tokens: int, heads: int, build_dir: str | None = None,
     Returns:
         The worst head's error against the exact causal reference, and the worst error the BF16 model carries.
     """
-    launch = _planned(tokens=tokens)
-    fused_tiles = 3 * heads * _HEAD // _TILE
-    image = compile_resident_attention(launch, heads=heads, fused_tiles=fused_tiles)
+    compiled = compile_kernel(gpt2_attention, heads=heads, M=tokens)
     generator = np.random.default_rng(0)
-    query, key, value = (from_bf16_words(words=as_bf16_words(values=generator.uniform(
-        -_SPREAD, _SPREAD, size=(tokens, heads * _HEAD)).astype(np.float32))) for _ in range(3))
+    query, key, value = (_drawn(generator, rows=tokens, heads=heads) for _ in range(3))
+    fused = _pack(np.concatenate([query, key, value], axis=1))
+    dumped = run_image(compiled.image, arguments=[compiled.constants, b"", fused.tobytes()],
+                       offsets=[0, 0, 2 * _ZERO_TILE_WORDS], dump_bytes=fused.nbytes,
+                       what=f"{heads} heads over {tokens} tokens", build_dir=build_dir, max_cycles=max_cycles)
+    attended = _unpack(np.frombuffer(dumped, dtype="<u2"), tokens=tokens, features=3 * heads * _HEAD)
 
-    # Lays the fused tensor out as resident blocks do, each block's packed tokens followed by the next block's
-    # clearing tile, from the first block's tokens onward, which is where the launch's argument points.
-    fused = np.concatenate([query, key, value], axis=1)
-    blocks = [pack_activations(activations=fused[block * _BLOCK_TOKENS: (block + 1) * _BLOCK_TOKENS])
-              for block in range(tokens // _BLOCK_TOKENS)]
-    clearing = np.zeros(_ZERO_TILE_WORDS, dtype=np.uint16)
-    resident = np.concatenate([piece for block in blocks for piece in (block, clearing)])
-    constants = pack_attention_constants(initial_maximum=launch.entering, constants=launch.constants,
-                                         masks=launch.mask_tiles)
-    dumped = _run_image(image=image, activations=constants.tobytes(), weights=b"", drain=resident.tobytes(),
-                        drain_bytes=resident.nbytes, build_dir=build_dir, max_cycles=max_cycles,
-                        what=f"{heads} heads over {tokens} tokens")
-    words = np.frombuffer(dumped, dtype="<u2")
-    block_words = blocks[0].size + _ZERO_TILE_WORDS
-    attended = np.concatenate([
-        from_bf16_words(words=words[block * block_words: block * block_words + heads * _HEAD * _BLOCK_TOKENS])
-        .reshape(heads * _HEAD // _TILE, _BLOCK_TOKENS, _TILE).transpose(1, 0, 2).reshape(_BLOCK_TOKENS, -1)
-        for block in range(len(blocks))], axis=0)
-
-    mask = launch.mask_scores
-    errors, modelled_errors = [], []
-    for head in range(heads):
-        columns = slice(head * _HEAD, (head + 1) * _HEAD)
-        expected = attention_reference(query[:, columns], key[:, columns], value[:, columns], mask=mask)
-        modelled = attention_bf16_reference(query[:, columns], key[:, columns], value[:, columns],
-                                            initial_maximum=launch.entering, mask=mask)
-        bound = float(np.abs(expected).max())
-        errors.append(float(np.abs(attended[:, columns] - expected).max() / bound))
-        modelled_errors.append(float(np.abs(modelled - expected).max() / bound))
-    return max(errors), max(modelled_errors)
+    mask = np.where(np.tril(np.ones((tokens, tokens), dtype=bool)), np.float32(0.0), np.float32(_MASKED))
+    return _errors(attended, query, key, value, heads=heads, mask=mask, rows=tokens)
 
 
 def simulate_decode(*, length: int, heads: int, build_dir: str | None = None,
@@ -110,58 +87,73 @@ def simulate_decode(*, length: int, heads: int, build_dir: str | None = None,
         The worst head's error on the new token against the exact reference, and the worst error the BF16 model
         carries.
     """
-    padded = -(-length // _BLOCK_TOKENS) * _BLOCK_TOKENS
-    declared = {parameter.name: parameter.default for parameter in gpt2_decode_attention.params
-                if parameter.is_constexpr}
-    matmuls = read_program(gpt2_decode_attention, signature=signature_of(gpt2_decode_attention, operands={}),
-                           constexprs=declared | {"N": padded, "LENGTH": length})
-    launch = plan(matmuls, strides={}).launches[0]
-    model_tiles = heads * _HEAD // _TILE
-    image = compile_resident_attention(launch, heads=heads, fused_tiles=3 * model_tiles, cache_tiles=2 * model_tiles)
+    keys = -(-length // _BLOCK_TOKENS) * _BLOCK_TOKENS
+    compiled = compile_kernel(gpt2_decode_attention, heads=heads, N=keys, LENGTH=length)
+    entry = compiled.entry
     generator = np.random.default_rng(1)
 
-    def drawn(rows: int) -> NDArray[np.float32]:
-        """Returns operands on the BF16 grid, one row per token and one column per feature of every head."""
-        return from_bf16_words(words=as_bf16_words(values=generator.uniform(
-            -_SPREAD, _SPREAD, size=(rows, heads * _HEAD)).astype(np.float32)))
+    # Stages the new token in the fused block's first row, the rest of the block being padding, and the cache's keys
+    # and values past its length as values no query may attend to.
+    fused = np.concatenate([_drawn(generator, rows=_BLOCK_TOKENS, heads=heads) for _ in range(3)], axis=1)
+    key, value = _drawn(generator, rows=keys, heads=heads), _drawn(generator, rows=keys, heads=heads)
+    masks = decode_mask_tiles(keys=keys, length=length)
+    if entry["transposed_masks"]:
+        masks = masks.swapaxes(-1, -2)
+    constants = pack_attention_constants(initial_maximum=entry["entering"], constants=tuple(entry["stated"]),
+                                         masks=masks).reshape(-1)
+    packed, cache = _pack(fused), _pack(np.concatenate([key, value], axis=1))
+    dumped = run_image(compiled.image, arguments=[constants.tobytes(), cache.tobytes(), packed.tobytes()],
+                       offsets=[0, 2 * _ZERO_TILE_WORDS, 2 * _ZERO_TILE_WORDS], dump_bytes=packed.nbytes,
+                       what=f"{heads} heads of one decode step over {length} keys", build_dir=build_dir,
+                       max_cycles=max_cycles)
+    attended = _unpack(np.frombuffer(dumped, dtype="<u2"), tokens=_BLOCK_TOKENS, features=3 * heads * _HEAD)
 
-    # Stages the new token in the fused block's first row, the rest of the block being padding, and the cache's
-    # keys and values past its length as values no query may attend to.
-    fused = np.concatenate([drawn(_BLOCK_TOKENS) for _ in range(3)], axis=1)
-    key, value = drawn(padded), drawn(padded)
-    cache = np.concatenate([key, value], axis=1)
-    clearing = np.zeros(_ZERO_TILE_WORDS, dtype=np.uint16)
-    resident = np.concatenate([piece for block in range(padded // _BLOCK_TOKENS) for piece in (
-        pack_activations(activations=cache[block * _BLOCK_TOKENS: (block + 1) * _BLOCK_TOKENS]), clearing)])
-    constants = pack_attention_constants(initial_maximum=launch.entering, constants=launch.constants,
-                                         masks=launch.mask_tiles)
-    packed = pack_activations(activations=fused)
-    dumped = _run_image(image=image, activations=constants.tobytes(), weights=resident.tobytes(),
-                        drain=packed.tobytes(), drain_bytes=packed.nbytes, build_dir=build_dir,
-                        max_cycles=max_cycles, what=f"{heads} heads of one decode step over {length} keys")
-    words = from_bf16_words(words=np.frombuffer(dumped, dtype="<u2")[:model_tiles * _BLOCK_TOKENS * _TILE])
-    attended = words.reshape(model_tiles, _BLOCK_TOKENS, _TILE).transpose(1, 0, 2).reshape(_BLOCK_TOKENS, -1)
+    mask = np.broadcast_to(np.where(np.arange(keys) < length, np.float32(0.0), np.float32(_MASKED)), (_TILE, keys))
+    return _errors(attended, fused[:_TILE], key, value, heads=heads, mask=mask, rows=1)
 
-    mask = launch.mask_scores
+
+def _drawn(generator: np.random.Generator, *, rows: int, heads: int) -> NDArray[np.float32]:
+    """Returns operands on the BF16 grid, one row per token and one column per feature of every head."""
+    return from_bf16_words(words=as_bf16_words(values=generator.uniform(
+        -_SPREAD, _SPREAD, size=(rows, heads * _HEAD)).astype(np.float32)))
+
+
+def _pack(matrix: NDArray[np.float32]) -> NDArray[np.uint16]:
+    """Lays a [tokens, features] tensor out as the device holds it: per token block, a zeroed tile and then its
+    feature tiles, one row per token."""
+    blocks = []
+    for block in range(matrix.shape[0] // _BLOCK_TOKENS):
+        rows = matrix[block * _BLOCK_TOKENS:(block + 1) * _BLOCK_TOKENS]
+        blocks += [np.zeros(_ZERO_TILE_WORDS, dtype=np.float32),
+                   rows.reshape(_BLOCK_TOKENS, -1, _TILE).transpose(1, 0, 2).reshape(-1)]
+    return as_bf16_words(values=np.concatenate(blocks))
+
+
+def _unpack(words: NDArray[np.uint16], *, tokens: int, features: int) -> NDArray[np.float32]:
+    """Reads a tensor packed as `_pack` lays it out back into [tokens, features]."""
+    block_words = _ZERO_TILE_WORDS + features * _BLOCK_TOKENS
+    rows = []
+    for block in range(tokens // _BLOCK_TOKENS):
+        tiles = from_bf16_words(words=words[block * block_words + _ZERO_TILE_WORDS:(block + 1) * block_words])
+        rows.append(tiles.reshape(features // _TILE, _BLOCK_TOKENS, _TILE).transpose(1, 0, 2)
+                    .reshape(_BLOCK_TOKENS, -1))
+    return np.concatenate(rows)
+
+
+def _errors(attended: NDArray[np.float32], query: NDArray[np.float32], key: NDArray[np.float32],
+            value: NDArray[np.float32], *, heads: int, mask: NDArray[np.float32], rows: int) -> tuple[float, float]:
+    """Returns the worst head's error over its first `rows` queries against the exact reference, and the worst error
+    the BF16 model carries over the same operands."""
     errors, modelled_errors = [], []
     for head in range(heads):
         columns = slice(head * _HEAD, (head + 1) * _HEAD)
-        queries = fused[:_TILE, columns]
-        expected = attention_reference(queries, key[:, columns], value[:, columns], mask=mask)[:1]
-        modelled = attention_bf16_reference(queries, key[:, columns], value[:, columns],
-                                            initial_maximum=launch.entering, mask=mask)[:1]
+        expected = attention_reference(query[:, columns], key[:, columns], value[:, columns], mask=mask)[:rows]
+        modelled = attention_bf16_reference(query[:, columns], key[:, columns], value[:, columns],
+                                            initial_maximum=_MASKED, mask=mask)[:rows]
         bound = float(np.abs(expected).max())
-        errors.append(float(np.abs(attended[:1, columns] - expected).max() / bound))
+        errors.append(float(np.abs(attended[:rows, columns] - expected).max() / bound))
         modelled_errors.append(float(np.abs(modelled - expected).max() / bound))
     return max(errors), max(modelled_errors)
-
-
-def _planned(*, tokens: int) -> FlashLaunch:
-    """Returns the launch GPT-2's attention kernel plans to over a sequence of the given length."""
-    declared = {parameter.name: parameter.default for parameter in gpt2_attention.params if parameter.is_constexpr}
-    matmuls = read_program(gpt2_attention, signature=signature_of(gpt2_attention, operands={}),
-                           constexprs=declared | {"M": tokens})
-    return plan(matmuls, strides={}).launches[0]
 
 
 def main() -> int:

@@ -21,7 +21,6 @@ from bf16 import (  # noqa: E402
     _LAUNCH_REPEATS,
     _MODEL_WIDTH,
     _on_bf16_grid,
-    _single_launch_operands,
     build_operands,
 )
 from gpt2_inference import (  # noqa: E402
@@ -110,7 +109,7 @@ def check_kernel_launch(image_bytes: bytes) -> None:
         minitpuHostReset()
 
 
-def check_copy_roundtrip(words: NDArray[np.uint32], *, uio_name: str = "minitpu") -> None:
+def check_copy_roundtrip(words: NDArray[np.uint16], *, uio_name: str = "minitpu") -> None:
     """Verifies that a kernel's argument words cross to device memory and return byte for byte unchanged.
 
     Notes:
@@ -185,7 +184,11 @@ def check_halt() -> str:
 
 
 def check_copy_argument() -> str:
-    """Sends one GEMM argument through device memory and reads it back.
+    """Sends one token block's worth of random words through device memory and reads them back.
+
+    Notes:
+        The round trip moves bytes and computes nothing, so random words, which reach every bit pattern, test it
+        better than any operand a kernel would take.
 
     Returns:
         The detail the report line carries.
@@ -193,9 +196,9 @@ def check_copy_argument() -> str:
     Raises:
         AssertionError: If the payload read back differs from the payload sent.
     """
-    gemm_input = _single_launch_operands()[3]
-    check_copy_roundtrip(words=gemm_input)
-    return f"{gemm_input.nbytes}-byte GEMM argument"
+    words = np.random.default_rng(0).integers(0, 1 << 16, size=_BLOCK_TOKENS * _MODEL_WIDTH, dtype=np.uint16)
+    check_copy_roundtrip(words=words)
+    return f"{words.nbytes}-byte random payload"
 
 
 def check_full_gemm(*, tokens: int = 32, depth: int = 768, columns: int = 3072) -> str:

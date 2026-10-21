@@ -43,7 +43,7 @@ while IFS= read -r f; do FILES+=("$f"); done < <(files_in '*' board_package/fpga
 FILES+=("board_package/fpga/overlay.dtso" "board_package/fpga/u-dma-buf.ko")
 
 # The compiled images the layer drivers launch. The board carries no
-# compiler, so tools/board/build_gpt2_images.py writes them here and they travel as data.
+# compiler, so tools/board/build_images.py writes them here and they travel as data.
 while IFS= read -r f; do FILES+=("$f"); done < <(files_in '*' board_package/images)
 
 # GPT-2's weights and tokenizer, which tools/board/export_gpt2_weights.py writes into weights/

@@ -71,7 +71,7 @@ would not, and the cache would then belong in the runtime instead."""
 
 _IMAGE_DIRECTORY: pathlib.Path = HERE / "images"
 """Directory holding the compiled images and the manifest describing them, which a host writes through
-`tools/board/build_gpt2_images.py`."""
+`tools/board/build_images.py`."""
 
 
 UIO_NAME: str = "minitpu"
@@ -843,7 +843,7 @@ def prefill(token_ids: NDArray[np.int64], layers: list[dict], shared: dict, *, h
         message = (
             f"Unable to prefill a prompt of {tokens} tokens. A compiled attention image covers "
             f"{', '.join(map(str, lengths))} tokens and the caches hold {capacity}, so add a longer length to "
-            f"tools/board/build_gpt2_images.py or shorten the prompt."
+            f"tools/board/build_images.py or shorten the prompt."
         )
         raise ValueError(message)
     padding = np.full(padded - tokens, _END_OF_TEXT, dtype=np.int64)
@@ -1094,7 +1094,7 @@ def _compiled_image(*, kind: str, **shape: int | bool) -> tuple[bytes, dict]:
         stated = ", ".join(f"{field}={value}" for field, value in shape.items())
         message = (
             f"Unable to launch the {kind} image with {stated}. No image in {_IMAGE_DIRECTORY} covers that shape, so "
-            f"add it to tools/board/build_gpt2_images.py and rerun that tool on a host."
+            f"add it to tools/board/build_images.py and rerun that tool on a host."
         )
         raise ValueError(message)
     cached = ((_IMAGE_DIRECTORY / found).read_bytes(), manifest[found])

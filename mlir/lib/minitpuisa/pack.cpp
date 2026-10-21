@@ -3,7 +3,8 @@
  *
  * @brief Implements the minitpuisa packer, which merges independent instructions between barriers into shared bundles.
  *
- * @note The region schedule matches codegen/asm.py's pack() bundle for bundle, over the traffic traffic.h models.
+ * @note The region schedule matches the retired Python assembler's pack() bundle for bundle, over the traffic traffic.h
+ * models, which the recorded streams under test/Inputs/schedule hold it to.
  */
 
 #include <llvm/ADT/DenseSet.h>
@@ -44,7 +45,8 @@ namespace
         llvm::SmallVector<BundleOp, 2> members;  ///< The bundles merged into this one, empty for an empty bundle.
     };
 
-    /// Determines whether a bundle must keep its position, as asm.py's _is_barrier decides.
+    /// Determines whether a bundle must keep its position: a DMA bundle, or one carrying a matrix, scalar or control
+    /// instruction.
     bool IsBarrier(const BundleTraffic& traffic)
     {
         return traffic.is_dma || (traffic.slots & kBarrierSlots) != 0;
@@ -184,7 +186,7 @@ namespace
         for (auto& [cycle, held] : cycles) packed.push_back(std::move(held.merged));
     }
 
-    /// Returns the program's bundles split at its barriers, each region packed, as asm.py's _reframe arranges them.
+    /// Returns the program's bundles split at its barriers, each region packed, in program order.
     FailureOr<std::vector<PackedBundle>> PackProgram(ProgramOp program)
     {
         std::vector<PackedBundle> packed;
@@ -226,7 +228,7 @@ namespace
      * @brief Rebuilds the program body as the packed bundles, in order.
      *
      * A lone member is moved as it stands. Several members merge into one new bundle carrying their instructions and
-     * the bitwise OR of their delays, which is what asm.py's word-level merge produces.
+     * the bitwise OR of their delays, which is what merging their words produces.
      *
      * @param program the program to rebuild.
      * @param packed the packed bundles, in order.

@@ -3,7 +3,7 @@
  * @brief Provides the minitpuisa dialect, one operation per MiniTPU machine instruction, grouped into bundles exactly
  * as an image carries them.
  *
- * @details Every slot and opcode is read from codegen/minitpuisa.td, the ISA's single source, so an opcode that moves
+ * @details Every slot and opcode is read from minitpuisa/isa.td, the ISA's single source, so an opcode that moves
  * there moves here, and a mnemonic dropped there fails this file's build rather than encoding a stale number. The
  * arithmetic groups' operations are generated from their mnemonic lists, so an E-slot mnemonic added there becomes an
  * operation here with no edit to this file.
@@ -15,7 +15,7 @@
 include "mlir/IR/OpBase.td"
 include "mlir/IR/RegionKindInterface.td"
 include "mlir/IR/SymbolInterfaces.td"
-include "codegen/minitpuisa.td"
+include "minitpu/minitpuisa/isa.td"
 
 /// @brief Provides the dialect every MiniTPU machine operation belongs to.
 def ISA_Dialect : Dialect
@@ -30,7 +30,7 @@ def ISA_Dialect : Dialect
  *
  * @details A slot's payload is the instruction's fields at their positions within the slot, before the slot is
  * shifted into the bundle. get_code is what the decoder matches a payload against: the opcode for the slots carrying
- * one, and the store bit for X and D. Every register operand is named as codegen/minitpuisa.td's register_reads and
+ * one, and the store bit for X and D. Every register operand is named as minitpuisa/isa.td's register_reads and
  * register_write name it, so the scheduler reads an instruction's registers by the roles its group publishes.
  */
 def ISA_SlotOpInterface : OpInterface<"SlotOpInterface">
@@ -100,7 +100,7 @@ class ISA_Op<OpGroup group, string mnemonic, int store_bit = -1>
     : Op<ISA_Dialect, mnemonic, [ISA_SlotOpInterface]>
 {
     defvar index = ISA_IndexIn<group, mnemonic>.value;
-    assert !ge(index, 0), "codegen/minitpuisa.td's " # group.slot # " group names no '" # mnemonic # "'.";
+    assert !ge(index, 0), "minitpuisa/isa.td's " # group.slot # " group names no '" # mnemonic # "'.";
 
     /// Stores the code the instruction's payload is matched against.
     int instruction_code = !if(!ge(store_bit, 0), store_bit, group.opcodes[index]);

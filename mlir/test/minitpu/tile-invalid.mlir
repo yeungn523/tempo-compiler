@@ -12,22 +12,23 @@ minitpu.kernel @wrong_tokens {
 
 // -----
 
-minitpu.kernel @partial_chunk {
+minitpu.kernel @partial_tile {
   %a = minitpu.arg 0
   %w = minitpu.arg 1
   %d = minitpu.arg 2
-  // expected-error @below {{The depth must be a whole number of 128-row weight chunks}}
+  // expected-error @below {{Both must be a whole number of 16-wide tiles}}
   minitpu.matmul %a, %w -> %d tokens 32 depth 200 columns 32
 }
 
 // -----
 
-minitpu.kernel @past_one_bank {
+minitpu.kernel @bias_past_one_bank {
   %a = minitpu.arg 0
   %w = minitpu.arg 1
   %d = minitpu.arg 2
-  // expected-error @below {{is unable to stage a depth of 4096}}
-  minitpu.matmul %a, %w -> %d tokens 32 depth 4096 columns 32
+  %b = minitpu.arg 3
+  // expected-error @below {{is unable to stage 32768 columns. Its bias row and weight chunks take 8480 VMEM rows}}
+  minitpu.matmul %a, %w -> %d bias %b tokens 32 depth 256 columns 32768
 }
 
 // -----

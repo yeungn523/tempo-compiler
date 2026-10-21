@@ -4,7 +4,8 @@
  * @brief Provides the bit layout of the MiniTPU's 128-bit bundle, as one named field per instruction operand.
  *
  * The layout mirrors sequencer_pkg's compute_payload_t and d_wire_t at NUM_LANES=16 and NUM_SUBLANES=4, as
- * codegen/asm.py does. Every slot position derives from the slot widths, so a width change moves them all.
+ * tools/emulators/minitpu_emulator.py's decoder does. Every slot position derives from the slot widths, so a width
+ * change moves them all.
  */
 
 #ifndef MINITPU_MINITPUISA_ENCODING_H
@@ -26,6 +27,9 @@ namespace mlir::minitpu::isa
 
     /// Stores the size of one bundle in bytes.
     static constexpr uint32_t kBundleBytes = kBundleBits / kBitsPerByte;
+
+    /// Stores the bundles the instruction memory holds, the most one image may carry.
+    static constexpr uint32_t kIramBundles = 4096;
 
     /// Stores the bit that selects the DMA format over the compute format.
     static constexpr uint32_t kDmaBit = kBundleBits - 1;

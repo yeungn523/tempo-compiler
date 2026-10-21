@@ -1,4 +1,4 @@
-"""Provides the per-opcode scheduling facts the assembler schedules against.
+"""Provides the per-opcode facts the emulator decodes images with.
 
 Run `python3 tools/toolchain/gen_isa_doc.py --write` to generate.
 """
@@ -11,30 +11,7 @@ PROFILE: dict[str, int] = {
     "vreg_element_count": 64,
     "vreg_entry_count": 32,
 }
-"""Array geometry every offset below is quoted against, and every capacity a consumer derives from it."""
-
-RTL_PARAMS: dict[str, int] = {
-    "WB_W_ALU": 5,
-    "WB_W_SFU": 7,
-    "WB_W_REDUCE": 15,
-    "WB_W_VLD": 6,
-    "WB_W_MPOP_FIRST": 3,
-    "WB_W_MPOP_LAST": 6,
-}
-"""Writeback reservation offset of each sequencer_pkg localparam tb_isa_conformance checks."""
-
-MATRIX_OCCUPANCY: dict[str, int] = {
-    "vmatload": 18,
-    "vmatpush": 5,
-    "vmatpop": 7,
-}
-"""Cycles each matrix command holds the controller, measured against the RTL."""
-
-MATRIX_PORT_A: tuple[str, ...] = ("vmatload", "vmatpush")
-"""Matrix commands owning VREG read port A while they stream."""
-
-MATRIX_RESULT_LATENCY: int = 82
-"""Cycles from a vmatpush to its first result leaving the array."""
+"""Array geometry the emulator decodes vector registers and VMEM rows against."""
 
 OPERATIONS: tuple[dict, ...] = (
     {

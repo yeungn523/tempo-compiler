@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Generates the published ISA operation table, the RTL conformance package and the assembler's scheduling model.
+"""Generates the published ISA operation table and the emulator's opcode model.
 
-codegen/minitpuisa.td is the single source of truth for the implemented scheduling contract, and it is read through a
-TableGen driver's --dump-json, the minitpu-tblgen mlir/ builds against the pinned LLVM when it is built and a system
-llvm-tblgen otherwise. The artifacts derived from it are the operation table spliced between the generated markers in
-docs/ISA_AND_INTERFACES.md, the localparams in tb/isa_latency_pkg.sv and the per-opcode facts in codegen/isa_model.py.
-Running this script with --write regenerates all three, and running it with --check exits non-zero when any of them, or
-any scheduling constant in codegen/asm.py, disagrees with the source.
+mlir/include/minitpu/minitpuisa/isa.td is the single source of truth for the implemented scheduling contract, and it is
+read through a TableGen driver's --dump-json, the minitpu-tblgen mlir/ builds against the pinned LLVM when it is built
+and a system llvm-tblgen otherwise. The artifacts derived from it are the operation table spliced between the generated
+markers in docs/ISA_AND_INTERFACES.md and the per-opcode facts in tools/emulators/isa_model.py. Running this script
+with --write regenerates both, and running it with --check exits non-zero when either disagrees with the source.
 """
 
 from __future__ import annotations
@@ -15,7 +14,6 @@ import argparse
 import json
 import os
 import pathlib
-import re
 import shutil
 import subprocess
 import sys
@@ -24,20 +22,14 @@ from typing import Any
 _REPO: pathlib.Path = pathlib.Path(__file__).resolve().parents[2]
 """Stores the path to the repository root."""
 
-_SOURCE: pathlib.Path = _REPO / "codegen" / "minitpuisa.td"
+_SOURCE: pathlib.Path = _REPO / "mlir" / "include" / "minitpu" / "minitpuisa" / "isa.td"
 """Stores the path to the TableGen contract every generated artifact derives from."""
 
 _DOC: pathlib.Path = _REPO / "docs" / "ISA_AND_INTERFACES.md"
 """Stores the path to the markdown page carrying the generated operation table."""
 
-_PACKAGE: pathlib.Path = _REPO / "tb" / "isa_latency_pkg.sv"
-"""Stores the path to the package tb_isa_conformance.sv holds the sequencer's own localparams against."""
-
-_MODEL: pathlib.Path = _REPO / "codegen" / "isa_model.py"
-"""Stores the path to the module the assembler reads its per-opcode scheduling facts from."""
-
-_ASSEMBLER: pathlib.Path = _REPO / "codegen" / "asm.py"
-"""Stores the path to the assembler whose hand-written scheduling constants are checked against the source."""
+_MODEL: pathlib.Path = _REPO / "tools" / "emulators" / "isa_model.py"
+"""Stores the path to the module the emulator reads its opcodes and array geometry from."""
 
 _BEGIN: str = "<!-- BEGIN GENERATED: tools/toolchain/gen_isa_doc.py -->"
 """Stores the marker opening the generated region of the markdown page."""
@@ -46,7 +38,7 @@ _END: str = "<!-- END GENERATED -->"
 """Stores the marker closing the generated region of the markdown page."""
 
 _HEADER: str = "Run `python3 tools/toolchain/gen_isa_doc.py --write` to generate."
-"""Stores the line the generated SystemVerilog package and Python module open with."""
+"""Stores the line the generated Python module opens with."""
 
 _COLUMNS: tuple[str, ...] = (
     "Physical slot / operation",
@@ -77,8 +69,6 @@ def _load() -> dict[str, Any]:
     return {
         "profile": _profile(records),
         "operations": _operations(records),
-        "rtl_params": {record["name"]: record["value"]
-                       for record in _ordered(records, "RtlParameter", "rtl_parameters")},
         "matrix": _matrix(records),
         "resources": _resources(records),
     }
@@ -185,8 +175,6 @@ def _operations(records: dict[str, Any]) -> list[dict[str, Any]]:
         }
         optional = (
             ("opcodes", record["opcodes"]),
-            ("rtl_enum", record["rtl_enumerators"]),
-            ("rtl_param", record["rtl_parameter"]),
             ("consumer_override", record["consumer_override"]),
         )
         entry.update({key: value for key, value in optional if value})
@@ -219,14 +207,14 @@ def _matrix(records: dict[str, Any]) -> dict[str, Any]:
 
 
 def _resources(records: dict[str, Any]) -> dict[str, Any]:
-    """Returns each capacity's values, RTL parameter, assembler constants and note."""
+    """Returns each capacity's values, RTL parameter, headline value and note."""
     resources = {}
     for record in _ordered(records, "HardwareResource", "resources"):
         spec = {value["name"]: value["value"] for value in _referenced(records, record["values"])}
         if record["rtl_parameter"]:
             spec["rtl_param"] = record["rtl_parameter"]
-        spec["asm_constants"] = {constant["name"]: constant["resource_field"]
-                                 for constant in _referenced(records, record["asm_constants"])}
+        if record["headline"]:
+            spec["headline"] = record["headline"]
         if record["note"]:
             spec["note"] = record["note"]
         resources[record["group"]] = spec
@@ -237,7 +225,6 @@ def _artifacts(data: dict[str, Any]) -> dict[pathlib.Path, str]:
     """Returns the content each generated artifact must hold, keyed by its path."""
     return {
         _DOC: _splice(_DOC.read_text(), _render_table(data)),
-        _PACKAGE: _render_package(data),
         _MODEL: _render_model(data),
     }
 
@@ -327,52 +314,20 @@ def _consumer(entry: dict[str, Any]) -> str:
 
 
 def _capacity(spec: dict[str, Any]) -> int | None:
-    """Returns the resource's headline value, being the one its first assembler constant names.
+    """Returns the resource's headline value, being the one its record names.
 
-    A resource binding no assembler constant falls back to its first value, so a capacity no constant mirrors still
-    publishes a number rather than a dash.
+    A resource naming none falls back to its first value, so it still publishes a number rather than a dash.
     """
-    field = next(iter(spec["asm_constants"].values()), None)
-    if field is not None:
-        return spec[field]
-    values = [name for name in spec if name not in {"rtl_param", "asm_constants", "note"}]
+    if "headline" in spec:
+        return spec[spec["headline"]]
+    values = [name for name in spec if name not in {"rtl_param", "headline", "note"}]
     return spec[values[0]] if values else None
 
 
-def _render_package(data: dict[str, Any]) -> str:
-    """Returns the generated SystemVerilog package carrying one localparam per published offset and opcode."""
-    lines = [
-        # Emits the licence header every other source carries here rather than adding it afterwards, since --check
-        # would call the file stale the moment it had one.
-        "// Copyright MiniTPU Authors",
-        "// SPDX-License-Identifier: Apache-2.0",
-        "",
-        f"// {_HEADER}",
-        "//",
-        "// Concepts: ISA latency contract, writeback offset, generated artifact.",
-        "package isa_latency_pkg;",
-    ]
-
-    params = dict(data["rtl_params"])
-    for spec in data["resources"].values():
-        capacity = _capacity(spec)
-        if "rtl_param" in spec and capacity is not None:
-            params[spec["rtl_param"]] = capacity
-    for name, value in params.items():
-        lines.append(f"  localparam int unsigned DOC_{name} = {value};")
-
-    for entry in data["operations"]:
-        for name, value in zip(entry.get("rtl_enum", ()), entry.get("opcodes", ())):
-            lines.append(f"  localparam int unsigned DOC_{name} = {value};")
-
-    lines += ["endpackage : isa_latency_pkg", ""]
-    return "\n".join(lines)
-
-
 def _render_model(data: dict[str, Any]) -> str:
-    """Returns the generated Python module carrying the per-opcode scheduling facts the assembler reads."""
+    """Returns the generated Python module carrying the per-opcode facts the emulator decodes images with."""
     lines = [
-        '"""Provides the per-opcode scheduling facts the assembler schedules against.',
+        '"""Provides the per-opcode facts the emulator decodes images with.',
         "",
         _HEADER,
         '"""',
@@ -385,29 +340,7 @@ def _render_model(data: dict[str, Any]) -> str:
         lines.append(f"    {_python_literal(name)}: {value},")
     lines += [
         "}",
-        '"""Array geometry every offset below is quoted against, and every capacity a consumer derives from it."""',
-        "",
-        "RTL_PARAMS: dict[str, int] = {",
-    ]
-    for name, value in data["rtl_params"].items():
-        lines.append(f"    {_python_literal(name)}: {value},")
-    lines += [
-        "}",
-        '"""Writeback reservation offset of each sequencer_pkg localparam tb_isa_conformance checks."""',
-        "",
-        "MATRIX_OCCUPANCY: dict[str, int] = {",
-    ]
-    for name, cycles in data["matrix"]["occupancy"].items():
-        lines.append(f"    {_python_literal(name)}: {cycles},")
-    lines += [
-        "}",
-        '"""Cycles each matrix command holds the controller, measured against the RTL."""',
-        "",
-        "MATRIX_PORT_A: tuple[str, ...] = " + repr(tuple(data["matrix"]["port_a_held_by"])).replace("'", '"'),
-        '"""Matrix commands owning VREG read port A while they stream."""',
-        "",
-        f"MATRIX_RESULT_LATENCY: int = {data['matrix']['result_latency']['vmatpush']}",
-        '"""Cycles from a vmatpush to its first result leaving the array."""',
+        '"""Array geometry the emulator decodes vector registers and VMEM rows against."""',
         "",
         "OPERATIONS: tuple[dict, ...] = (",
     ]
@@ -440,34 +373,11 @@ def _python_literal(value: Any) -> str:
     return repr(value)
 
 
-def _check_assembler_constants(data: dict[str, Any]) -> list[str]:
-    """Returns a message per scheduling constant in the assembler that disagrees with the source.
-
-    The assembler ships to the board and cannot read the source at runtime, so its capacity constants are written
-    out by hand and held against the source here rather than generated from it.
-    """
-    source = _ASSEMBLER.read_text()
-    relative = _ASSEMBLER.relative_to(_REPO)
-    problems = []
-    for group, spec in data["resources"].items():
-        for name, field in spec["asm_constants"].items():
-            expected = spec[field]
-            # Tolerates the type annotation on each constant, and refuses a name prefixing a longer one.
-            match = re.search(rf"^{re.escape(name)}(?![A-Za-z0-9_])\s*(?::[^=\n]+)?=\s*(\d+)", source, re.MULTILINE)
-            if match is None:
-                problems.append(f"{relative} does not define {name} "
-                                f"({_SOURCE.relative_to(_REPO)} {group} resource, {field} = {expected})")
-            elif int(match.group(1)) != expected:
-                problems.append(f"{relative} {name} = {match.group(1)}, but "
-                                f"{_SOURCE.relative_to(_REPO)} {group} resource, {field} = {expected}")
-    return problems
-
-
 def main() -> int:
     """Regenerates every artifact or reports the ones that disagree with the source.
 
     Returns:
-        Zero when the run succeeds, and one when --check finds a stale artifact or a drifted assembler constant.
+        Zero when the run succeeds, and one when --check finds a stale artifact.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -491,12 +401,6 @@ def main() -> int:
         for path in stale:
             print(f"STALE: {path} does not match {_SOURCE.relative_to(_REPO)}", file=sys.stderr)
         print("run: python3 tools/toolchain/gen_isa_doc.py --write", file=sys.stderr)
-        return 1
-
-    drift = _check_assembler_constants(data)
-    if drift:
-        for message in drift:
-            print(f"DRIFT: {message}", file=sys.stderr)
         return 1
 
     print(f"{names} are in sync with {_SOURCE.relative_to(_REPO)}")

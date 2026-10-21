@@ -77,6 +77,58 @@ minitpu.kernel @gemm_bias {
 
 // -----
 
+// A contraction ending part way through a chunk loads only the rows of its last chunk and walks only its k-tiles.
+
+// CHECK-LABEL: minitpu.kernel @gemm_short_chunk
+// CHECK:       minitpu.alloc : !minitpu.vmem<288>
+// CHECK:       scf.for
+// CHECK:         minitpu.vmemld {{.*}} rows 128, slot 0
+// CHECK:         minitpu.vmemld {{.*}} rows 16, slot 1
+// CHECK:         %[[EIGHT:.*]] = arith.constant 8 : index
+// CHECK:         scf.for %{{.*}} = %{{.*}} to %[[EIGHT]]
+// CHECK:         %[[ONE:.*]] = arith.constant 1 : index
+// CHECK:         scf.for %{{.*}} = %{{.*}} to %[[ONE]]
+// PROGRAM-LABEL: minitpuisa.program @gemm_short_chunk
+// PROGRAM:       minitpuisa.halt
+minitpu.kernel @gemm_short_chunk {
+  %activations = minitpu.arg 0
+  %weights = minitpu.arg 1
+  %drain = minitpu.arg 2
+  minitpu.matmul %activations, %weights -> %drain tokens 32 depth 144 columns 32
+}
+
+// -----
+
+// A contraction deeper than one bank holds splits into segments of whole chunks, each staging its activations and
+// walking every column tile. A later segment reads its pointers afresh and starts each column tile from the partial
+// product the segment before drained, read back on slot 1 beside the first weight chunk.
+
+// CHECK-LABEL: minitpu.kernel @gemm_split
+// CHECK:       minitpu.alloc : !minitpu.vmem<4096>
+// CHECK:       scf.for
+// CHECK-NOT:     rows 32, slot 1
+// CHECK:         minitpu.vmemst {{.*}} rows 32
+// CHECK:       minitpu.arg 0
+// CHECK:       minitpu.arg 1
+// CHECK:       minitpu.arg 2
+// CHECK:       scf.for
+// CHECK:         minitpu.vmemld {{.*}} rows 128, slot 0
+// CHECK:         minitpu.vmemld {{.*}} rows 32, slot 1
+// CHECK-NEXT:    minitpu.flush_slot 2
+// CHECK-COUNT-8: minitpu.vld %{{.*}}[%{{.*}}] : !minitpu.vmem<32>
+// CHECK:         minitpu.vmemst {{.*}} rows 32
+// CHECK-NOT:   scf.for
+// PROGRAM-LABEL: minitpuisa.program @gemm_split
+// PROGRAM:       minitpuisa.halt
+minitpu.kernel @gemm_split {
+  %activations = minitpu.arg 0
+  %weights = minitpu.arg 1
+  %drain = minitpu.arg 2
+  minitpu.matmul %activations, %weights -> %drain tokens 32 depth 4096 columns 16
+}
+
+// -----
+
 // A streamed sum loads both operands' first chunks on the two slots, peels its first chunk, runs the middle chunks two
 // per iteration, and peels its last, each chunk prefetching the next before its additions and draining on slot 0.
 

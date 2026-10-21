@@ -27,9 +27,6 @@ _NUM_LANES: int = 16
 _ROW_BYTES: int = _NUM_LANES * _ELEMENT_BYTES
 """The byte size of one VMEM row, which is the stride every DMA descriptor walks DRAM at."""
 
-_VMEM_ENTRIES_PER_LANE: int = 8192
-"""The number of rows one VMEM lane holds."""
-
 _GELU_TABLE_ENTRIES: int = 2048
 """The number of entries in the SFU's GELU table."""
 
@@ -57,27 +54,11 @@ _BLOCK_TOKENS: int = _TOKEN_GROUPS * _TILE
 _BLOCK_DEPTH: int = _STEPS * _TILE
 """The contraction depth one block spans."""
 
-_STEP_TILES: int = 4
-"""The number of tiles one step block spans, set by the AGU's power-of-two row stride."""
-
-_LOOP_BLOCKS: int = 6
-"""The number of blocks the looped GEMM accumulates before it drains."""
-
 _NUM_SUBLANES: int = 4
 """The number of sublanes one vector register spans."""
 
-_TILE_VREGS: int = 4
-"""The number of vector registers one tile occupies."""
-
-_TILE_ROWS: int = _NUM_SUBLANES * _TILE_VREGS
-"""The number of VMEM rows one tile occupies."""
-
-_VMEM_SLOT_STRIDE: int = _VMEM_ENTRIES_PER_LANE
-"""The VMEM row distance between consecutive staging slots, which is a whole lane so no two slots share a row."""
-
 _BLOCK_ACTIVATION_BYTES: int = _STEPS * _TOKEN_GROUPS * _TILE * _ROW_BYTES
-"""The byte size of one block's activation tiles, at the token block the hand-written kernels cover. An emitted
-image takes this from `emit.Staging.activation_slack` instead, which reads the rows its own block covers."""
+"""The byte size of one block's activation tiles, which the runtime allocates past the activations as slack."""
 
 _BLOCK_WEIGHT_BYTES: int = _STEPS * _TILE * _ROW_BYTES
 """The byte size of one block's weight tiles."""
@@ -91,80 +72,11 @@ _ZERO_TILE_BYTES: int = _ZERO_TILE_WORDS * _ELEMENT_BYTES
 _VREG_ELEMENTS: int = _NUM_LANES * _NUM_SUBLANES
 """The number of values one vector register holds."""
 
-_MAX_DESCRIPTOR_ROWS: int = 128
-"""The largest number of rows one DMA descriptor moves, which is the chunk every staged region is sized in."""
-
-_ROW_ADD_LEFT: int = 2048
-"""The first VMEM row of the elementwise add's left operand."""
-
-_ROW_ADD_RIGHT: int = _ROW_ADD_LEFT + _MAX_DESCRIPTOR_ROWS
-"""The first VMEM row of the elementwise add's right operand."""
-
-_ROW_ADD_OUT: int = _ROW_ADD_RIGHT + _MAX_DESCRIPTOR_ROWS
-"""The first VMEM row of the elementwise add's result."""
-
-_ROW_TX_IN: int = _ROW_ADD_OUT + _MAX_DESCRIPTOR_ROWS
-"""The first VMEM row of the tile transpose's input."""
-
-_ROW_TX_OUT: int = _ROW_TX_IN + _TILE
-"""The first VMEM row of the tile transpose's result."""
-
-_ROW_ADD_BIAS: int = _ROW_TX_OUT + _TILE
-"""First VMEM row of the replicated bias, which the broadcasting add reads at stride one."""
-
-_ROW_STAT_IN: int = _ROW_ADD_BIAS + _MAX_DESCRIPTOR_ROWS
-"""First VMEM row of the score tile a row statistic reduces, one query per row."""
-
-_ROW_STAT_SCRATCH: int = _ROW_STAT_IN + _TILE
-"""First VMEM row the cross-sublane reduction shifts its partials through."""
-
-_ROW_STAT_OUT: int = _ROW_STAT_SCRATCH + _TILE * 2
-"""First VMEM row of the maxima, probabilities and sums a row statistic leaves, a tile each."""
-
-_STAT_OUT_ROWS: int = _TILE * 3
-"""Rows one row statistic drains."""
-
-_ENTERING_MAXIMUM: float = -1e4
-"""Value a running maximum entering at no finite one is staged at, which every score the table covers clears."""
-
-_ROW_FLASH_BASE: int = _ROW_STAT_OUT + _STAT_OUT_ROWS
-"""First VMEM row an attention block stages into, the regions past it sized by the head it covers."""
-
 _MODEL_WIDTH: int = 768
 """The GPT-2 model width in features."""
 
-_LN_ROW_X: int = 0
-"""The first VMEM row of the LayerNorm input."""
-
-_LN_ROW_OUT: int = 512
-"""The first VMEM row of the LayerNorm result."""
-
 _LN_EPSILON: float = 1e-5
 """The variance floor LayerNorm adds before taking the reciprocal square root."""
-
-
-def layernorm_constants(gamma: NDArray[np.float32], beta: NDArray[np.float32], *,
-                        width: int | None = None) -> NDArray[np.uint16]:
-    """Packs the resident half of a LayerNorm launch: gamma, beta and three broadcast scalars.
-
-    Args:
-        gamma: The per-feature scale, `width` long.
-        beta: The per-feature shift, `width` long.
-        width: The model width the mean divides by, defaulting to GPT-2's. Its reciprocal is baked in here, which
-            nothing downstream can tell disagrees with the row it is applied to.
-
-    Returns:
-        The container words the launch stages in VMEM.
-
-    Raises:
-        ValueError: If the operands are not one row of `width` features each.
-    """
-    width = _MODEL_WIDTH if width is None else width
-    _require_norm_operands(width=width, gamma=gamma, beta=beta)
-    zero = np.zeros(_VREG_ELEMENTS, dtype=np.float32)
-    inverse = np.full(_VREG_ELEMENTS, 1.0 / width, dtype=np.float32)
-    epsilon = np.full(_VREG_ELEMENTS, _LN_EPSILON, dtype=np.float32)
-    return as_bf16_words(values=np.concatenate([gamma, beta, zero, inverse, epsilon]))
 
 
 def as_bf16_words(values: NDArray[np.float32]) -> NDArray[np.uint16]:
@@ -190,54 +102,6 @@ def from_bf16_words(words: NDArray[np.uint16]) -> NDArray[np.float32]:
     return (words.astype("<u4") << 16).view("<f4")
 
 
-def reduce_drain(partials: NDArray[np.float32], *, shape: tuple[int, int, int, int, int]) -> NDArray[np.float32]:
-    """Sums one launch's drained partials into the token block's product.
-
-    The drain lies in the order the image walked its loops, so a block's output tiles sit inside its partials.
-
-    Args:
-        partials: The drained partials, with the clearing tile already skipped.
-        shape: Extent of each axis of the drain, as the plan's `Drain` states it.
-
-    Returns:
-        The product, as token rows by the columns the launch covers.
-    """
-    blocks, _, output_tiles, rows, tile = shape
-    tiles = blocks * output_tiles
-    summed = partials.reshape(shape).sum(axis=1, dtype=np.float32)
-    return summed.reshape(tiles, rows, tile).transpose(1, 0, 2).reshape(rows, tiles * tile)
-
-
-def pack_gemm_input(activations: NDArray[np.float32], weights: NDArray[np.float32]) -> NDArray[np.uint16]:
-    """Packs the tiled GEMM's tiles into the one buffer its DMA prologue expects.
-
-    Args:
-        activations: Activation tiles indexed by step, group, row and column.
-        weights: Weight tiles indexed by step, row and column.
-
-    Returns:
-        The VMEM image as BF16 container words, spanning one clearing tile plus _STEP_TILES tiles per step.
-
-    Raises:
-        ValueError: If a step holds more activation tiles than the AGU's stride leaves room for.
-    """
-    steps, groups = activations.shape[0], activations.shape[1]
-    if groups > _STEP_TILES - 1:
-        message = (
-            f"Unable to pack the GEMM image for {groups} token groups. A step block spans {_STEP_TILES} tiles and "
-            f"reserves the last for the weights, so the group count must be at most {_STEP_TILES - 1}."
-        )
-        raise ValueError(message)
-
-    padding = np.zeros_like(weights[0])
-    blocks = [padding]
-    for step in range(steps):
-        blocks.extend(activations[step, group] for group in range(groups))
-        blocks.extend(padding for _ in range(_STEP_TILES - 1 - groups))
-        blocks.append(weights[step])
-    return np.concatenate([as_bf16_words(values=block).ravel() for block in blocks])
-
-
 def gelu_lut_reference(words: NDArray[np.uint32]) -> NDArray[np.uint32]:
     """Models the SFU's direct GELU table over a vector of BF16 container words.
 
@@ -257,25 +121,37 @@ def gelu_lut_reference(words: NDArray[np.uint32]) -> NDArray[np.uint32]:
     return np.where((operand & 0x7FFF_FFFF) == 0, 0, result).astype("<u4")
 
 
+def _padded_columns(values: NDArray[np.float32]) -> NDArray[np.float32]:
+    """Returns the array with its last dimension padded with zeros to a whole number of `_TILE`-wide tiles, which is the
+    extent an image covers along an axis a kernel masks."""
+    short = -values.shape[-1] % _TILE
+    if not short:
+        return values
+    return np.pad(values, [(0, 0)] * (values.ndim - 1) + [(0, short)])
+
+
 def pack_activations(activations: NDArray[np.float32]) -> NDArray[np.uint16]:
     """Lays an activation array out in the order the looped kernel visits it.
 
     Args:
-        activations: The left operand, whose rows are tokens and columns the contraction.
+        activations: The left operand, whose rows are tokens and columns the contraction, the columns padded with
+            zeros to whole tiles.
 
     Returns:
         The BF16 words of every step, ordered contraction block outermost and step innermost.
 
     Raises:
-        ValueError: If a dimension is not a whole number of blocks.
+        ValueError: If the rows are not a whole number of token groups.
     """
-    tokens, depth = activations.shape
-    if tokens % _TILE or depth % _BLOCK_DEPTH:
+    tokens = activations.shape[0]
+    if tokens % _TILE:
         message = (
-            f"Unable to pack an activation array of shape [{tokens},{depth}]. Its rows must be a whole number "
-            f"of the {_TILE} a token group holds and its columns a whole number of {_BLOCK_DEPTH}."
+            f"Unable to pack an activation array of shape {list(activations.shape)}. Its rows must be a whole "
+            f"number of the {_TILE} a token group holds."
         )
         raise ValueError(message)
+    activations = _padded_columns(values=activations)
+    depth = activations.shape[1]
     words = as_bf16_words(values=activations)
     return np.ascontiguousarray(words.reshape(tokens, depth // _TILE, _TILE).transpose(1, 0, 2)).reshape(-1)
 
@@ -284,20 +160,18 @@ def pack_bias(bias: NDArray[np.float32]) -> NDArray[np.uint16]:
     """Lays a bias row out in the order a stride-one broadcast read visits it.
 
     Args:
-        bias: One value per feature, a whole number of `_NUM_LANES`-wide tiles.
+        bias: One value per feature, padded with zeros to whole `_NUM_LANES`-wide tiles.
 
     Returns:
         The BF16 words, each feature tile repeated `_NUM_SUBLANES` times.
 
     Raises:
-        ValueError: If it is not one row of whole tiles.
+        ValueError: If it is not one row.
     """
-    if bias.ndim != 1 or bias.size % _NUM_LANES:
-        message = (
-            f"Unable to pack a bias of shape {bias.shape}. It must be one row of whole {_NUM_LANES}-lane tiles."
-        )
+    if bias.ndim != 1:
+        message = f"Unable to pack a bias of shape {bias.shape}. It must be one row."
         raise ValueError(message)
-    tiles = as_bf16_words(values=bias).reshape(-1, _NUM_LANES)
+    tiles = as_bf16_words(values=_padded_columns(values=bias)).reshape(-1, _NUM_LANES)
     return np.ascontiguousarray(np.repeat(tiles, _NUM_SUBLANES, axis=0)).reshape(-1)
 
 
@@ -305,99 +179,17 @@ def pack_weights(weights: NDArray[np.float32]) -> NDArray[np.uint16]:
     """Lays a weight matrix out in the order the looped kernel visits it.
 
     Args:
-        weights: The right operand, whose rows are the contraction and columns the output features.
+        weights: The right operand, whose rows are the contraction and columns the output features, both padded with
+            zeros to whole tiles.
 
     Returns:
-        The BF16 words of every block, ordered output tile outermost and contraction block innermost.
-
-    Raises:
-        ValueError: If a dimension is not a whole number of blocks.
+        The BF16 words of every column tile, each tile's contraction rows in order.
     """
+    weights = _padded_columns(values=_padded_columns(values=weights).T).T
     depth, columns = weights.shape
-    if depth % _BLOCK_DEPTH or columns % _TILE:
-        message = (
-            f"Unable to pack a weight matrix of shape [{depth},{columns}]. Both dimensions must be a whole "
-            f"number of the {_BLOCK_DEPTH}x{_TILE} block one group stages."
-        )
-        raise ValueError(message)
     words = as_bf16_words(values=weights)
-    ordered = words.reshape(depth // _BLOCK_DEPTH, _BLOCK_DEPTH, columns // _TILE, _TILE).transpose(2, 0, 1, 3)
+    ordered = words.reshape(depth, columns // _TILE, _TILE).transpose(1, 0, 2)
     return np.ascontiguousarray(ordered).reshape(-1)
-
-def staged_maximum(stated: float) -> float:
-    """Returns the value a running maximum enters below, bounded where the kernel states no finite one.
-
-    The exponential table covers a finite range, so a maximum entering at negative infinity leaves a difference
-    the table cannot be indexed by. Any value every score clears rescales the first block by zero just as well.
-
-    Args:
-        stated: The value the kernel enters its running maximum at.
-
-    Returns:
-        The value a host stages.
-    """
-    return stated if math.isfinite(stated) else _ENTERING_MAXIMUM
-
-
-def pack_attention(query: NDArray[np.float32], key: NDArray[np.float32], value: NDArray[np.float32], *,
-                   initial_maximum: float, constants: tuple[float, ...] = (),
-                   masks: NDArray[np.float32] | None = None) -> tuple[NDArray[np.uint16], NDArray[np.uint16]]:
-    """Lays one attention block's operands out in the order its image visits them.
-
-    Args:
-        query: The block's queries, whose rows are tokens and columns the head.
-        key: Every key the block attends over, laid out as the queries are.
-        value: Every value the block attends over, laid out as the queries are.
-        initial_maximum: Value the running maximum enters below, which every score clears.
-        constants: Numbers the kernel states, a tile of each riding the queries' own staging.
-        masks: The tile added to the scores of each pair of a query block and a key block, shaped [query blocks,
-            key blocks, queries, keys], or None for an unmasked kernel.
-
-    Returns:
-        The query words of each block followed by the initial maximum, the zeros that block clears from, a tile
-        of every stated number and its mask tiles, and the key and value words, each key block's transposed keys
-        ahead of its values.
-
-    Raises:
-        ValueError: If a dimension is not a whole number of tiles, or if the three operands disagree on the head
-            or the keys on their count.
-    """
-    queries, head = query.shape
-    if queries % _TILE or head % _TILE:
-        message = (
-            f"Unable to pack a query block of shape [{queries},{head}]. Both dimensions must be a whole number "
-            f"of the {_TILE} wide tiles the array computes."
-        )
-        raise ValueError(message)
-    if key.shape != value.shape or key.shape[1] != head:
-        message = (
-            f"Unable to pack keys of shape {key.shape} against values of shape {value.shape} and a head of "
-            f"{head}. The keys and the values cover the same positions of the same head."
-        )
-        raise ValueError(message)
-    if key.shape[0] % _TILE:
-        message = (
-            f"Unable to pack {key.shape[0]} keys. The loop walks them a tile at a time, so they are a whole "
-            f"number of {_TILE}."
-        )
-        raise ValueError(message)
-
-    # One launch stages the queries of its own block, so each block carries the tiles it enters the loop from and
-    # a host reaches the next by advancing one block's worth of rows.
-    entered = _attention_constants(blocks=queries // _TILE, initial_maximum=initial_maximum, constants=constants,
-                                   masks=masks)
-    staged = np.concatenate([piece for block in range(queries // _TILE)
-                             for piece in (_by_tile(query[block * _TILE: (block + 1) * _TILE]), entered[block])],
-                            axis=0)
-
-    blocks: list[NDArray[np.float32]] = []
-    for block in range(key.shape[0] // _TILE):
-        rows = slice(block * _TILE, (block + 1) * _TILE)
-        # The array wants the keys transposed, its stationary operand being the contraction by the keys.
-        blocks.append(np.concatenate([key[rows, tile * _TILE: (tile + 1) * _TILE].T
-                                      for tile in range(head // _TILE)], axis=0))
-        blocks.append(_by_tile(value[rows]))
-    return as_bf16_words(values=staged), as_bf16_words(values=np.concatenate(blocks, axis=0))
 
 
 def decode_mask_tiles(*, keys: int, length: int) -> NDArray[np.float32]:
@@ -569,31 +361,6 @@ def build_operands(
     return left, right
 
 
-def _require_norm_operands(*, width: int, **operands: NDArray[np.float32]) -> None:
-    """Rejects a normalisation operand that is not exactly one row of `width` features.
-
-    Args:
-        width: Features one normalised row covers.
-        operands: The per-feature vectors to check, named for the message.
-
-    Raises:
-        ValueError: If the width is not a whole number of VREGs, or an operand disagrees with it.
-    """
-    if width <= 0 or width % _VREG_ELEMENTS:
-        message = (
-            f"Unable to normalise a row of {width} features. The reductions are per VREG, so a row is a whole "
-            f"number of {_VREG_ELEMENTS}."
-        )
-        raise ValueError(message)
-    for name, values in operands.items():
-        if values.ndim != 1 or values.size != width:
-            message = (
-                f"Unable to use {name} of shape {values.shape} at width {width}. It must be exactly one row of "
-                f"{width} features."
-            )
-            raise ValueError(message)
-
-
 def _attention_constants(*, blocks: int, initial_maximum: float, constants: tuple[float, ...],
                          masks: NDArray[np.float32] | None) -> list[NDArray[np.float32]]:
     """Returns the tiles each query block enters its key loop from, in the order it stages them."""
@@ -602,20 +369,6 @@ def _attention_constants(*, blocks: int, initial_maximum: float, constants: tupl
     stated = [np.full((_TILE, _NUM_LANES), number, dtype=np.float32) for number in constants]
     return [np.concatenate([initial, cleared, *stated, *(() if masks is None else masks[block])], axis=0)
             for block in range(blocks)]
-
-
-def _by_tile(matrix: NDArray[np.float32]) -> NDArray[np.float32]:
-    """Returns one operand as the tiles an image stages, each tile a run of `_TILE` rows.
-
-    Args:
-        matrix: The operand, whose columns are a whole number of tiles.
-
-    Returns:
-        The stacked tiles.
-    """
-    width = matrix.shape[1]
-    return np.concatenate([matrix[:, tile * _TILE: (tile + 1) * _TILE]
-                           for tile in range(width // _TILE)], axis=0)
 
 
 def _reordered(rng: np.random.Generator, count: int) -> NDArray[np.intp] | None:
@@ -637,27 +390,6 @@ def _reordered(rng: np.random.Generator, count: int) -> NDArray[np.intp] | None:
     while np.array_equal(order, identity):
         order = rng.permutation(count)
     return order
-
-
-def _single_launch_operands() -> (
-    tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32], NDArray[np.uint16]]
-):
-    """Builds the operands every single-launch check shares.
-
-    Returns:
-        The activation tiles, the weight tiles, the product a host reference computes from them, and the packed
-        VMEM image one launch takes.
-    """
-    activations = np.zeros((_STEPS, _TOKEN_GROUPS, _TILE, _TILE), dtype=np.float32)
-    for step in range(_STEPS):
-        for group in range(_TOKEN_GROUPS):
-            for row in range(_TILE):
-                activations[step, group, row, : (row + 4 * group + 8 * step) % _TILE + 1] = 1.0
-    weights = np.full((_STEPS, _TILE, _TILE), 1.0 / 16.0, dtype=np.float32)
-    expected = np.stack(
-        [sum(activations[step, group] @ weights[step] for step in range(_STEPS)) for group in range(_TOKEN_GROUPS)]
-    )
-    return activations, weights, expected, pack_gemm_input(activations=activations, weights=weights)
 
 
 def _gelu_table() -> NDArray[np.uint16]:

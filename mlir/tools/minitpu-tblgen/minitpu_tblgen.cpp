@@ -1,12 +1,12 @@
 /**
  * @file
  *
- * @brief Provides minitpu-tblgen, the TableGen driver carrying the MiniTPU's own backends over codegen/minitpuisa.td.
+ * @brief Provides minitpu-tblgen, the TableGen driver carrying the MiniTPU's own backends over minitpuisa/isa.td.
  *
  * -gen-minitpu-sched writes the scheduling facts every pass prices bundles against: each mnemonic's slot, opcode,
  * writeback window, register roles and read-port claim, each matrix command's occupancy and result latency, every
  * hardware capacity, and every issue distance no register dependence carries. The output is a self-contained header, so
- * a fact moves in codegen/minitpuisa.td alone.
+ * a fact moves in minitpuisa/isa.td alone.
  */
 
 #include <llvm/ADT/StringExtras.h>
@@ -79,22 +79,21 @@ namespace
             mnemonic_count += group->getValueAsListOfStrings("mnemonics").size();
         }
 
-        output
-            << "    /// Stores the most register roles one operation reads.\n"
-            << "    static constexpr size_t kMaxRegisterReads = " << widest_reads << ";\n\n"
-            << "    /// Stores the scheduling facts of one mnemonic.\n"
-            << "    struct OperationFacts\n    {\n"
-            << "        std::string_view mnemonic;  ///< The mnemonic.\n"
-            << "        kSlot slot;  ///< The bundle slot the operation issues in.\n"
-            << "        int32_t opcode;  ///< The opcode, or -1 for the groups the store bit separates.\n"
-            << "        int32_t writeback_first;  ///< The first cycle the write port is reserved, or -1.\n"
-            << "        int32_t writeback_last;  ///< The last cycle the write port is reserved, or -1.\n"
-            << "        std::array<std::string_view, kMaxRegisterReads> register_reads;  ///< The roles read.\n"
-            << "        std::string_view register_write;  ///< The role written, or empty.\n"
-            << "        bool claims_read_port_a;  ///< Determines whether the operation claims read port A.\n"
-            << "    };\n\n"
-            << "    /// Stores every mnemonic's scheduling facts, in the order codegen/minitpuisa.td publishes them.\n"
-            << "    static constexpr std::array<OperationFacts, " << mnemonic_count << "> kOperations {{\n";
+        output << "    /// Stores the most register roles one operation reads.\n"
+               << "    static constexpr size_t kMaxRegisterReads = " << widest_reads << ";\n\n"
+               << "    /// Stores the scheduling facts of one mnemonic.\n"
+               << "    struct OperationFacts\n    {\n"
+               << "        std::string_view mnemonic;  ///< The mnemonic.\n"
+               << "        kSlot slot;  ///< The bundle slot the operation issues in.\n"
+               << "        int32_t opcode;  ///< The opcode, or -1 for the groups the store bit separates.\n"
+               << "        int32_t writeback_first;  ///< The first cycle the write port is reserved, or -1.\n"
+               << "        int32_t writeback_last;  ///< The last cycle the write port is reserved, or -1.\n"
+               << "        std::array<std::string_view, kMaxRegisterReads> register_reads;  ///< The roles read.\n"
+               << "        std::string_view register_write;  ///< The role written, or empty.\n"
+               << "        bool claims_read_port_a;  ///< Determines whether the operation claims read port A.\n"
+               << "    };\n\n"
+               << "    /// Stores every mnemonic's scheduling facts, in the order minitpuisa/isa.td publishes them.\n"
+               << "    static constexpr std::array<OperationFacts, " << mnemonic_count << "> kOperations {{\n";
 
         for (const Record* group : groups)
         {
@@ -187,10 +186,10 @@ namespace
                << "        return nullptr;\n    }\n";
     }
 
-    /// Writes every scheduling fact codegen/minitpuisa.td publishes as one self-contained C++ header.
+    /// Writes every scheduling fact minitpuisa/isa.td publishes as one self-contained C++ header.
     void EmitSchedule(const RecordKeeper& records, raw_ostream& output)
     {
-        llvm::emitSourceFileHeader("MiniTPU scheduling facts, from codegen/minitpuisa.td", output, records);
+        llvm::emitSourceFileHeader("MiniTPU scheduling facts, from minitpuisa/isa.td", output, records);
         const Record& order = FindEmissionOrder(records);
         output << "#include <array>\n#include <cstdint>\n#include <string_view>\n\n"
                << "#include \"minitpu/minitpuisa/encoding.h\"\n\n"

@@ -1,10 +1,11 @@
 /**
  * @file
  *
- * @brief Implements the minitpuisa scheduler, which fills every bundle's delay from the latencies codegen/minitpuisa.td
+ * @brief Implements the minitpuisa scheduler, which fills every bundle's delay from the latencies minitpuisa/isa.td
  * publishes.
  *
- * @note The timeline matches codegen/asm.py's schedule() bundle for bundle, over the traffic traffic.h models.
+ * @note The timeline matches the retired Python assembler's schedule() bundle for bundle, over the traffic traffic.h
+ * models, which the recorded streams under test/Inputs/schedule hold it to.
  */
 
 #include <llvm/ADT/DenseSet.h>
@@ -116,7 +117,7 @@ namespace
             }
         }
 
-        // Counts the results outstanding in each lane's MXU output FIFO, in program order, as asm.py does.
+        // Counts the results outstanding in each lane's MXU output FIFO, in program order.
         int64_t outstanding = 0;
         for (StreamEntry& entry : stream)
         {

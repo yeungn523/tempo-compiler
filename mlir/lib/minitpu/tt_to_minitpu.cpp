@@ -8,8 +8,9 @@
  * host's and the tile op covers one block. Each loop is identified by what it walks, the rows or the columns of an
  * operand, since the canonicalizer folds away a loop the kernel's shape gives one iteration. Every address the kernel
  * computes is resolved into an affine form over the tensor's indices and the enclosing loops' counters, and is held to
- * the dense row-major layout the host packs each operand from. A kernel the conversion does not recognise, or one that
- * addresses an operand any other way, is refused with a diagnostic naming what differs.
+ * the dense row-major layout the host packs each operand from. A product's masks state its extents, past which the host
+ * pads its operands with zeros to the whole tiles the tile op covers. A kernel the conversion does not recognise, or one
+ * that addresses an operand any other way, is refused with a diagnostic naming what differs.
  */
 
 #include <llvm/ADT/StringExtras.h>
@@ -99,6 +100,13 @@ namespace
         Value counter;      ///< The loop's counter.
         int64_t upper = 0;  ///< The bound its counter stops before.
         int64_t step  = 0;  ///< The amount its counter advances per iteration.
+
+        /// Returns the extent its iterations cover, past its bound when the last iteration overruns it.
+        [[nodiscard]]
+        int64_t Covered() const
+        {
+            return (upper + step - 1) / step * step;
+        }
     };
 
     /// Returns `value`'s tensor rank, zero for a scalar.
@@ -127,14 +135,16 @@ namespace
      * @brief Resolves `operation`'s bounds, holding them to constants that start at zero and step evenly to the end.
      *
      * @param operation the loop.
+     * @param ragged determines whether the last iteration may overrun the bound, which a kernel masking the overrun
+     * reads as the padding the host lays out.
      * @returns the bounds, or failure with a diagnostic on the loop.
      */
-    FailureOr<Loop> Bounds(scf::ForOp operation)
+    FailureOr<Loop> Bounds(scf::ForOp operation, const bool ragged = false)
     {
         const std::optional<int64_t> lower = getConstantIntValue(operation.getLowerBound());
         const std::optional<int64_t> upper = getConstantIntValue(operation.getUpperBound());
         const std::optional<int64_t> step  = getConstantIntValue(operation.getStep());
-        if (!lower || !upper || !step || *lower != 0 || *step <= 0 || *upper % *step != 0)
+        if (!lower || !upper || !step || *lower != 0 || *step <= 0 || (!ragged && *upper % *step != 0))
         {
             return operation.emitError()
                 << "is a loop the conversion is unable to read. Each loop must run from 0 to a "
@@ -142,6 +152,25 @@ namespace
                 << "image covers.";
         }
         return Loop {.op = operation, .counter = operation.getInductionVar(), .upper = *upper, .step = *step};
+    }
+
+    /// Returns the sum of two forms of one rank, based on whichever pointer either is based on.
+    Affine Added(Affine left, const Affine& right)
+    {
+        left.base = left.base ? left.base : right.base;
+        left.constant += right.constant;
+        for (const auto [dimension, stride] : llvm::enumerate(right.strides)) left.strides[dimension] += stride;
+        for (const auto& [counter, step] : right.counters) left.AddStep(counter, step);
+        return left;
+    }
+
+    /// Returns `form` negated, which must be based on no pointer.
+    Affine Negated(Affine form)
+    {
+        form.constant = -form.constant;
+        for (int64_t& stride : form.strides) stride = -stride;
+        for (auto& [counter, step] : form.counters) step = -step;
+        return form;
     }
 
     /// Resolves the addresses and offsets a kernel computes into affine forms.
@@ -181,12 +210,7 @@ namespace
             {
                 return operation->emitError() << "adds two pointers, which no address the conversion reads does.";
             }
-            Affine sum   = left;
-            sum.base     = left.base ? left.base : right.base;
-            sum.constant = left.constant + right.constant;
-            for (const auto [dimension, stride] : llvm::enumerate(right.strides)) sum.strides[dimension] += stride;
-            for (const auto& [counter, step] : right.counters) sum.AddStep(counter, step);
-            return sum;
+            return Added(left, right);
         }
 
         /// Returns whether `form` is a constant alone.
@@ -209,7 +233,7 @@ namespace
                                         << "each iteration, which the conversion is unable to follow.";
             }
             const FailureOr<Affine> delta = Of(advance.getOffset());
-            const FailureOr<Loop> bounds  = Bounds(loop);
+            const FailureOr<Loop> bounds  = Bounds(loop, true);
             if (failed(delta) || failed(bounds)) return failure();
             if (!IsConstant(*delta) || delta->constant % bounds->step != 0)
             {
@@ -290,6 +314,17 @@ namespace
                 if (failed(left) || failed(right)) return failure();
                 return Sum(operation, *left, *right);
             }
+            if (auto difference = dyn_cast<arith::SubIOp>(operation))
+            {
+                const FailureOr<Affine> left  = Of(difference.getLhs());
+                const FailureOr<Affine> right = Of(difference.getRhs());
+                if (failed(left) || failed(right)) return failure();
+                if (right->base)
+                {
+                    return operation->emitError() << "subtracts a pointer, which no address the conversion reads does.";
+                }
+                return Sum(operation, *left, Negated(*right));
+            }
             if (auto product = dyn_cast<arith::MulIOp>(operation))
             {
                 FailureOr<Affine> left  = Of(product.getLhs());
@@ -358,15 +393,23 @@ namespace
         return widened ? widened.getIn() : value;
     }
 
-    /// Returns the unmasked load defining `value`, or a null op.
-    tt::LoadOp Load(Value value)
+    /**
+     * @brief Returns the load defining `value`, or a null op.
+     *
+     * @param value the loaded value.
+     * @param masked determines whether a masked load filling what it masks with zero is accepted, the zeros being the
+     * padding the host lays out past the operand's extent.
+     */
+    tt::LoadOp Load(Value value, const bool masked = false)
     {
         auto load = value ? value.getDefiningOp<tt::LoadOp>() : tt::LoadOp {};
-        return load && !load.getMask() ? load : tt::LoadOp {};
+        if (!load || !load.getMask()) return load;
+        return masked && load.getOther() && IsFloat(load.getOther(), 0.0) ? load : tt::LoadOp {};
     }
 
-    /// Returns the load the exact GELU in `value` activates, or a null op when `value` is no GELU of a widened load.
-    tt::LoadOp Gelu(Value value)
+    /// Returns the load the exact GELU in `value` activates, or a null op when `value` is no GELU of a widened load,
+    /// accepting a masked load when `masked` is set.
+    tt::LoadOp Gelu(Value value, const bool masked = false)
     {
         auto narrowed = value.getDefiningOp<arith::TruncFOp>();
         if (!narrowed) return {};
@@ -381,7 +424,7 @@ namespace
                     if (!erf || !IsFloat(one, 1.0)) continue;
                     auto quotient = erf.getOperand().getDefiningOp<arith::DivFOp>();
                     if (!quotient || quotient.getLhs() != argument || !IsFloat(quotient.getRhs(), kRootTwo)) continue;
-                    if (auto load = Load(Narrow(argument)); load && Narrow(argument) != argument) return load;
+                    if (auto load = Load(Narrow(argument), masked); load && Narrow(argument) != argument) return load;
                 }
             }
         }
@@ -433,6 +476,12 @@ namespace
         std::optional<Loop> rows;     ///< The loop advancing the operand one row per unit of its counter.
         std::optional<Loop> columns;  ///< The loop advancing the operand one column per unit of its counter.
     };
+
+    /// Returns `extent` rounded up to a whole number of tiles, the extent the host pads an operand to.
+    int64_t RoundUp(const int64_t extent)
+    {
+        return (extent + tile::kTile - 1) / tile::kTile * tile::kTile;
+    }
 
     /// Returns whether two optional loops are the same loop or both absent.
     bool Same(const std::optional<Loop>& left, const std::optional<Loop>& right)
@@ -506,8 +555,10 @@ namespace
         /// Stores the addresses resolved so far.
         AddressAnalysis _addresses;
 
-        /// Returns the loops enclosing `operation`, innermost first, below `scope` or else the kernel.
-        FailureOr<SmallVector<Loop>> Enclosing(Operation* operation, Operation* scope = nullptr)
+        /// Returns the loops enclosing `operation`, innermost first, below `scope` or else the kernel, accepting loops
+        /// whose last iteration overruns their bound when `ragged` is set.
+        FailureOr<SmallVector<Loop>>
+        Enclosing(Operation* operation, Operation* scope = nullptr, const bool ragged = false)
         {
             SmallVector<Loop> loops;
             for (Operation* parent = operation->getParentOp(); parent && parent != scope && parent != _function;
@@ -519,7 +570,7 @@ namespace
                     return parent->emitError() << "is control flow the conversion is unable to read. A kernel's "
                                                << "tiles may sit only in counted scf.for loops.";
                 }
-                const FailureOr<Loop> bounds = Bounds(loop);
+                const FailureOr<Loop> bounds = Bounds(loop, ragged);
                 if (failed(bounds)) return failure();
                 loops.push_back(*bounds);
             }
@@ -625,6 +676,160 @@ namespace
             return ArgOp::create(builder, _function.getLoc(), builder.getI32Type(), index).getResult();
         }
 
+        /// Stores the bound each dimension of an access's tensor is masked under, absent where its mask bounds none.
+        using Extents = SmallVector<std::optional<int64_t>, 2>;
+
+        /**
+         * @brief Reads the bound one comparison in a mask holds one dimension of the operand under.
+         *
+         * @param comparison the comparison.
+         * @param role the operand's name, as the diagnostic names it.
+         * @param address the operand's address.
+         * @param dimensions the dimension of the operand each dimension of the comparison's tensor stands for.
+         * @returns the operand's dimension and the bound its index, plus the counters walking it, stays below.
+         */
+        FailureOr<std::pair<int64_t, int64_t>>
+        Comparison(arith::CmpIOp comparison, StringRef role, const Affine& address, ArrayRef<int64_t> dimensions)
+        {
+            using arith::CmpIPredicate;
+            const CmpIPredicate predicate = comparison.getPredicate();
+            const bool flipped            = predicate == CmpIPredicate::sgt || predicate == CmpIPredicate::ugt ||
+                                 predicate == CmpIPredicate::sge || predicate == CmpIPredicate::uge;
+            const bool inclusive = predicate == CmpIPredicate::sle || predicate == CmpIPredicate::ule ||
+                                   predicate == CmpIPredicate::sge || predicate == CmpIPredicate::uge;
+            const bool ordered          = predicate != CmpIPredicate::eq && predicate != CmpIPredicate::ne;
+            const FailureOr<Affine> lhs = _addresses.Of(comparison.getLhs());
+            const FailureOr<Affine> rhs = _addresses.Of(comparison.getRhs());
+            if (failed(lhs) || failed(rhs)) return failure();
+
+            // Reads `index < bound` as `index - bound < 0`, the difference walking exactly one dimension by one.
+            const Affine difference = flipped ? Added(*rhs, Negated(*lhs)) : Added(*lhs, Negated(*rhs));
+            int64_t walked          = -1;
+            for (const auto [dimension, stride] : llvm::enumerate(difference.strides))
+            {
+                if (stride == 0) continue;
+                walked = stride == 1 && walked < 0 ? static_cast<int64_t>(dimension) : -2;
+            }
+            const int64_t operand_dimension = walked >= 0 ? dimensions[walked] : -1;
+
+            // Holds the mask to the counters walking the operand along that dimension, so it bounds the whole operand.
+            bool aligned = ordered && !lhs->base && !rhs->base && operand_dimension >= 0;
+            for (const Affine* form : {&difference, &address})
+            {
+                for (const auto& [counter, step] : form->counters)
+                {
+                    if (!aligned) break;
+                    const int64_t stride = address.strides[operand_dimension];
+                    const bool walks     = stride != 0 && address.Step(counter) == stride;
+                    aligned              = difference.Step(counter) == (walks ? 1 : 0);
+                }
+            }
+            if (!aligned)
+            {
+                return comparison.emitError()
+                    << "masks the " << role << " in a way the conversion is unable to read. Each comparison must hold "
+                    << "one index, plus the loop counters walking the operand along it, below a constant, which is the "
+                    << "operand's extent the host pads past with zeros.";
+            }
+            return std::pair {operand_dimension, -difference.constant + (inclusive ? 1 : 0)};
+        }
+
+        /**
+         * @brief Reads the bound `mask` holds each dimension of the operand `pointer` addresses under.
+         *
+         * @param access the load or store the mask guards.
+         * @param role the operand's name, as the diagnostic names it.
+         * @param pointer the address.
+         * @param mask the mask, or null for an unmasked access.
+         * @returns the bound of each dimension, absent where the mask bounds none, or failure with a diagnostic.
+         */
+        FailureOr<Extents> Masked(Operation* access, StringRef role, Value pointer, Value mask)
+        {
+            Extents extents(Rank(pointer));
+            if (!mask) return extents;
+            const FailureOr<Affine> address = _addresses.Of(pointer);
+            if (failed(address)) return failure();
+
+            // Walks the conjunction, tracking which of the operand's dimensions each term's dimensions stand for.
+            auto identity = llvm::to_vector(llvm::seq<int64_t>(0, Rank(pointer)));
+            SmallVector<std::pair<Value, SmallVector<int64_t>>> pending {
+                {mask, identity}
+            };
+            while (!pending.empty())
+            {
+                auto [term, dimensions] = pending.pop_back_val();
+                if (auto conjunction = term.getDefiningOp<arith::AndIOp>())
+                {
+                    pending.emplace_back(conjunction.getLhs(), dimensions);
+                    pending.emplace_back(conjunction.getRhs(), dimensions);
+                    continue;
+                }
+                if (auto broadcast = term.getDefiningOp<tt::BroadcastOp>())
+                {
+                    pending.emplace_back(broadcast.getSrc(), dimensions);
+                    continue;
+                }
+                if (auto expand = term.getDefiningOp<tt::ExpandDimsOp>())
+                {
+                    dimensions.erase(dimensions.begin() + expand.getAxis());
+                    pending.emplace_back(expand.getSrc(), dimensions);
+                    continue;
+                }
+                if (matchPattern(term, m_One())) continue;
+                auto comparison = term.getDefiningOp<arith::CmpIOp>();
+                if (!comparison)
+                {
+                    return access->emitError() << "masks the " << role << " with something other than comparisons "
+                                               << "joined by and, which the conversion is unable to read.";
+                }
+                const FailureOr<std::pair<int64_t, int64_t>> bound = Comparison(comparison, role, *address, dimensions);
+                if (failed(bound)) return failure();
+                std::optional<int64_t>& extent = extents[bound->first];
+                extent                         = extent ? std::min(*extent, bound->second) : bound->second;
+            }
+            return extents;
+        }
+
+        /**
+         * @brief Resolves the extent a product covers along one axis from its loop or tile and the masks bounding it.
+         *
+         * @param product the dot product, which carries the diagnostic.
+         * @param axis the axis's name, as the diagnostic names it.
+         * @param loop the loop walking the axis, or nullopt when the tile covers it in one step.
+         * @param tile the tile's extent along the axis.
+         * @param masks the bound each access's mask holds the axis under, absent where it holds none.
+         * @returns the extent, or failure with a diagnostic when the masks disagree or a loop overruns its bound
+         * unmasked.
+         */
+        static FailureOr<int64_t> Extent(
+            tt::DotOp product,
+            StringRef axis,
+            const std::optional<Loop>& loop,
+            const int64_t tile,
+            ArrayRef<std::optional<int64_t>> masks
+        )
+        {
+            const int64_t stated  = loop ? loop->upper : tile;
+            const int64_t covered = loop ? loop->Covered() : tile;
+            std::optional<int64_t> masked;
+            for (const std::optional<int64_t>& bound : masks)
+            {
+                if (!bound) continue;
+                if ((masked && *masked != *bound) || *bound <= 0)
+                {
+                    return product.emitError() << "is unable to be read as a matrix product: the masks bounding its "
+                                               << axis << " must agree on one positive extent.";
+                }
+                masked = bound;
+            }
+            if (!masked && stated != covered)
+            {
+                return product.emitError() << "is unable to be read as a matrix product: a loop overrunning its bound "
+                                           << "along the " << axis << " must mask the overrun.";
+            }
+            return masked ? std::min(*masked, stated) : stated;
+        }
+
         /// Refuses the kernel with `message`, naming the family it was read as.
         static LogicalResult Refuse(Operation* operation, StringRef family, StringRef message)
         {
@@ -643,22 +848,22 @@ namespace
         LogicalResult ConvertMatmul(tt::DotOp product, tt::StoreOp store)
         {
             constexpr StringRef kFamily = "matrix product";
-            const bool activate         = static_cast<bool>(Gelu(product.getA()));
-            tt::LoadOp activation       = activate ? Gelu(product.getA()) : Load(product.getA());
-            tt::LoadOp weight           = Load(product.getB());
-            if (!activation || !weight || store.getMask())
+            const bool activate         = static_cast<bool>(Gelu(product.getA(), true));
+            tt::LoadOp activation       = activate ? Gelu(product.getA(), true) : Load(product.getA(), true);
+            tt::LoadOp weight           = Load(product.getB(), true);
+            if (!activation || !weight)
             {
                 return Refuse(
                     product,
                     kFamily,
-                    "both operands must be unmasked loads, the left one optionally through the exact GELU, "
-                    "and the store must be unmasked."
+                    "both operands must be loads, masked ones filling with zero, the left one optionally through "
+                    "the exact GELU."
                 );
             }
 
             // Finds each loop by what it walks: the token blocks walk the activations' rows, the contraction their
             // columns and the weights' rows, and the column loop the weights' columns.
-            const FailureOr<SmallVector<Loop>> loops = Enclosing(product);
+            const FailureOr<SmallVector<Loop>> loops = Enclosing(product, nullptr, true);
             if (failed(loops)) return failure();
             const FailureOr<Walk> left  = Classify(activation, "activations", activation.getPtr(), *loops);
             const FailureOr<Walk> right = Classify(weight, "weights", weight.getPtr(), *loops);
@@ -695,7 +900,7 @@ namespace
                 result = loop.getResult(carried.getArgNumber() - first);
             }
             tt::LoadOp bias;
-            if (!IsFloat(start, 0.0)) bias = Load(Narrow(Broadcasted(start, kTokenAxis)));
+            if (!IsFloat(start, 0.0)) bias = Load(Narrow(Broadcasted(start, kTokenAxis)), true);
             if (!IsFloat(start, 0.0) && !bias)
             {
                 return Refuse(product, kFamily, "its accumulator must start from zero or from a broadcast bias row.");
@@ -707,7 +912,7 @@ namespace
             {
                 for (const auto& [total, row] : Orders<arith::AddFOp>(stored))
                 {
-                    tt::LoadOp added = Load(Narrow(Broadcasted(row, kTokenAxis)));
+                    tt::LoadOp added = Load(Narrow(Broadcasted(row, kTokenAxis)), true);
                     if (total != result || !added) continue;
                     bias   = added;
                     stored = total;
@@ -715,11 +920,26 @@ namespace
             }
             if (stored != result) return Refuse(store, kFamily, "the kernel must store the accumulated product.");
 
+            // Reads each axis's extent from its loop or tile and the masks bounding it, the host padding the operands
+            // past it with zeros to the whole tiles the op covers.
+            const FailureOr<Extents> left_mask =
+                Masked(activation, "activations", activation.getPtr(), activation.getMask());
+            const FailureOr<Extents> right_mask = Masked(weight, "weights", weight.getPtr(), weight.getMask());
+            const FailureOr<Extents> drain_mask = Masked(store, "result", store.getPtr(), store.getMask());
+            const FailureOr<Extents> bias_mask =
+                bias ? Masked(bias, "bias", bias.getPtr(), bias.getMask()) : FailureOr<Extents>(Extents(1));
+            if (failed(left_mask) || failed(right_mask) || failed(drain_mask) || failed(bias_mask)) return failure();
             const ArrayRef<int64_t> tile = Shape(product.getA());
             const int64_t tokens         = tile[0];
-            const int64_t k              = contraction ? contraction->upper : tile[1];
-            const int64_t n              = columns ? columns->upper : Shape(product.getB())[1];
-            if ((contraction && contraction->step != tile[1]) || (columns && columns->step != Shape(product.getB())[1]))
+            const int64_t width          = Shape(product.getB())[1];
+            const FailureOr<int64_t> rows =
+                Extent(product, "tokens", block, tokens, {(*left_mask)[0], (*drain_mask)[0]});
+            const FailureOr<int64_t> k =
+                Extent(product, "contraction", contraction, tile[1], {(*left_mask)[1], (*right_mask)[0]});
+            const FailureOr<int64_t> n =
+                Extent(product, "columns", columns, width, {(*right_mask)[1], (*drain_mask)[1], (*bias_mask)[0]});
+            if (failed(rows) || failed(k) || failed(n)) return failure();
+            if ((contraction && contraction->step != tile[1]) || (columns && columns->step != width))
             {
                 return Refuse(
                     product,
@@ -742,19 +962,19 @@ namespace
             }
 
             SmallVector<Counter> reads;
-            AddCounter(reads, block, k);
+            AddCounter(reads, block, *k);
             AddCounter(reads, contraction, 1);
             SmallVector<Counter> weighs;
             AddCounter(weighs, columns, 1);
-            AddCounter(weighs, contraction, n);
+            AddCounter(weighs, contraction, *n);
             SmallVector<Counter> drains;
-            AddCounter(drains, block, n);
+            AddCounter(drains, block, *n);
             AddCounter(drains, columns, 1);
             SmallVector<Counter> biases;
             AddCounter(biases, columns, 1);
-            const FailureOr<Value> activations = Expect(activation, "activations", activation.getPtr(), {k, 1}, reads);
-            const FailureOr<Value> weights     = Expect(weight, "weights", weight.getPtr(), {n, 1}, weighs);
-            const FailureOr<Value> drain       = Expect(store, "result", store.getPtr(), {n, 1}, drains);
+            const FailureOr<Value> activations = Expect(activation, "activations", activation.getPtr(), {*k, 1}, reads);
+            const FailureOr<Value> weights     = Expect(weight, "weights", weight.getPtr(), {*n, 1}, weighs);
+            const FailureOr<Value> drain       = Expect(store, "result", store.getPtr(), {*n, 1}, drains);
             const FailureOr<Value> offsets =
                 bias ? Expect(bias, "bias", bias.getPtr(), {1}, biases) : FailureOr<Value>(Value {});
             if (failed(activations) || failed(weights) || failed(drain) || failed(offsets)) return failure();
@@ -782,8 +1002,8 @@ namespace
                 third,
                 fourth,
                 static_cast<uint32_t>(tokens),
-                static_cast<uint32_t>(k),
-                static_cast<uint32_t>(n),
+                static_cast<uint32_t>(RoundUp(*k)),
+                static_cast<uint32_t>(RoundUp(*n)),
                 activate
             );
             return success();

@@ -95,7 +95,7 @@ LogicalResult MinitpuDialect::verifyOperationAttribute(Operation* operation, con
     return success();
 }
 
-/// Verifies that the product's shape is one the lowering covers and that its staged rows fit one VMEM bank.
+/// Verifies that the product's shape is one the lowering covers and that its fixed buffers leave room for activations.
 LogicalResult MatmulOp::verify()
 {
     if (getTokens() != tile::kTokens)
@@ -103,19 +103,21 @@ LogicalResult MatmulOp::verify()
         return emitOpError() << "is unable to cover " << getTokens() << " tokens. One launch covers " << tile::kTokens
                              << ", whose pushes fill the MXU output FIFO exactly.";
     }
-    if (getDepth() % tile::kChunkRows != 0 || getColumns() % tile::kTile != 0)
+    if (getDepth() % tile::kTile != 0 || getColumns() % tile::kTile != 0)
     {
         return emitOpError() << "is unable to cover a depth of " << getDepth() << " by " << getColumns()
-                             << " columns. The depth must be a whole number of " << tile::kChunkRows
-                             << "-row weight chunks and the columns a whole number of " << tile::kTile
-                             << "-wide tiles.";
+                             << " columns. Both must be a whole number of " << tile::kTile
+                             << "-wide tiles, the host padding a narrower operand with zeros.";
     }
-    const uint32_t staged = tile::MatmulStagedRows(getDepth(), getColumns(), getBias() != nullptr);
-    if (staged > tile::kBankRows)
+
+    // Splits a contraction deeper than one bank holds into segments, so only the fixed buffers bound the width.
+    if (tile::MatmulSegmentLimit(getColumns(), getBias() != nullptr) == 0)
     {
-        return emitOpError() << "is unable to stage a depth of " << getDepth() << " by " << getColumns()
-                             << " columns. Its buffers take " << staged << " VMEM rows, where one bank holds "
-                             << tile::kBankRows << ".";
+        return emitOpError() << "is unable to stage " << getColumns()
+                             << " columns. Its bias row and weight chunks take "
+                             << tile::MatmulFixedRows(getColumns(), getBias() != nullptr)
+                             << " VMEM rows, leaving one bank of " << tile::kBankRows
+                             << " no room for a chunk of activations.";
     }
     return success();
 }

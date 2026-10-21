@@ -18,7 +18,7 @@ include "mlir/IR/OpBase.td"
 include "mlir/IR/RegionKindInterface.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
-include "codegen/minitpuisa.td"
+include "minitpu/minitpuisa/isa.td"
 
 /// @brief Provides the dialect a kernel is stated in before its registers, rows and timing are chosen.
 def Minitpu_Dialect : Dialect
@@ -77,7 +77,7 @@ class Minitpu_IndexIn<OpGroup group, string mnemonic>
 class Minitpu_Op<string mnemonic, list<Trait> traits = []> : Op<Minitpu_Dialect, mnemonic, traits>;
 
 /**
- * @brief Provides an operation the machine runs as the instruction of the same mnemonic, which codegen/minitpuisa.td
+ * @brief Provides an operation the machine runs as the instruction of the same mnemonic, which minitpuisa/isa.td
  * must name in `group`.
  *
  * @param group Names the operation group the instruction belongs to.
@@ -86,7 +86,7 @@ class Minitpu_Op<string mnemonic, list<Trait> traits = []> : Op<Minitpu_Dialect,
 class Minitpu_InstructionOp<OpGroup group, string mnemonic, list<Trait> traits = []> : Minitpu_Op<mnemonic, traits>
 {
     defvar index = Minitpu_IndexIn<group, mnemonic>.value;
-    assert !ge(index, 0), "codegen/minitpuisa.td's " # group.slot # " group names no '" # mnemonic # "'.";
+    assert !ge(index, 0), "minitpuisa/isa.td's " # group.slot # " group names no '" # mnemonic # "'.";
     let summary = "`" # mnemonic # "`";
     let description = group.issue_requirement;
 }
@@ -234,7 +234,9 @@ def Minitpu_AllocOp : Minitpu_Op<"alloc", [MemoryEffects<[MemAlloc]>]>
  * `[columns / 16][tokens][16]`, which is the layout board_package/bf16.py's pack_activations and pack_weights write and
  * the board runtime reads back. With activate set, the activations pass through the GELU before they enter the array.
  * With a bias, the product's columns each add one value, the bias packed as `[columns / 16][4][16]` as pack_bias writes
- * it, so the bias costs no launch of its own.
+ * it, so the bias costs no launch of its own. The depth and the columns are whole tiles, the host padding an operand
+ * a kernel masks with zeros up to them. A depth whose activations one VMEM bank does not hold is walked in segments,
+ * each resuming every column tile from the partial product the one before drained.
  */
 def Minitpu_MatmulOp : Minitpu_Op<"matmul", [MemoryEffects<[MemRead, MemWrite]>]>
 {

@@ -3,6 +3,8 @@
 Compiles GPT-2 small inference from Triton kernels into images for a systolic-array NPU whose RTL has no hardware
 interlocks.
 
+Summer' 26 @ Cornell CSL
+
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 ___

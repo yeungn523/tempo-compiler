@@ -1,8 +1,3 @@
-# Provides a C++ format based on the Google style guide and the Black formatter. This results in a visual style that is
-# largely similar between C++ and Python code, improving cross-language developer experience. Note, all contributors
-# should combine this formatter with the Google C++ / C style guide to be fully compatible with the project's style
-# format.
----
 BasedOnStyle: Google
 AccessModifierOffset: -2
 AlignAfterOpenBracket: BlockIndent

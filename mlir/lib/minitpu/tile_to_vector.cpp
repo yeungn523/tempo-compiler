@@ -259,9 +259,8 @@ namespace
      * @brief Builds one segment of a product's contraction: its activations staged, then every column tile's
      * accumulators carried through the segment's chunks and drained.
      *
-     * @details The first segment starts each column tile from the zero tile or the bias row. A later segment starts it
-     * from the partial product the segment before drained, read back on the slot the first chunk leaves free, so a
-     * contraction deeper than one bank holds costs one round trip of the output per segment and no host sum.
+     * @details The first segment starts from the zero tile or the bias row, a later one from the partial product the
+     * segment before drained.
      *
      * @param expansion the expansion building the segment.
      * @param product the product being expanded.
@@ -432,8 +431,8 @@ namespace
      * @brief Builds one chunk of a sum: the wait for its operands, the next chunk's prefetch, the additions and the
      * drain.
      *
-     * @details A broadcast sum loads on slot 0 and drains on slot 1, so the drain runs beside the next prefetch. A
-     * streamed sum loads its two operands on both slots and drains on slot 0 once the prefetch on it lands.
+     * @details A broadcast sum loads on slot 0 and drains on slot 1. A streamed sum loads on both slots and drains on
+     * slot 0 once the prefetch on it lands.
      *
      * @param expansion the expansion building the chunk.
      * @param buffers the sum's buffers.
@@ -830,12 +829,8 @@ namespace
     /**
      * @brief Builds one block of 16 keys attended by one block of 16 queries under the online softmax.
      *
-     * @details Everything a query block carries is held transposed, one query per lane: the scores, register r holding
-     * keys 4r through 4r + 3, come from pushing the keys against the transposed queries, and the output, register r
-     * of a tile holding head features 4r through 4r + 3, from pushing the transposed values against the probabilities.
-     * Each query's maximum and sum over the keys then combine across registers and sublanes rather than across lanes,
-     * and the rescale and the normalisation multiply by one register. Every trip through the array waits out its
-     * result latency, so the probabilities stay stationary for every value tile.
+     * @details The block is held transposed, one query per lane, so each query's maximum and sum combine across
+     * registers and sublanes rather than lanes. The probabilities stay stationary for every value tile.
      *
      * @param expansion the expansion building the block.
      * @param buffers the attention's buffers.
@@ -1386,10 +1381,8 @@ namespace
      * @brief Builds one token of a LayerNorm: the wait for its rows, the next token's prefetch, the normalisation and
      * the drain.
      *
-     * @details The token's rows land one per 16 features, so each register holds 64 of its features and vredsum, which
-     * sums a whole register, reduces over features alone. The mean and the variance each sum the token's registers as a
-     * tree before one vredsum, and the variance sums the centred values' squares, as the host reference does. Gamma and
-     * beta line up with the token's registers row for row.
+     * @details Each register holds 64 of the token's features, so the mean and the variance each sum the registers as
+     * a tree before one vredsum. The variance sums the centred squares, as the host reference does.
      *
      * @param expansion the expansion building the token.
      * @param buffers the LayerNorm's buffers and shared registers.

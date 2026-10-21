@@ -9,8 +9,8 @@
  * operand, since the canonicalizer folds away a loop the kernel's shape gives one iteration. Every address the kernel
  * computes is resolved into an affine form over the tensor's indices and the enclosing loops' counters, and is held to
  * the dense row-major layout the host packs each operand from. A product's masks state its extents, past which the host
- * pads its operands with zeros to the whole tiles the tile op covers. A kernel the conversion does not recognise, or one
- * that addresses an operand any other way, is refused with a diagnostic naming what differs.
+ * pads its operands with zeros to the whole tiles the tile op covers. A kernel the conversion does not recognise, or
+ * one that addresses an operand any other way, is refused with a diagnostic naming what differs.
  */
 
 #include <llvm/ADT/StringExtras.h>
@@ -1031,11 +1031,8 @@ namespace
         /**
          * @brief Converts a kernel attending one head under the online softmax into minitpu.attention.
          *
-         * @details The kernel reads one head's queries, keys and values as dense row-major [tokens, head] tensors and
-         * stores its output the same way, the scores masked causally or to a length. The image it converts into is
-         * the one the board launches: every head of the fused QKV tensor at once, each head's output written over
-         * its queries, the keys read from that tensor when causal and from the KV cache otherwise, and the masks
-         * read from the constants block the host writes.
+         * @details The result is the image the board launches: every head of the fused QKV tensor at once, each
+         * head's output written over its queries.
          *
          * @param scores the dot product of the queries and the transposed keys.
          * @param attended the dot product of the probabilities and the values, accumulating the output.

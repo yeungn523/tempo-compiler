@@ -30,7 +30,8 @@ namespace mlir::minitpu::isa
      *
      * @param program the program to write.
      * @param output the stream that receives the image.
-     * @returns success once every bundle is written.
+     * @returns success once every bundle is written, failure with a diagnostic when the program carries more bundles
+     * than IRAM holds.
      */
     LogicalResult ExportImage(ProgramOp program, llvm::raw_ostream& output);
 

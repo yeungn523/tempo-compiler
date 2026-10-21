@@ -97,10 +97,10 @@ def _mlir_image(*, keys: int, causal: bool, directory: pathlib.Path) -> bytes:
     return image.read_bytes()
 
 
-@pytest.mark.parametrize("tokens", [32, 64, 96])
+@pytest.mark.parametrize("tokens", [32, 64])
 def test_mlir_causal_attention_matches_the_reference(tokens: int, tmp_path: pathlib.Path) -> None:
     """Verifies that each causal attention attends every head within BF16's error of a float64 reference, with one
-    token block, two, and an odd query half past a full key loop."""
+    token block and two, the most whose unrolled query blocks fit the instruction memory."""
     rng = np.random.default_rng(tokens)
     fused = to_bf16(rng.standard_normal((tokens, 3 * _MODEL)).astype(np.float32))
     constants = np.frombuffer(attention_constants(), dtype="<u2")

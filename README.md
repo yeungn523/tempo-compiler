@@ -22,6 +22,8 @@ board needs no RTL checkout. Only the simulation tools read the RTL itself.
 - Compiles every launch of a GPT-2 small layer: the four projections, the bias and residual adds, both LayerNorms,
   and causal flash attention covering every head and token block in one launch.
 - Compiles decode attention over a KV cache that fills on the device, with images for 64, 256 and 1024 keys.
+- Compiles GEMMs past GPT-2's shapes: an extent a kernel masks is padded with zeros to whole 16-wide tiles, and a
+  contraction deeper than one VMEM bank holds runs in segments within one image.
 - Derives every placement constant from `codegen/minitpuisa.td`, the implemented scheduling contract.
 - Checks each image against the RTL in simulation and against a host reference on the board.
 - Apache 2.0 License.

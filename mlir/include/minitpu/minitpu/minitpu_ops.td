@@ -234,7 +234,9 @@ def Minitpu_AllocOp : Minitpu_Op<"alloc", [MemoryEffects<[MemAlloc]>]>
  * `[columns / 16][tokens][16]`, which is the layout board_package/bf16.py's pack_activations and pack_weights write and
  * the board runtime reads back. With activate set, the activations pass through the GELU before they enter the array.
  * With a bias, the product's columns each add one value, the bias packed as `[columns / 16][4][16]` as pack_bias writes
- * it, so the bias costs no launch of its own.
+ * it, so the bias costs no launch of its own. The depth and the columns are whole tiles, the host padding an operand
+ * a kernel masks with zeros up to them. A depth whose activations one VMEM bank does not hold is walked in segments,
+ * each resuming every column tile from the partial product the one before drained.
  */
 def Minitpu_MatmulOp : Minitpu_Op<"matmul", [MemoryEffects<[MemRead, MemWrite]>]>
 {

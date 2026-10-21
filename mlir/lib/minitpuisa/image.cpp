@@ -113,6 +113,14 @@ Word mlir::minitpu::isa::EncodeBundle(BundleOp bundle)
 
 LogicalResult mlir::minitpu::isa::ExportImage(ProgramOp program, llvm::raw_ostream& output)
 {
+    const size_t bundles = program.getBody().front().getOperations().size();
+    if (bundles > kIramBundles)
+    {
+        // Reports at the program's location alone, since the op itself would print every bundle beside the error.
+        return emitError(program.getLoc())
+            << "Unable to fit the " << program.getSymName() << " image in the instruction memory. It carries "
+            << bundles << " bundles, where IRAM holds " << kIramBundles << ".";
+    }
     for (Operation& operation : program.getBody().front())
     {
         const Word word = EncodeBundle(cast<BundleOp>(operation));

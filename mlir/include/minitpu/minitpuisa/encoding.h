@@ -27,6 +27,9 @@ namespace mlir::minitpu::isa
     /// Stores the size of one bundle in bytes.
     static constexpr uint32_t kBundleBytes = kBundleBits / kBitsPerByte;
 
+    /// Stores the bundles the instruction memory holds, the most one image may carry.
+    static constexpr uint32_t kIramBundles = 4096;
+
     /// Stores the bit that selects the DMA format over the compute format.
     static constexpr uint32_t kDmaBit = kBundleBits - 1;
 

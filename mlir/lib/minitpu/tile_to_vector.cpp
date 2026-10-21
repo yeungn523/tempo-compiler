@@ -71,6 +71,15 @@ namespace
             return pointer;
         }
 
+        /// Returns `value` read afresh when it is a launch argument, which smovarg reads at any point, so a value used
+        /// again after a long loop holds no scalar register across it; returns any other value as it is.
+        Value Reread(Value value)
+        {
+            auto argument = value.getDefiningOp<ArgOp>();
+            if (!argument) return value;
+            return ArgOp::create(_builder, _location, value.getType(), argument.getIndex()).getResult();
+        }
+
         /// Returns a VMEM buffer of `rows` rows.
         Value Buffer(const uint32_t rows)
         {
@@ -153,7 +162,7 @@ namespace
     struct MatmulBuffers
     {
         Value start;                   ///< The zero tile, or the bias row, the accumulators start from.
-        Value activations;             ///< The block's activations, resident for the whole launch.
+        Value activations;             ///< One segment of the block's activations, resident while it is walked.
         std::array<Value, 2> weights;  ///< The two weight chunks, alternating so one lands while the other is pushed.
         Value output;                  ///< One column tile of the product, staged for its drain.
     };
@@ -164,7 +173,8 @@ namespace
      *
      * @param expansion the expansion building the loop.
      * @param buffers the product's buffers.
-     * @param chunk the chunk's index within the contraction, which offsets every activation row.
+     * @param chunk the chunk's index within its segment, which offsets every activation row.
+     * @param tiles the k-tiles the chunk covers, fewer than a whole chunk only for a segment's last.
      * @param accumulators the accumulators entering the chunk.
      * @returns the accumulators leaving the chunk.
      */
@@ -172,6 +182,7 @@ namespace
         Expansion& expansion,
         const MatmulBuffers& buffers,
         const uint32_t chunk,
+        const uint32_t tiles,
         llvm::ArrayRef<Value> accumulators
     )
     {
@@ -180,9 +191,9 @@ namespace
         auto loop               = scf::ForOp::create(
             builder,
             location,
-            expansion.Index(0),            // lower bound
-            expansion.Index(kChunkTiles),  // upper bound
-            expansion.Index(1),            // step
+            expansion.Index(0),      // lower bound
+            expansion.Index(tiles),  // upper bound
+            expansion.Index(1),      // step
             ValueRange(accumulators)
         );
         OpBuilder::InsertionGuard guard(builder);
@@ -244,38 +255,46 @@ namespace
         VstOp::create(builder, location, activated, activations, row, kEverySublane);
     }
 
-    /// Expands one minitpu.matmul into the machine operations that compute it, then erases it.
-    void ExpandMatmul(MatmulOp product)
+    /**
+     * @brief Builds one segment of a product's contraction: its activations staged, then every column tile's
+     * accumulators carried through the segment's chunks and drained.
+     *
+     * @details The first segment starts each column tile from the zero tile or the bias row. A later segment starts it
+     * from the partial product the segment before drained, read back on the slot the first chunk leaves free, so a
+     * contraction deeper than one bank holds costs one round trip of the output per segment and no host sum.
+     *
+     * @param expansion the expansion building the segment.
+     * @param product the product being expanded.
+     * @param buffers the product's buffers.
+     * @param first the segment's first k-tile.
+     * @param tiles the k-tiles the segment covers.
+     * @param stride the scalar holding the bytes between consecutive host rows.
+     */
+    void BuildSegment(
+        Expansion& expansion,
+        MatmulOp product,
+        const MatmulBuffers& buffers,
+        const uint32_t first,
+        const uint32_t tiles,
+        Value stride
+    )
     {
-        OpBuilder builder(product);
-        Expansion expansion(builder, product.getLoc());
-        const Location location        = product.getLoc();
-        const uint32_t depth           = product.getDepth();
-        const uint32_t chunks          = depth / kChunkRows;
-        const uint32_t activation_rows = kTokens * (depth / kTile);
-        Value stride                   = expansion.Scalar(kRowBytes);
+        OpBuilder& builder             = expansion.get_builder();
+        const Location location        = expansion.get_location();
+        const uint32_t depth_tiles     = product.getDepth() / kTile;
+        const uint32_t chunks          = (tiles + kChunkTiles - 1) / kChunkTiles;
+        const uint32_t activation_rows = kTokens * tiles;
+        const bool resumes             = first != 0;
 
-        // Starts the accumulators from the bias row when the product adds one, its tiles one register each, and
-        // otherwise from the zero tile heading the drain buffer.
-        Value bias               = product.getBias();
-        const uint32_t bias_rows = kBroadcastRows * (product.getColumns() / kTile);
-        MatmulBuffers buffers {
-            .start       = expansion.Buffer(bias ? bias_rows : kZeroRows),
-            .activations = expansion.Buffer(activation_rows),
-            .weights     = {expansion.Buffer(kChunkRows), expansion.Buffer(kChunkRows)},
-            .output      = expansion.Buffer(kTokens),
+        // Reads each pointer afresh in a resuming segment, since the scalar file holds no argument across a segment.
+        const auto pointer = [&](Value value) {
+            return resumes ? expansion.Reread(value) : value;
         };
-        if (bias)
-        {
-            expansion.Stage(buffers.start, bias, stride, bias_rows);
-        }
-        else
-        {
-            expansion.Stage(buffers.start, product.getDrain(), stride, kZeroRows);
-        }
-        expansion.Stage(buffers.activations, product.getActivations(), stride, activation_rows);
+        Value activations = expansion.Advance(pointer(product.getActivations()), int64_t {first} * kTokens * kRowBytes);
+        expansion.Stage(buffers.activations, activations, stride, activation_rows);
         if (product.getActivate()) ActivateInPlace(expansion, buffers.activations, activation_rows);
-        Value drain = expansion.Advance(product.getDrain(), int64_t {kZeroRows} * kRowBytes);
+        Value weights = expansion.Advance(pointer(product.getWeights()), int64_t {first} * kTile * kRowBytes);
+        Value drain   = expansion.Advance(pointer(product.getDrain()), int64_t {kZeroRows} * kRowBytes);
 
         auto columns = scf::ForOp::create(
             builder,
@@ -283,53 +302,110 @@ namespace
             expansion.Index(0),                             // lower bound
             expansion.Index(product.getColumns() / kTile),  // upper bound
             expansion.Index(1),                             // step
-            ValueRange {product.getWeights(), drain}
+            ValueRange {weights, drain}
         );
-        {
-            OpBuilder::InsertionGuard guard(builder);
-            builder.setInsertionPointToStart(columns.getBody());
-            Value weights = columns.getRegionIterArgs()[0];
-            Value output  = columns.getRegionIterArgs()[1];
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(columns.getBody());
+        Value column_weights = columns.getRegionIterArgs()[0];
+        Value output         = columns.getRegionIterArgs()[1];
 
-            llvm::SmallVector<Value> accumulators;
-            Value start = bias ? expansion.Row(columns.getInductionVar(), kBroadcastRows, 0) : expansion.Index(0);
+        // Starts the accumulators from the zero tile or the bias row, or in a resuming segment from the partial product
+        // read back beside the first chunk.
+        const auto load_first = [&] {
+            expansion.Load(buffers.weights[0], 0, column_weights, stride, std::min(tiles, kChunkTiles) * kTile, 0);
+            column_weights = expansion.Advance(column_weights, int64_t {kChunkRows} * kRowBytes);
+        };
+        llvm::SmallVector<Value> accumulators;
+        if (resumes)
+        {
+            load_first();
+            expansion.Load(buffers.output, 0, output, stride, kTokens, 1);
+            expansion.Flush(1U << 1);
+            for (uint32_t group = 0; group < kTokenGroups; ++group)
+            {
+                Value row = expansion.Index(int64_t {group} * kSublanes);
+                accumulators.push_back(expansion.LoadRegister(buffers.output, row));
+            }
+        }
+        else
+        {
+            Value start =
+                product.getBias() ? expansion.Row(columns.getInductionVar(), kBroadcastRows, 0) : expansion.Index(0);
             for (uint32_t group = 0; group < kTokenGroups; ++group)
             {
                 accumulators.push_back(expansion.LoadRegister(buffers.start, start));
             }
+            load_first();
+        }
 
-            // Loads the first chunk, then prefetches each next chunk into the other buffer before pushing the current.
-            expansion.Load(buffers.weights[0], 0, weights, stride, kChunkRows, 0);
-            weights = expansion.Advance(weights, int64_t {kChunkRows} * kRowBytes);
-            for (uint32_t chunk = 0; chunk < chunks; ++chunk)
+        // Prefetches each next chunk into the other buffer before pushing the current.
+        for (uint32_t chunk = 0; chunk < chunks; ++chunk)
+        {
+            const uint32_t covered = std::min(kChunkTiles, tiles - chunk * kChunkTiles);
+            expansion.Flush(1U << (chunk % 2));
+            if (chunk + 1 < chunks)
             {
-                expansion.Flush(1U << (chunk % 2));
-                if (chunk + 1 < chunks)
-                {
-                    const uint32_t next = (chunk + 1) % 2;
-                    expansion.Load(buffers.weights[next], 0, weights, stride, kChunkRows, next);
-                    weights = expansion.Advance(weights, int64_t {kChunkRows} * kRowBytes);
-                }
-                accumulators = BuildChunk(expansion, buffers, chunk, accumulators);
+                const uint32_t next = (chunk + 1) % 2;
+                const uint32_t rows = std::min(kChunkTiles, tiles - (chunk + 1) * kChunkTiles) * kTile;
+                expansion.Load(buffers.weights[next], 0, column_weights, stride, rows, next);
+                column_weights = expansion.Advance(column_weights, int64_t {kChunkRows} * kRowBytes);
             }
+            accumulators = BuildChunk(expansion, buffers, chunk, covered, accumulators);
+        }
 
-            // Stores the column tile and drains it on the slot the last chunk freed, waiting before the next reuses it.
-            for (uint32_t group = 0; group < kTokenGroups; ++group)
-            {
-                VstOp::create(
-                    builder,
-                    location,
-                    accumulators[group],
-                    buffers.output,
-                    expansion.Index(int64_t {group} * kSublanes),
-                    kEverySublane
-                );
-            }
-            const uint32_t drain_slot = chunks % 2;
-            expansion.Drain(buffers.output, 0, output, stride, kTokens, drain_slot);
-            expansion.Flush(1U << drain_slot);
-            output = expansion.Advance(output, int64_t {kTokens} * kRowBytes);
-            scf::YieldOp::create(builder, location, ValueRange {weights, output});
+        // Stores the column tile and drains it on the slot the last chunk freed, waiting before the next reuses it.
+        for (uint32_t group = 0; group < kTokenGroups; ++group)
+        {
+            VstOp::create(
+                builder,
+                location,
+                accumulators[group],
+                buffers.output,
+                expansion.Index(int64_t {group} * kSublanes),
+                kEverySublane
+            );
+        }
+        const uint32_t drain_slot = chunks % 2;
+        expansion.Drain(buffers.output, 0, output, stride, kTokens, drain_slot);
+        expansion.Flush(1U << drain_slot);
+        output = expansion.Advance(output, int64_t {kTokens} * kRowBytes);
+
+        // Steps the weights from where the segment's chunks leave them to the segment's start in the next column tile.
+        const int64_t walked = int64_t {chunks} * kChunkRows;
+        column_weights       = expansion.Advance(column_weights, (int64_t {depth_tiles} * kTile - walked) * kRowBytes);
+        scf::YieldOp::create(builder, location, ValueRange {column_weights, output});
+    }
+
+    /// Expands one minitpu.matmul into the machine operations that compute it, then erases it.
+    void ExpandMatmul(MatmulOp product)
+    {
+        OpBuilder builder(product);
+        Expansion expansion(builder, product.getLoc());
+        const uint32_t depth_tiles = product.getDepth() / kTile;
+        const bool bias            = product.getBias() != nullptr;
+        const uint32_t segment     = MatmulSegmentTiles(product.getDepth(), product.getColumns(), bias);
+        Value stride               = expansion.Scalar(kRowBytes);
+
+        // Starts the accumulators from the bias row when the product adds one, its tiles one register each, and
+        // otherwise from the zero tile heading the drain buffer.
+        const uint32_t bias_rows = kBroadcastRows * (product.getColumns() / kTile);
+        MatmulBuffers buffers {
+            .start       = expansion.Buffer(bias ? bias_rows : kZeroRows),
+            .activations = expansion.Buffer(kTokens * segment),
+            .weights     = {expansion.Buffer(kChunkRows), expansion.Buffer(kChunkRows)},
+            .output      = expansion.Buffer(kTokens),
+        };
+        if (bias)
+        {
+            expansion.Stage(buffers.start, product.getBias(), stride, bias_rows);
+        }
+        else
+        {
+            expansion.Stage(buffers.start, product.getDrain(), stride, kZeroRows);
+        }
+        for (uint32_t first = 0; first < depth_tiles; first += segment)
+        {
+            BuildSegment(expansion, product, buffers, first, std::min(segment, depth_tiles - first), stride);
         }
         product.erase();
     }

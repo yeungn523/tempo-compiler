@@ -257,25 +257,37 @@ def gelu_lut_reference(words: NDArray[np.uint32]) -> NDArray[np.uint32]:
     return np.where((operand & 0x7FFF_FFFF) == 0, 0, result).astype("<u4")
 
 
+def _padded_columns(values: NDArray[np.float32]) -> NDArray[np.float32]:
+    """Returns the array with its last dimension padded with zeros to a whole number of `_TILE`-wide tiles, which is the
+    extent an image covers along an axis a kernel masks."""
+    short = -values.shape[-1] % _TILE
+    if not short:
+        return values
+    return np.pad(values, [(0, 0)] * (values.ndim - 1) + [(0, short)])
+
+
 def pack_activations(activations: NDArray[np.float32]) -> NDArray[np.uint16]:
     """Lays an activation array out in the order the looped kernel visits it.
 
     Args:
-        activations: The left operand, whose rows are tokens and columns the contraction.
+        activations: The left operand, whose rows are tokens and columns the contraction, the columns padded with
+            zeros to whole tiles.
 
     Returns:
         The BF16 words of every step, ordered contraction block outermost and step innermost.
 
     Raises:
-        ValueError: If a dimension is not a whole number of blocks.
+        ValueError: If the rows are not a whole number of token groups.
     """
-    tokens, depth = activations.shape
-    if tokens % _TILE or depth % _BLOCK_DEPTH:
+    tokens = activations.shape[0]
+    if tokens % _TILE:
         message = (
-            f"Unable to pack an activation array of shape [{tokens},{depth}]. Its rows must be a whole number "
-            f"of the {_TILE} a token group holds and its columns a whole number of {_BLOCK_DEPTH}."
+            f"Unable to pack an activation array of shape {list(activations.shape)}. Its rows must be a whole "
+            f"number of the {_TILE} a token group holds."
         )
         raise ValueError(message)
+    activations = _padded_columns(values=activations)
+    depth = activations.shape[1]
     words = as_bf16_words(values=activations)
     return np.ascontiguousarray(words.reshape(tokens, depth // _TILE, _TILE).transpose(1, 0, 2)).reshape(-1)
 
@@ -284,20 +296,18 @@ def pack_bias(bias: NDArray[np.float32]) -> NDArray[np.uint16]:
     """Lays a bias row out in the order a stride-one broadcast read visits it.
 
     Args:
-        bias: One value per feature, a whole number of `_NUM_LANES`-wide tiles.
+        bias: One value per feature, padded with zeros to whole `_NUM_LANES`-wide tiles.
 
     Returns:
         The BF16 words, each feature tile repeated `_NUM_SUBLANES` times.
 
     Raises:
-        ValueError: If it is not one row of whole tiles.
+        ValueError: If it is not one row.
     """
-    if bias.ndim != 1 or bias.size % _NUM_LANES:
-        message = (
-            f"Unable to pack a bias of shape {bias.shape}. It must be one row of whole {_NUM_LANES}-lane tiles."
-        )
+    if bias.ndim != 1:
+        message = f"Unable to pack a bias of shape {bias.shape}. It must be one row."
         raise ValueError(message)
-    tiles = as_bf16_words(values=bias).reshape(-1, _NUM_LANES)
+    tiles = as_bf16_words(values=_padded_columns(values=bias)).reshape(-1, _NUM_LANES)
     return np.ascontiguousarray(np.repeat(tiles, _NUM_SUBLANES, axis=0)).reshape(-1)
 
 
@@ -305,23 +315,16 @@ def pack_weights(weights: NDArray[np.float32]) -> NDArray[np.uint16]:
     """Lays a weight matrix out in the order the looped kernel visits it.
 
     Args:
-        weights: The right operand, whose rows are the contraction and columns the output features.
+        weights: The right operand, whose rows are the contraction and columns the output features, both padded with
+            zeros to whole tiles.
 
     Returns:
-        The BF16 words of every block, ordered output tile outermost and contraction block innermost.
-
-    Raises:
-        ValueError: If a dimension is not a whole number of blocks.
+        The BF16 words of every column tile, each tile's contraction rows in order.
     """
+    weights = _padded_columns(values=_padded_columns(values=weights).T).T
     depth, columns = weights.shape
-    if depth % _BLOCK_DEPTH or columns % _TILE:
-        message = (
-            f"Unable to pack a weight matrix of shape [{depth},{columns}]. Both dimensions must be a whole "
-            f"number of the {_BLOCK_DEPTH}x{_TILE} block one group stages."
-        )
-        raise ValueError(message)
     words = as_bf16_words(values=weights)
-    ordered = words.reshape(depth // _BLOCK_DEPTH, _BLOCK_DEPTH, columns // _TILE, _TILE).transpose(2, 0, 1, 3)
+    ordered = words.reshape(depth, columns // _TILE, _TILE).transpose(1, 0, 2)
     return np.ascontiguousarray(ordered).reshape(-1)
 
 def staged_maximum(stated: float) -> float:

@@ -93,7 +93,7 @@ def test_mlir_conversion_refuses_a_transposed_operand(tmp_path: pathlib.Path) ->
     assert "addresses the weights in a layout the host does not pack it in" in refusal.value.stderr
 
 
-@pytest.mark.parametrize("tokens", [32, 64, 96])
+@pytest.mark.parametrize("tokens", [32, 64])
 def test_mlir_converts_causal_attention(tokens: int, tmp_path: pathlib.Path) -> None:
     """Verifies that the causal attention kernel, written for one head, converts into the image walking every head,
     at GPT-2's sequence length and at others."""

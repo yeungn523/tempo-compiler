@@ -6,7 +6,7 @@ from triton._C.libtriton import ir
 from triton.compiler.compiler import ASTSource
 from triton.runtime import JITFunction
 
-from .backend import MinitpuBackend, MinitpuOptions
+from .backend import TempoBackend, TempoOptions
 
 
 def signature_of(kernel: JITFunction) -> dict[str, str]:
@@ -23,7 +23,7 @@ def signature_of(kernel: JITFunction) -> dict[str, str]:
             for parameter in kernel.params}
 
 
-def make_ir(kernel: JITFunction, *, backend: MinitpuBackend, options: MinitpuOptions,
+def make_ir(kernel: JITFunction, *, backend: TempoBackend, options: TempoOptions,
             **bound: int | float | bool) -> ir.module:
     """Builds the module of one Triton kernel at the shape its constexprs fix, before any pass runs over it.
 
@@ -56,7 +56,7 @@ def triton_kernel(kernel: JITFunction, **bound: int | float | bool) -> str:
         The module's MLIR text.
     """
     # Triton types the target argument and then ignores it, so this backend carries no target descriptor.
-    backend = MinitpuBackend(None)
+    backend = TempoBackend(None)
     options = backend.parse_options({})
     stages: dict = {}
     backend.add_stages(stages, options)

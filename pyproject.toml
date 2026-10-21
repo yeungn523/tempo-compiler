@@ -24,7 +24,7 @@ test = [
 
 # Pins the C++ toolchain mlir/ builds against, which no Python package carries. tools/toolchain/setup_toolchain.py fetches and
 # verifies it, and mlir/CMakeLists.txt refuses an LLVM built from any other commit.
-[tool.minitpu.toolchain]
+[tool.tempo.toolchain]
 triton-tag = "v3.8.0"                                      # Must name the release the compiler group pins
 llvm-commit = "5f07f818b51b786b0a87b4e514882600ecba112f"   # Triton 3.8.0's cmake/llvm-info.json
 llvm-package = "llvm-5f07f818-ubuntu-x64-1"

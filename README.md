@@ -1,6 +1,7 @@
-# minitpu-compiler
+# tempo-compiler
 
-Compiles GPT-2 small inference from Triton kernels into images for a systolic-array NPU.
+Compiles GPT-2 small inference from Triton kernels into images for a systolic-array NPU whose RTL has no hardware
+interlocks.
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
@@ -9,7 +10,7 @@ ___
 ## Detailed Description
 
 The target NPU is a 16 by 16 BF16 systolic array with a VLIW vector unit, synthesized on a ZCU104. The compiler takes a
-Triton kernel through Triton's own frontend to the tt dialect and converts it into a minitpu tile op. An MLIR pipeline
+Triton kernel through Triton's own frontend to the tt dialect and converts it into a tempo tile op. An MLIR pipeline
 lowers that op into the 128-bit VLIW bundles the board fetches, along with the manifest entry the board runtime
 launches each image with. The images run on the board from `board_package/`, which holds the runtime, the GPT-2 layer
 drivers, and the NPU's bitstream.
@@ -47,8 +48,8 @@ ___
 2. `cd` to the root directory of the repository.
 3. Run `pip install --group compiler --group mlir --group test "tox>=4,<5" "tox-uv>=1,<2"` to install the Python
    dependencies and tox.
-4. Run `tox -e build`. It fetches and verifies Triton's source and the pinned LLVM, then builds `minitpu-opt`,
-   `minitpu-translate` and `minitpu-tblgen` into `mlir/build/bin`.
+4. Run `tox -e build`. It fetches and verifies Triton's source and the pinned LLVM, then builds `tempo-opt`,
+   `tempo-translate` and `tempo-tblgen` into `mlir/build/bin`.
 
 ___
 
@@ -140,19 +141,19 @@ C++ under `mlir/` is formatted by `mlir/.clang-format` and linted by `mlir/.clan
 
 ### Repository Layout
 
-| Path                               | Holds                                                                                    |
-|------------------------------------|------------------------------------------------------------------------------------------|
-| `driver/`                          | The Triton backend whose stages run the MLIR tools, and `compile_kernel`                 |
-| `gpt2_triton.py`                   | The Triton kernels a GPT-2 small layer launches                                          |
-| `mlir/include/minitpu/minitpu/`    | The minitpu dialect: tile ops, machine operations over virtual registers, and its passes |
-| `mlir/include/minitpu/minitpuisa/` | The minitpuisa dialect, one op per instruction, and the ISA contract `isa.td`            |
-| `mlir/lib/minitpu/`                | The Triton conversion, tile op expansion, allocators, ISA lowering, and manifest export  |
-| `mlir/lib/minitpuisa/`             | The packer, the scheduler, and the image import and export                               |
-| `mlir/tools/`                      | `minitpu-opt`, `minitpu-translate`, and `minitpu-tblgen`                                 |
-| `mlir/test/`                       | The lit suite, one pass per file, with every GPT-2 kernel's tt module under `Inputs/`    |
-| `tests/`                           | The compiler's pytest suite                                                              |
-| `tools/`                           | The image builder, board deployment, emulator, RTL simulations, and toolchain setup      |
-| `board_package/`                   | The board runtime, the GPT-2 drivers, the board checks, and the compiled images          |
+| Path                           | Holds                                                                                   |
+|--------------------------------|-----------------------------------------------------------------------------------------|
+| `driver/`                      | The Triton backend whose stages run the MLIR tools, and `compile_kernel`                |
+| `gpt2_triton.py`               | The Triton kernels a GPT-2 small layer launches                                         |
+| `mlir/include/tempo/tempo/`    | The tempo dialect: tile ops, machine operations over virtual registers, and its passes  |
+| `mlir/include/tempo/tempoisa/` | The tempoisa dialect, one op per instruction, and the ISA contract `isa.td`             |
+| `mlir/lib/tempo/`              | The Triton conversion, tile op expansion, allocators, ISA lowering, and manifest export |
+| `mlir/lib/tempoisa/`           | The packer, the scheduler, and the image import and export                              |
+| `mlir/tools/`                  | `tempo-opt`, `tempo-translate`, and `tempo-tblgen`                                      |
+| `mlir/test/`                   | The lit suite, one pass per file, with every GPT-2 kernel's tt module under `Inputs/`   |
+| `tests/`                       | The compiler's pytest suite                                                             |
+| `tools/`                       | The image builder, board deployment, emulator, RTL simulations, and toolchain setup     |
+| `board_package/`               | The board runtime, the GPT-2 drivers, the board checks, and the compiled images         |
 
 ___
 

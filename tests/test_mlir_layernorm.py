@@ -23,7 +23,7 @@ from driver import TOOLS, compile_kernel  # noqa: E402
 from minitpu_emulator import Machine, read_image, to_bf16  # noqa: E402
 from references import layernorm_reference  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not (TOOLS / "minitpu-opt").exists(), reason="mlir/ is not built")
+pytestmark = pytest.mark.skipif(not (TOOLS / "tempo-opt").exists(), reason="mlir/ is not built")
 
 _FEATURES: int = 768
 """Stores the width GPT-2 small normalises over, the one width the host reference covers."""

@@ -2,7 +2,7 @@
 """Writes the tt dialect module of every kernel a GPT-2 small layer launches, at the shapes the layer compiles it at.
 
 The modules are the input the MLIR pipeline under mlir/ reads. They are written in the form Triton prints, without
-locations, which minitpu-opt parses because it is built from the LLVM commit and dialect sources the Triton 3.8.0
+locations, which tempo-opt parses because it is built from the LLVM commit and dialect sources the Triton 3.8.0
 wheel was.
 """
 

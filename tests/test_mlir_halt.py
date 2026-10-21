@@ -19,13 +19,13 @@ sys.path.insert(0, str(_HERE / "tools" / "emulators"))
 from driver import TOOLS, compile_kernel  # noqa: E402
 from minitpu_emulator import Machine, read_image  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not (TOOLS / "minitpu-opt").exists(), reason="mlir/ is not built")
+pytestmark = pytest.mark.skipif(not (TOOLS / "tempo-opt").exists(), reason="mlir/ is not built")
 
 
 def test_mlir_halt_is_one_bundle(tmp_path: pathlib.Path) -> None:
     """Verifies that an empty kernel builds a single halt bundle, which the machine retires at once."""
     image = tmp_path / "halt.bin"
-    image.write_bytes(compile_kernel("minitpu.kernel @halt {\n}\n").image)
+    image.write_bytes(compile_kernel("tempo.kernel @halt {\n}\n").image)
     assert image.stat().st_size == 16
 
     machine = Machine(np.zeros(4096, dtype=np.uint8), arguments=())

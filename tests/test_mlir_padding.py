@@ -26,7 +26,7 @@ from build_images import attention_kernel, gemm_kernel  # noqa: E402
 from driver import TOOLS, ProgramError, compile_kernel, triton_kernel  # noqa: E402
 from minitpu_emulator import Machine, read_image, to_bf16  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not (TOOLS / "minitpu-opt").exists(), reason="mlir/ is not built")
+pytestmark = pytest.mark.skipif(not (TOOLS / "tempo-opt").exists(), reason="mlir/ is not built")
 
 _ROOT_TWO: tl.constexpr = tl.constexpr(1.4142135623730951)
 """Divisor the exact GELU scales its argument by."""

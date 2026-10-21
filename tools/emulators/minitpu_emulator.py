@@ -21,7 +21,7 @@ _OPCODES: dict[str, int] = {
 }
 """Numeric opcode of every mnemonic the ISA contract names."""
 
-# Mirrors sequencer_pkg::compute_payload_t at NUM_LANES=16 and NUM_SUBLANES=4, as mlir/include/minitpu/minitpuisa/
+# Mirrors sequencer_pkg::compute_payload_t at NUM_LANES=16 and NUM_SUBLANES=4, as mlir/include/tempo/tempoisa/
 # encoding.h does:
 #
 #   is_dma [127]   e [126:108]   m [107:101]   x [100:68]

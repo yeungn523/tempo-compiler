@@ -14,7 +14,7 @@ from triton._C.libtriton import ir, passes
 from triton.backends.compiler import BaseBackend
 
 TOOLS: pathlib.Path = pathlib.Path(__file__).resolve().parents[1] / "mlir" / "build" / "bin"
-"""Stores the directory minitpu-opt and minitpu-translate are built into."""
+"""Stores the directory tempo-opt and tempo-translate are built into."""
 
 _OPERAND_ELEMENT: str = "bf16"
 """The only element type the systolic array supports."""
@@ -38,10 +38,10 @@ _TTIR_PASSES = (
 which an unrolled loop no longer states."""
 
 _LOWERING: str = (
-    "builtin.module(minitpu.kernel(minitpu-tile-to-vector,minitpu-allocate-vmem,minitpu-allocate-registers),"
-    "convert-minitpu-to-isa,minitpuisa.program(minitpuisa-pack,minitpuisa-schedule))"
+    "builtin.module(tempo.kernel(tempo-tile-to-vector,tempo-allocate-vmem,tempo-allocate-registers),"
+    "convert-tempo-to-isa,tempoisa.program(tempoisa-pack,tempoisa-schedule))"
 )
-"""Passes taking a kernel of tile ops to a scheduled minitpuisa program."""
+"""Passes taking a kernel of tile ops to a scheduled tempoisa program."""
 
 
 class ProgramError(RuntimeError):
@@ -49,7 +49,7 @@ class ProgramError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class MinitpuOptions:
+class TempoOptions:
     """Holds the compilation settings Triton's frontend reads and the one this backend's own stages read.
 
     Attributes:
@@ -69,8 +69,8 @@ class MinitpuOptions:
     attention_heads: int = 1
 
 
-class MinitpuBackend(BaseBackend):
-    """Compiles Triton kernels for this machine, from the tt dialect through minitpu tile ops to an image.
+class TempoBackend(BaseBackend):
+    """Compiles Triton kernels for this machine, from the tt dialect through tempo tile ops to an image.
 
     Triton declares six abstract methods. Two are empty because this machine adds no dialects to Triton's context and
     supplies no device specific modules. `get_codegen_implementation` is a seventh that BaseBackend does not declare
@@ -88,13 +88,13 @@ class MinitpuBackend(BaseBackend):
 
     def hash(self) -> str:
         """Returns the identifier distinguishing this backend's cache entries."""
-        return f"minitpu-{_OPERAND_ELEMENT}-{_MINIMUM_DOT_SHAPE}"
+        return f"tempo-{_OPERAND_ELEMENT}-{_MINIMUM_DOT_SHAPE}"
 
-    def parse_options(self, options: dict) -> MinitpuOptions:
+    def parse_options(self, options: dict) -> TempoOptions:
         """Returns the settings a compilation runs under, of which a caller chooses only the attention heads."""
-        return MinitpuOptions(attention_heads=options.get("attention_heads", 1))
+        return TempoOptions(attention_heads=options.get("attention_heads", 1))
 
-    def get_codegen_implementation(self, options: MinitpuOptions) -> dict:
+    def get_codegen_implementation(self, options: TempoOptions) -> dict:
         """Returns the dot callback, which is the one implementation the frontend requires."""
         return {"min_dot_size": _dot_shape}
 
@@ -106,21 +106,21 @@ class MinitpuBackend(BaseBackend):
         """Returns the device specific implementations of Triton's interface modules, of which there are none."""
         return {}
 
-    def add_stages(self, stages: dict, options: MinitpuOptions, *_) -> None:
+    def add_stages(self, stages: dict, options: TempoOptions, *_) -> None:
         """Registers the compilation stages, each taking the previous stage's output and the shared metadata.
 
         Notes:
-            The stages are "ttir", canonicalizing the module make_ir builds into tt dialect text; "minitpu",
+            The stages are "ttir", canonicalizing the module make_ir builds into tt dialect text; "tempo",
             converting it into a kernel of tile ops and recording its manifest entry and any constants block in the
-            metadata; "minitpuisa", lowering the tile ops to a scheduled program; and "bin", writing the image.
+            metadata; "tempoisa", lowering the tile ops to a scheduled program; and "bin", writing the image.
             Absorbs the arguments past the two BaseBackend declares, because Triton's own driver passes a third:
             `compiler.py` calls `backend.add_stages(stages, options, src.language)`.
         """
         stages["ttir"] = lambda source, metadata: _make_ttir(source)
-        stages["minitpu"] = lambda source, metadata: _make_minitpu(source, metadata, heads=options.attention_heads)
-        stages["minitpuisa"] = lambda source, metadata: _run_tool("minitpu-opt", f"-pass-pipeline={_LOWERING}",
+        stages["tempo"] = lambda source, metadata: _make_tempo(source, metadata, heads=options.attention_heads)
+        stages["tempoisa"] = lambda source, metadata: _run_tool("tempo-opt", f"-pass-pipeline={_LOWERING}",
                                                                   source=source).decode()
-        stages["bin"] = lambda source, metadata: _run_tool("minitpu-translate", "--export-minitpu-image",
+        stages["bin"] = lambda source, metadata: _run_tool("tempo-translate", "--export-tempo-image",
                                                            source=source)
 
 
@@ -134,13 +134,13 @@ def _make_ttir(module: ir.module) -> str:
     return module.str_nodebug().rstrip("\n") + "\n"
 
 
-def _make_minitpu(source: str, metadata: dict, *, heads: int) -> str:
+def _make_tempo(source: str, metadata: dict, *, heads: int) -> str:
     """Converts a tt module, or a kernel already stated as tile ops, into a kernel of tile ops, recording its manifest
     entry under "manifest" and its constants block, when the image reads one unchanged, under "constants"."""
-    kernel = _run_tool("minitpu-opt", f"--convert-tt-to-minitpu=attention-heads={heads}", source=source).decode()
-    metadata["manifest"] = json.loads(_run_tool("minitpu-translate", "--export-minitpu-manifest", source=kernel))
+    kernel = _run_tool("tempo-opt", f"--convert-tt-to-tempo=attention-heads={heads}", source=source).decode()
+    metadata["manifest"] = json.loads(_run_tool("tempo-translate", "--export-tempo-manifest", source=kernel))
     (entry,) = metadata["manifest"].values()
-    metadata["constants"] = (_run_tool("minitpu-translate", "--export-minitpu-constants", source=kernel)
+    metadata["constants"] = (_run_tool("tempo-translate", "--export-tempo-constants", source=kernel)
                              if "constants" in entry else None)
     return kernel
 

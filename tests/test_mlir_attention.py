@@ -22,7 +22,7 @@ from build_images import attention_kernel  # noqa: E402
 from driver import TOOLS, Compiled, compile_kernel  # noqa: E402
 from minitpu_emulator import Machine, to_bf16  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not (TOOLS / "minitpu-opt").exists(), reason="mlir/ is not built")
+pytestmark = pytest.mark.skipif(not (TOOLS / "tempo-opt").exists(), reason="mlir/ is not built")
 
 _HEADS: int = 12
 """Heads the fused tensor carries."""
